@@ -17,6 +17,7 @@ import socket
 import stat
 import subprocess
 import time
+import threading
 from wire import Client
 
 def copy_file(root, source, destination=None):
@@ -143,15 +144,23 @@ def run(args):
                 c.ack(message);assert c.get(prior_next_pending,name='A') is None
             for seq,value in expected.items():assert c.get(seq)==value,(cycle,seq)
             if args.concurrent:
-                def publish_worker(worker):
-                    client=Client(vm.address, timeout=30);pairs=[]
-                    try:
+                # Establish connections before the publication workload so its
+                # concurrency does not depend on user-network handshake timing.
+                clients=[]
+                try:
+                    for _ in range(16):
+                        client=Client(vm.address, timeout=30);clients.append(client);client.flush()
+                    gate=threading.Barrier(16)
+                    def publish_worker(worker):
+                        client=clients[worker];pairs=[]
+                        gate.wait(timeout=30)
                         for i in range(worker,args.messages,16):
                             value=f'{cycle}-{i}'.encode();pairs.append((client.publish(value),value))
-                    finally:client.close()
-                    return pairs
-                with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
-                    batches=list(pool.map(publish_worker,range(16)))
+                        return pairs
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+                        batches=list(pool.map(publish_worker,range(16)))
+                finally:
+                    for client in clients:client.close()
                 for pairs in batches:
                     for seq,value in pairs:assert seq not in expected;expected[seq]=value
                 assert c.request('$JS.API.SCREECH.GROUPS',{})['committed_groups']>0
