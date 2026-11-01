@@ -18,9 +18,15 @@ def bootstrap(binary,directory,count):
     finally:server.kill()
 
 def no_response(c):
-    if select.select([c.socket],[],[],.02)[0]:
-        data=c.socket.recv(4096)
-        assert data==b'', f'response escaped before the durability boundary: {data!r}'
+    # readline/read_message can read ahead past a PONG or the last expected MSG.
+    # Inspect that buffer as well as the socket, without consuming or timing out
+    # the BufferedReader (a timed-out reader cannot be safely reused).
+    timeout=c.socket.gettimeout();c.socket.setblocking(False)
+    try:
+        data=c.file.peek(1)
+        if not data and select.select([c.socket],[],[],.02)[0]:data=c.file.peek(1)
+        assert not data, f'response escaped before the durability boundary: {data!r}'
+    finally:c.socket.settimeout(timeout)
 
 def run(binary):
     results=[]
