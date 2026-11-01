@@ -28,6 +28,7 @@ def run(binary,shim):
                     elif phase=='checkpoint':result=attempt(lambda:c.request('$JS.API.SCREECH.CHECKPOINT',{}));success=bool(result and result.get('success'))
                     else:result=attempt(c.pull);success=bool(result and result.get('payload')==b'value')
                     assert hit.exists(),(phase,mode,'interposer never hit',result)
+                    if mode.startswith('sync-'):assert hit.read_text()=='fdatasync','Linux SQLite build did not use fdatasync'
                     assert success==(mode=='short-write'),(phase,mode,result,success)
                     c.close()
                     if mode!='short-write':

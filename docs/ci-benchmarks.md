@@ -4,7 +4,7 @@
 
 CI runs on pushes to main, pull requests, manual dispatch and Mondays at 04:17 UTC.
 The correctness job runs formatting, default/all-feature Clippy, Rust tests, extended
-projection/group properties, dashboard reducer/generator tests and process faults.
+projection/group/ACK-floor properties, dashboard reducer/generator tests and process faults, including waits inside actual data-sync syscalls.
 The reusable guest workflow kills and recovers a disposable VM three times, including
 forced checkpoints and concurrent commits. Each test artifact is downloadable from
 its workflow run. A manual guest-only run remains available in vm.yml.
@@ -19,8 +19,8 @@ unpinned; cross-run differences can reflect hardware and filesystem variation.
 The default campaign runs three checked trials per case, plus warmups. It covers
 Core fanout/wildcards/queues/request-reply, live Core on a stream, sequential and
 concurrent durable publishers, pull consumers, ACK-and-next, dedup, retention and
-mixed workloads. A second campaign runs four concurrent cases at 20,000 messages.
-There are 246 measured trials at the default settings: 198 standard and 48 larger.
+mixed workloads, including a 1000-message outstanding ACK window. A second campaign runs four concurrent cases at 20,000 messages.
+There are 258 measured trials at the default settings: 210 standard and 48 larger.
 A manual CI run can set trials (1–10) and nats_ref (branch, tag or SHA).
 
 ## Storage modes

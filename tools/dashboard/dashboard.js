@@ -18,7 +18,7 @@
   const CASES = {
     fanout: 'Core fanout', wildcard: 'Core wildcard', queue: 'Core queue', request: 'Core request / reply',
     'core-stream': 'Core on a durable stream', durable: 'Durable publish', dedup: 'Publish deduplication',
-    consume: 'Fetch(128) + ACK', 'consume-limits': 'Fetch(128) + ACK · limits',
+    'consume-ack-window': 'Fetch(1000) + 16 ACK clients', consume: 'Fetch(128) + ACK', 'consume-limits': 'Fetch(128) + ACK · limits',
     'consume-one': 'Fetch(1) + ACK', 'consume-next': 'ACK + next', 'consume-parallel': 'Fetch(128) + 16 ACK clients',
     'durable-parallel': '16 durable publishers', 'consume-one-parallel': '16 Fetch(1) + ACK clients',
     'mixed-parallel': '8 publishers + 8 consumers', 'mixed-streams': 'Mixed · four streams'
@@ -35,7 +35,7 @@
   }
   function scope(row) {
     if (row.latency_scope) return row.latency_scope;
-    if (['consume', 'consume-one', 'consume-limits', 'consume-parallel'].includes(row.scenario)) return 'confirmed ACK only; Fetch excluded from latency';
+    if (['consume', 'consume-one', 'consume-limits', 'consume-parallel', 'consume-ack-window'].includes(row.scenario)) return 'confirmed ACK only; Fetch excluded from latency';
     if (row.scenario === 'consume-next') return 'ACK + next round trip; final ACK only';
     if (row.scenario === 'request') return 'request / reply round trip';
     if (['durable', 'dedup'].includes(row.scenario)) return 'publish to durable ACK';

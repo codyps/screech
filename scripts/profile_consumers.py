@@ -29,5 +29,5 @@ if __name__=='__main__':
     p=argparse.ArgumentParser()
     for key in ['binary','driver']:p.add_argument('--'+key,type=lambda x:Path(x).resolve(),required=True)
     p.add_argument('--output',type=Path,required=True);p.add_argument('--mode',choices=['cpu','sync'],required=True)
-    p.add_argument('--scenario',choices=['consume','consume-one','consume-parallel','consume-limits','consume-next','durable-parallel','consume-one-parallel','mixed-parallel','mixed-streams'],default='consume')
+    p.add_argument('--scenario',choices=['consume','consume-one','consume-parallel','consume-ack-window','consume-limits','consume-next','durable-parallel','consume-one-parallel','mixed-parallel','mixed-streams'],default='consume')
     p.add_argument('--messages',type=int,default=1000);args=p.parse_args();assert args.messages>0;main(args)

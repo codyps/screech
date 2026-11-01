@@ -4,6 +4,14 @@ pub fn point(name: &str) {
     if std::env::var("SCREECH_FAULT_POINT").as_deref() != Ok(name) {
         return;
     }
+    if let Ok(after) = std::env::var("SCREECH_FAULT_AFTER") {
+        static HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let after: usize = after.parse().expect("positive fault occurrence");
+        assert!(after > 0);
+        if HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 != after {
+            return;
+        }
+    }
     if let Ok(marker) = std::env::var("SCREECH_FAULT_MARKER") {
         std::fs::write(marker, name).expect("fault marker");
     }

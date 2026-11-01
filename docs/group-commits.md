@@ -62,3 +62,15 @@ position fencing and ambiguous failure. Process schedules gate mixed groups, inj
 I/O failures, kill the server at commit/output boundaries and verify committed prefixes.
 Populated-tree cases check untouched streams, dedup entries and pending ACKs. Guest
 VM kills check acknowledged state after guest page-cache loss. See [testing](testing.md).
+
+
+Consumer ACK floors use ordered pending/exhausted minima. First-attempt ACKs remove
+their history key directly; redeliveries retain the original key and use the history
+lookup path. Retention cleanup skips sequences already finished by the ACK. Recovery
+validates that history covers each pending/exhausted sequence exactly once and that
+first-attempt tokens identify the corresponding history entry. These changes leave
+event records, commit boundaries and checkpoint encoding unchanged.
+
+After a maintenance pass makes delivery progress, the worker polls ingress immediately
+and services the next bounded chunk. A pass with no progress uses its idle wait, so
+ready pull/push backlogs avoid timer gaps while blocked/empty consumers do not spin.

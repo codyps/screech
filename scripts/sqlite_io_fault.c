@@ -36,15 +36,19 @@ int fsync(int fd) {
     int (*real_call)(int) = dlsym(RTLD_NEXT, "fsync");
     if (!matches(fd, 1)) return real_call(fd);
     const char *mode = getenv("SCREECH_IO_MODE");
-    if (!strcmp(mode, "sync-after-eio") && real_call(fd)) return -1;
-    mark("fsync"); errno = EIO; return -1;
+    if ((!strcmp(mode, "sync-after-eio") || !strcmp(mode, "sync-hang-after")) && real_call(fd)) return -1;
+    mark("fsync");
+    if (!strncmp(mode, "sync-hang-", 10)) for (;;) pause();
+    errno = EIO; return -1;
 }
 int fdatasync(int fd) {
     int (*real_call)(int) = dlsym(RTLD_NEXT, "fdatasync");
     if (!matches(fd, 1)) return real_call(fd);
     const char *mode = getenv("SCREECH_IO_MODE");
-    if (!strcmp(mode, "sync-after-eio") && real_call(fd)) return -1;
-    mark("fdatasync"); errno = EIO; return -1;
+    if ((!strcmp(mode, "sync-after-eio") || !strcmp(mode, "sync-hang-after")) && real_call(fd)) return -1;
+    mark("fdatasync");
+    if (!strncmp(mode, "sync-hang-", 10)) for (;;) pause();
+    errno = EIO; return -1;
 }
 ssize_t pwrite64(int fd, const void *data, size_t count, off64_t offset) {
     ssize_t (*real_call)(int, const void*, size_t, off64_t) = dlsym(RTLD_NEXT, "pwrite64");

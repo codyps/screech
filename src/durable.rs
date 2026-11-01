@@ -398,17 +398,24 @@ impl Consumer {
         OrdSet::new()
     }
     fn next_delivery(&self, s: &Stream, time: u64) -> Option<Delivery> {
-        let due = self
-            .pending
-            .iter()
-            .find(|(seq, p)| {
-                p.deadline <= time
-                    && s.messages.get(*seq).is_some_and(|m| {
-                        s.config.max_age == 0 || m.time.saturating_add(s.config.max_age) > time
-                    })
-                    && (self.config.max_deliver < 0 || p.attempt < self.config.max_deliver as u64)
-            })
-            .map(|(&seq, p)| (seq, p.attempt + 1));
+        self.select_delivery(s, time, true)
+    }
+    fn select_delivery(&self, s: &Stream, time: u64, check_due: bool) -> Option<Delivery> {
+        let due = if check_due {
+            self.pending
+                .iter()
+                .find(|(seq, p)| {
+                    p.deadline <= time
+                        && s.messages.get(*seq).is_some_and(|m| {
+                            s.config.max_age == 0 || m.time.saturating_add(s.config.max_age) > time
+                        })
+                        && (self.config.max_deliver < 0
+                            || p.attempt < self.config.max_deliver as u64)
+                })
+                .map(|(&seq, p)| (seq, p.attempt + 1))
+        } else {
+            None
+        };
         let next = if let Some(x) = due {
             Some(x)
         } else if self.config.max_ack_pending > 0
@@ -450,7 +457,6 @@ impl Consumer {
             self.history
                 .insert(d.consumer_sequence, (d.sequence, false));
         }
-        self.advance();
         if self.config.ack_policy == AckPolicy::None {
             self.finish(d.sequence);
         } else {
@@ -464,35 +470,51 @@ impl Consumer {
                     deadline: d.deadline,
                 },
             );
+            self.advance();
         }
     }
     fn finish(&mut self, seq: u64) {
-        self.pending.remove(&seq);
-        self.exhausted.remove(&seq);
-        let finished: Vec<_> = self
-            .history
-            .iter()
-            .filter(|(_, (s, _))| *s == seq)
-            .map(|(n, _)| *n)
-            .collect();
-        for n in finished {
-            self.history.remove(&n);
+        let pending = self.pending.remove(&seq);
+        let exhausted = self.exhausted.remove(&seq);
+        // Retention can finish the same sequence after its ACK already did so.
+        if pending.is_none() && exhausted.is_none() && self.config.ack_policy != AckPolicy::None {
+            return;
+        }
+        if let Some(p) = pending.filter(|p| p.attempt == 1) {
+            self.history.remove(&p.consumer_sequence);
+        } else {
+            // A redelivery retains its original history key. ACK-none also passes
+            // here before a pending entry is installed.
+            let finished: Vec<_> = self
+                .history
+                .iter()
+                .filter(|(_, (s, _))| *s == seq)
+                .map(|(n, _)| *n)
+                .collect();
+            for n in finished {
+                self.history.remove(&n);
+            }
         }
         self.advance();
     }
     fn advance(&mut self) {
         self.ack_floor = self
             .history
-            .keys()
-            .next()
-            .map(|n| n - 1)
+            .get_min()
+            .map(|(n, _)| n - 1)
             .unwrap_or(self.delivered)
             .max(self.ack_floor);
-        self.ack_stream = self
-            .history
-            .values()
-            .map(|(s, _)| s - 1)
-            .min()
+        // Every history sequence has one pending or exhausted entry. Both indexes
+        // are ordered by stream sequence; no history scan is needed for this floor.
+        let first = self
+            .pending
+            .get_min()
+            .map(|(n, _)| *n)
+            .into_iter()
+            .chain(self.exhausted.get_min().copied())
+            .min();
+        self.ack_stream = first
+            .map(|n| n - 1)
             .unwrap_or(self.last_stream)
             .max(self.ack_stream);
     }
@@ -954,8 +976,9 @@ impl State {
         let time = time.max(self.time);
         let mut deliveries = Vec::with_capacity(limit);
         let mut bytes = 0usize;
+        let mut check_due = true;
         for _ in 0..limit {
-            let Some(d) = c.next_delivery(s, time) else {
+            let Some(d) = c.select_delivery(s, time, check_due) else {
                 break;
             };
             let size = s.messages[&d.sequence].size() as usize;
@@ -963,6 +986,12 @@ impl State {
                 break;
             }
             bytes = bytes.saturating_add(size);
+            // Once selection reaches new data, no original reservation is due.
+            // New entries cannot become due at this fixed time unless addition
+            // saturated (including time == u64::MAX).
+            if d.attempt == 1 && d.deadline > time {
+                check_due = false;
+            }
             c.reserve(&d, time);
             deliveries.push(d);
         }
@@ -1098,10 +1127,31 @@ impl State {
                         return Err(invalid("Invalid pending delivery snapshot"));
                     }
                 }
+                let mut history_sequences = OrdSet::new();
                 if c.exhausted.iter().any(|n| !s.messages.contains_key(n))
                     || c.history.iter().any(|(n, (seq, _))| {
-                        *n > c.delivered
+                        *n == 0
+                            || *n > c.delivered
                             || (!c.pending.contains_key(seq) && !c.exhausted.contains(seq))
+                            || history_sequences.insert(*seq).is_some()
+                    })
+                    || history_sequences.len() != c.pending.len() + c.exhausted.len()
+                    || c.ack_floor
+                        != c.history
+                            .get_min()
+                            .map(|(n, _)| n - 1)
+                            .unwrap_or(c.delivered)
+                    || c.ack_stream
+                        != c.history
+                            .values()
+                            .map(|(seq, _)| seq - 1)
+                            .min()
+                            .unwrap_or(c.last_stream)
+                    || c.pending.iter().any(|(seq, p)| {
+                        p.attempt == 1
+                            && c.history
+                                .get(&p.consumer_sequence)
+                                .is_none_or(|(s, _)| s != seq)
                     })
                 {
                     return Err(invalid("Invalid ACK history snapshot"));

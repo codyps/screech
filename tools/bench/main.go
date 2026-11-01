@@ -22,7 +22,7 @@ func main() {
 }
 func run() error {
 	url := flag.String("url", "nats://127.0.0.1:4222", "server URL")
-	scenario := flag.String("scenario", "fanout", "fanout, wildcard, queue, request, durable, consume, consume-one, consume-parallel, consume-limits, consume-next, dedup, durable-parallel, consume-one-parallel, mixed-parallel, mixed-streams, core-stream")
+	scenario := flag.String("scenario", "fanout", "fanout, wildcard, queue, request, durable, consume, consume-one, consume-parallel, consume-ack-window, consume-limits, consume-next, dedup, durable-parallel, consume-one-parallel, mixed-parallel, mixed-streams, core-stream")
 	n := flag.Int("n", 100000, "publishes")
 	size := flag.Int("size", 128, "payload bytes, at least 8")
 	subscribers := flag.Int("subscribers", 1, "subscribers")
@@ -88,7 +88,7 @@ func run() error {
 		}
 		elapsed = time.Since(start)
 		deliveries = int64(*n)
-	} else if *scenario == "consume" || *scenario == "consume-one" || *scenario == "consume-parallel" || *scenario == "consume-limits" || *scenario == "consume-next" {
+	} else if *scenario == "consume" || *scenario == "consume-one" || *scenario == "consume-parallel" || *scenario == "consume-ack-window" || *scenario == "consume-limits" || *scenario == "consume-next" {
 		js, e := pub.JetStream(nats.MaxWait(15 * time.Second))
 		if e != nil {
 			return e
@@ -110,13 +110,17 @@ func run() error {
 				return e
 			}
 		}
-		sub, e := js.PullSubscribe(subject, "D", nats.BindStream(name), nats.AckExplicit(), nats.MaxAckPending(256), nats.AckWait(30*time.Second))
+		maxPending := 256
+		if *scenario == "consume-ack-window" {
+			maxPending = 4096
+		}
+		sub, e := js.PullSubscribe(subject, "D", nats.BindStream(name), nats.AckExplicit(), nats.MaxAckPending(maxPending), nats.AckWait(30*time.Second))
 		if e != nil {
 			return e
 		}
 		defer sub.Unsubscribe()
 		var ackClients []*nats.Conn
-		if *scenario == "consume-parallel" {
+		if *scenario == "consume-parallel" || *scenario == "consume-ack-window" {
 			for i := 0; i < 16; i++ {
 				c, e := nats.Connect(*url)
 				if e != nil {
@@ -131,6 +135,9 @@ func run() error {
 		var nextMessage *nats.Msg
 		for received < *n {
 			batch := 128
+			if *scenario == "consume-ack-window" {
+				batch = 1000
+			}
 			if *scenario == "consume-one" || *scenario == "consume-next" {
 				batch = 1
 			}
@@ -386,7 +393,7 @@ func run() error {
 	}
 	result := map[string]any{"scenario": *scenario, "publishes": *n, "payload_bytes": *size, "subscribers": *subscribers, "deliveries": deliveries, "seconds": elapsed.Seconds(), "publishes_per_second": float64(*n) / elapsed.Seconds(), "deliveries_per_second": float64(deliveries) / elapsed.Seconds(), "checked": true}
 	switch *scenario {
-	case "consume", "consume-one", "consume-parallel", "consume-limits":
+	case "consume", "consume-one", "consume-parallel", "consume-ack-window", "consume-limits":
 		result["latency_scope"] = "confirmed ACK only; Fetch excluded from latency"
 	case "consume-next":
 		result["latency_scope"] = "ACK + next round trip; final ACK only"
@@ -396,6 +403,10 @@ func run() error {
 		result["latency_scope"] = "request / reply round trip"
 	default:
 		result["latency_scope"] = "throughput only; no latency samples"
+	}
+	if *scenario == "consume-ack-window" {
+		result["fetch_batch"] = 1000
+		result["ack_clients"] = 16
 	}
 	if concurrentScenario(*scenario) {
 		result["streams"] = 1

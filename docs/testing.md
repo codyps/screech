@@ -44,6 +44,8 @@ python3 scripts/consumer_crash_tests.py target/debug/screech-server --output res
 python3 scripts/batch_crash_tests.py target/debug/screech-server --output results/batch-process-tests.json
 python3 scripts/single_crash_tests.py target/debug/screech-server --output results/single-process-tests.json
 python3 scripts/io_failure_tests.py target/debug/screech-server --shim ./sqlite-io-fault.so --output results/io-process-tests.json
+python3 scripts/datasync_stall_tests.py target/debug/screech-server --shim ./sqlite-io-fault.so --output results/datasync-stall-tests.json
+python3 scripts/multi_pull_crash_tests.py target/debug/screech-server --output results/multi-pull-tests.json
 python3 scripts/group_crash_tests.py target/debug/screech-server --shim ./sqlite-io-fault.so --output results/group-process-tests.json
 python3 scripts/core_stall_tests.py target/debug/screech-server --output results/core-stall-tests.json
 python3 scripts/persistent_crash_tests.py target/debug/screech-server --output results/persistent-process-tests.json
@@ -99,3 +101,34 @@ See [CI benchmarks](ci-benchmarks.md) for scenarios, sync modes, timing boundari
 reproduction and the generated [dashboard](https://codyps.github.io/screech/). Keep
 benchmark runs separate from tests, profiles and VMs on the same host. Generated
 results and profiles belong in artifacts or local ignored directories.
+
+## Linux data-sync and ACK floors
+
+Cargo enables SQLite's supported fdatasync path on Linux x86-64/AArch64 GNU and
+musl targets. SQLite remains in WAL/FULL mode; reservations and confirmed ACKs
+still require separate completed durable commits. Other targets retain their sync
+defaults. The selected Linux syscall persists data and metadata required to retrieve
+it, including file size; unrelated inode timestamps are not part of the contract.
+
+The syscall interposer verifies fdatasync is actually used, injects errors before
+and after real sync, and hangs it on both sides of reservation and ACK commits.
+Tests require no early durable response, same-connection Core progress, committed
+state recovery after successful sync and preservation of the remaining backlog.
+Process kills before sync may still recover OS-cached writes; they do not model
+page-cache loss. Guest VM kills test the separate page-cache-loss boundary.
+
+ACK-floor histories include first deliveries, redeliveries, NAK/progress/TERM,
+exhaustion, checkpoint/reopen and varied ACK order. Floors are checked against
+independent minima of the reservation history. Recovery rejects missing, duplicate
+or inconsistent history entries before optimized index lookups can be used.
+
+```sh
+PROPTEST_CASES=1024 cargo test --locked --all-features --test durable_model ack_floors_refine
+```
+
+Larger pulls continue across bounded 64-message chunks without an idle sleep after
+delivery progress. Between chunks the worker checks ingress and shutdown; no-progress
+polls retain a bounded wait. The multi-pull crash schedule interrupts the third
+reservation chunk, verifies its committed prefix and Core control traffic, then
+checks all redelivery attempts and ACK/retention effects after restart. The fault-only
+SCREECH_FAULT_AFTER setting chooses a specific occurrence of a selected boundary.

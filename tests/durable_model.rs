@@ -1065,3 +1065,119 @@ proptest! {
         prop_assert_eq!(recovered.state(), &expected);
     }
 }
+
+proptest! {
+    #[test]
+    fn ack_floors_refine_history_through_redelivery_and_exhaustion(
+        count in 65usize..100, ops in prop::collection::vec((0u8..7,any::<bool>(),0u64..5),30..130)
+    ) {
+        let mut engine=Engine::recover(MemoryStore::default()).unwrap();
+        create(&mut engine,stream(Retention::Workqueue));
+        let mut config=consumer("D");config.max_deliver=2;config.ack_wait=3;add(&mut engine,config);
+        for _ in 0..count { publish(&mut engine,"events.a",Bytes::new(),0); }
+        for _ in 0..64 { take(&mut engine,"D",0); }
+        let mut time=0;
+        for (op,last,delta) in ops {
+            time+=delta;
+            if op==0 { take(&mut engine,"D",time); }
+            else if op==5 { engine.commit(Event::Expire{time}).unwrap(); }
+            else if op==6 {
+                engine.checkpoint().unwrap();engine=Engine::recover(engine.into_store()).unwrap();
+            } else {
+                let c=&engine.state().streams["S"].consumers["D"];
+                let chosen=if last { c.history.iter().next_back() } else { c.history.iter().next() };
+                if let Some((&original,(sequence,_)))=chosen {
+                    let sequence=*sequence;
+                    let consumer_sequence=c.pending.get(&sequence).map(|p|p.consumer_sequence).unwrap_or(original);
+                    let event=engine.state().prepare_ack("S","D",AckToken{generation:c.generation,sequence,consumer_sequence},
+                        [AckAction::Ack,AckAction::Nak(1),AckAction::Progress,AckAction::Term][(op-1) as usize].clone(),time).unwrap();
+                    engine.commit(event).unwrap();
+                }
+            }
+            let c=&engine.state().streams["S"].consumers["D"];
+            prop_assert_eq!(c.ack_floor,c.history.keys().next().map(|n|n-1).unwrap_or(c.delivered));
+            prop_assert_eq!(c.ack_stream,c.history.values().map(|(s,_)|s-1).min().unwrap_or(c.last_stream));
+            engine.state().check_invariants().unwrap();
+        }
+    }
+}
+
+#[test]
+fn recovery_rejects_inconsistent_ack_history_indexes() {
+    for mutation in 0..6 {
+        let mut engine = Engine::recover(MemoryStore::default()).unwrap();
+        create(&mut engine, stream(Retention::Workqueue));
+        add(&mut engine, consumer("D"));
+        publish(&mut engine, "events.a", Bytes::new(), 0);
+        take(&mut engine, "D", 0).unwrap();
+        let mut state = engine.state().clone();
+        let c = state
+            .streams
+            .get_mut("S")
+            .unwrap()
+            .consumers
+            .get_mut("D")
+            .unwrap();
+        match mutation {
+            1 => {
+                c.history.clear();
+            }
+            2 => {
+                c.delivered = 2;
+                c.history.insert(2, (1, false));
+            }
+            3 => {
+                c.delivered = 2;
+                c.pending.get_mut(&1).unwrap().consumer_sequence = 2;
+            }
+            4 => {
+                c.ack_floor = 1;
+            }
+            5 => {
+                c.ack_stream = 1;
+            }
+            _ => (),
+        }
+        let bytes = postcard::to_allocvec(&(2u8, state)).unwrap();
+        let mut store = engine.into_store();
+        store
+            .checkpoint(store.last_sequence().unwrap(), &bytes)
+            .unwrap();
+        assert_eq!(Engine::recover(store).is_ok(), mutation == 0);
+    }
+}
+
+#[test]
+fn batch_selection_keeps_immediately_due_saturated_deadlines() {
+    let mut engine = Engine::recover(MemoryStore::default()).unwrap();
+    create(&mut engine, stream(Retention::Workqueue));
+    let mut config = consumer("D");
+    config.max_deliver = 2;
+    add(&mut engine, config);
+    for _ in 0..2 {
+        publish(&mut engine, "events.a", Bytes::new(), 0);
+    }
+    let event = engine
+        .state()
+        .prepare_delivery_batch("S", "D", u64::MAX, 4, 0)
+        .unwrap()
+        .unwrap();
+    let Event::DeliverBatch { deliveries, .. } = &event else {
+        panic!("expected batch")
+    };
+    assert_eq!(
+        deliveries
+            .iter()
+            .map(|d| (d.sequence, d.attempt))
+            .collect::<Vec<_>>(),
+        vec![(1, 1), (1, 2), (2, 1), (2, 2)]
+    );
+    engine.commit(event).unwrap();
+    engine.state().check_invariants().unwrap();
+    let expected = engine.state().clone();
+    engine.checkpoint().unwrap();
+    assert_eq!(
+        Engine::recover(engine.into_store()).unwrap().state(),
+        &expected
+    );
+}

@@ -127,6 +127,7 @@ impl Handle {
                 interests: worker_interests,
             };
             let mut deferred = None;
+            let mut idle_wait = Duration::from_millis(10);
             loop {
                 if worker_stop.load(std::sync::atomic::Ordering::Acquire) {
                     break;
@@ -134,7 +135,7 @@ impl Handle {
                 match deferred
                     .take()
                     .map(Ok)
-                    .unwrap_or_else(|| rx.recv_timeout(Duration::from_millis(10)))
+                    .unwrap_or_else(|| rx.recv_timeout(idle_wait))
                 {
                     Ok(req) if worker.groupable(&req.message) => {
                         crate::fault::group_gate();
@@ -181,9 +182,14 @@ impl Handle {
                     Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(std_mpsc::RecvTimeoutError::Timeout) => (),
                 }
-                if let Err(error) = worker.maintain() {
-                    tracing::error!(%error,"durable worker maintenance failed");
-                }
+                idle_wait = match worker.maintain() {
+                    Ok(true) => Duration::ZERO,
+                    Ok(false) => Duration::from_millis(10),
+                    Err(error) => {
+                        tracing::error!(%error,"durable worker maintenance failed");
+                        Duration::from_millis(10)
+                    }
+                };
             }
             drop(worker);
             let _ = done_tx.send(());
@@ -1480,11 +1486,12 @@ impl<S: Store> Worker<S> {
             let _ = request.response.send(result);
         }
     }
-    fn maintain(&mut self) -> Result<(), String> {
+    fn maintain(&mut self) -> Result<bool, String> {
         if self.engine.is_poisoned() {
-            return Ok(());
+            return Ok(false);
         }
         self.expire()?;
+        let mut progressed = false;
         let n = self.pulls.len();
         for _ in 0..n {
             let mut p = self.pulls.pop_front().unwrap();
@@ -1507,7 +1514,9 @@ impl<S: Store> Worker<S> {
                 self.status(&p.inbox, 408, "Request Timeout", p.remaining)?;
                 continue;
             }
+            let before = p.remaining;
             self.fill(&mut p)?;
+            progressed |= p.remaining < before;
             if p.remaining > 0 {
                 if p.no_wait
                     && self
@@ -1563,8 +1572,10 @@ impl<S: Store> Worker<S> {
                 next_heartbeat: 0,
                 no_wait: false,
             };
+            let before = p.remaining;
             self.fill(&mut p)?;
+            progressed |= p.remaining < before;
         }
-        Ok(())
+        Ok(progressed)
     }
 }

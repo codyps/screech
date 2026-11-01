@@ -50,6 +50,7 @@ jobs:
         run: |
           PROPTEST_CASES=1024 cargo test --locked --all-features --test durable_model tree_projections
           PROPTEST_CASES=2048 cargo test --locked --all-features --test durable_model mixed_groups
+          PROPTEST_CASES=1024 cargo test --locked --all-features --test durable_model ack_floors_refine
       - run: cargo build --locked --features fault-injection
       - run: cc -shared -fPIC -O2 -Wall -Wextra -Werror -o sqlite-io-fault.so scripts/sqlite_io_fault.c -ldl
       - name: Process kills, stalls, ambiguous writes and recovery
@@ -63,6 +64,8 @@ jobs:
           python3 scripts/group_crash_tests.py target/debug/screech-server --shim ./sqlite-io-fault.so --output results/group-process-tests.json
           python3 scripts/core_stall_tests.py target/debug/screech-server --output results/core-stall-tests.json
           python3 scripts/persistent_crash_tests.py target/debug/screech-server --output results/persistent-process-tests.json
+          python3 scripts/datasync_stall_tests.py target/debug/screech-server --shim ./sqlite-io-fault.so --output results/datasync-stall-tests.json
+          python3 scripts/multi_pull_crash_tests.py target/debug/screech-server --output results/multi-pull-tests.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
