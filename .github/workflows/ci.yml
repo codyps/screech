@@ -66,6 +66,7 @@ jobs:
           python3 scripts/persistent_crash_tests.py target/debug/screech-server --output results/persistent-process-tests.json
           python3 scripts/datasync_stall_tests.py target/debug/screech-server --shim ./sqlite-io-fault.so --output results/datasync-stall-tests.json
           python3 scripts/multi_pull_crash_tests.py target/debug/screech-server --output results/multi-pull-tests.json
+          python3 scripts/group_extension_tests.py target/debug/screech-server --shim ./sqlite-io-fault.so --output results/group-extension-tests.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:

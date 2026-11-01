@@ -1639,6 +1639,10 @@ pub fn time_parse(s: &str) -> Result<u64, Error> {
         .and_then(|t| u64::try_from(t.unix_timestamp_nanos()).ok())
         .ok_or(invalid("Invalid timestamp"))
 }
+// Checkpoints bound replay work; every preceding append is already durable.
+const CHECKPOINT_RECORDS: usize = 8192;
+const CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
+
 pub struct Engine<S> {
     state: State,
     store: S,
@@ -1672,10 +1676,14 @@ impl<S: Store> Engine<S> {
         } else {
             (0, State::default())
         };
+        let mut log_bytes = 0usize;
         for seq in base + 1..=last {
             let record = store
                 .get(seq)?
                 .ok_or(invalid("Missing committed log record"))?;
+            log_bytes = log_bytes
+                .saturating_add(record.headers.len())
+                .saturating_add(record.payload.len());
             let event = match record.subject.as_str() {
                 "$SCREECH.event.v1" => serde_json::from_slice(&record.payload)?,
                 "$SCREECH.event.v2" => {
@@ -1697,7 +1705,7 @@ impl<S: Store> Engine<S> {
             poisoned: false,
             log_sequence: last,
             since_checkpoint: (last - base) as usize,
-            log_bytes: 0,
+            log_bytes,
             identity: std::sync::Arc::new(()),
             #[cfg(feature = "fault-injection")]
             committed_groups: 0,
@@ -1793,7 +1801,7 @@ impl<S: Store> Engine<S> {
         self.since_checkpoint += plan.records.len();
         self.log_bytes += plan.bytes;
         if self.store.supports_checkpoint()
-            && (self.since_checkpoint >= 2048 || self.log_bytes >= 8 * 1024 * 1024)
+            && (self.since_checkpoint >= CHECKPOINT_RECORDS || self.log_bytes >= CHECKPOINT_BYTES)
         {
             self.checkpoint()?;
         }
@@ -1826,7 +1834,7 @@ impl<S: Store> Engine<S> {
         self.since_checkpoint += 1;
         self.log_bytes += bytes.len() + payload.len();
         if self.store.supports_checkpoint()
-            && (self.since_checkpoint >= 2048 || self.log_bytes >= 8 * 1024 * 1024)
+            && (self.since_checkpoint >= CHECKPOINT_RECORDS || self.log_bytes >= CHECKPOINT_BYTES)
         {
             self.checkpoint()?;
         }

@@ -168,7 +168,7 @@ impl Handle {
                         } else if worker.engine.supports_groups()
                             && (requests.len() > 1 || active_consumers)
                         {
-                            worker.group_requests(requests);
+                            worker.group_requests(requests, &rx, &mut deferred);
                         } else {
                             let req = requests.pop().unwrap();
                             let result = worker.handle(req.message);
@@ -567,7 +567,12 @@ impl<S: Store> Worker<S> {
     #[cfg(not(feature = "fault-injection"))]
     #[inline(always)]
     fn after_commit_point(&self, _: &'static str) {}
-    fn group_requests(&mut self, requests: Vec<Request>) {
+    fn group_requests(
+        &mut self,
+        requests: Vec<Request>,
+        ingress: &std_mpsc::Receiver<Request>,
+        deferred: &mut Option<Request>,
+    ) {
         match self.engine.begin_group() {
             Ok(plan) => self.plan = Some(plan),
             Err(error) => {
@@ -577,8 +582,35 @@ impl<S: Store> Worker<S> {
                 return;
             }
         }
-        let mut completed = Vec::with_capacity(requests.len());
-        for request in requests {
+        let mut bytes: usize = requests
+            .iter()
+            .map(|r| r.message.payload.len() + r.message.headers.len())
+            .sum();
+        let mut count = requests.len();
+        let mut requests = requests.into_iter();
+        let mut completed = Vec::with_capacity(32);
+        loop {
+            let request = if let Some(request) = requests.next() {
+                request
+            } else {
+                // Admit arrivals during projection work, without a timer or wait.
+                // Never cross a previously encountered fence or the group bounds.
+                if deferred.is_some() || count >= 32 {
+                    break;
+                }
+                crate::fault::group_extend_gate();
+                let Ok(request) = ingress.try_recv() else {
+                    break;
+                };
+                let size = request.message.payload.len() + request.message.headers.len();
+                if !self.groupable(&request.message) || bytes + size > 1024 * 1024 {
+                    *deferred = Some(request);
+                    break;
+                }
+                bytes += size;
+                count += 1;
+                request
+            };
             let result = self.handle(request.message);
             completed.push((request.response, result, request._permit));
         }

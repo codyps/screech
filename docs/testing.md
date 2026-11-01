@@ -136,3 +136,14 @@ polls retain a bounded wait. The multi-pull crash schedule interrupts the third
 reservation chunk, verifies its committed prefix and Core control traffic, then
 checks all redelivery attempts and ACK/retention effects after restart. The fault-only
 SCREECH_FAULT_AFTER setting chooses a specific occurrence of a selected boundary.
+
+Group-extension schedules pause after the initial requests have been projected, then
+queue later requests. Kills before/after commit check the exact durable prefix, with
+separate cases for read fences, request-count bounds and input-byte bounds. Functional
+cases verify the fenced read's state and later replies. Real sync stalls verify that
+Core forwarding continues and that JetStream replies remain private until commit.
+
+Checkpoint-budget tests cross the record threshold in individual and grouped
+appends, restart just below it, and verify group overshoot and checkpoint replay.
+Byte-budget tests restart with an uncheckpointed prefix and require its encoded
+bytes to count toward the next automatic checkpoint.

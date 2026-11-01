@@ -1181,3 +1181,86 @@ fn batch_selection_keeps_immediately_due_saturated_deadlines() {
         &expected
     );
 }
+
+#[test]
+fn checkpoint_record_budget_survives_recovery_and_group_overshoot() {
+    for width in [1, 32] {
+        let mut engine = Engine::recover(MemoryStore::default()).unwrap();
+        create(&mut engine, stream(Retention::Limits));
+        let mut remaining = 8190;
+        while remaining > 0 {
+            let n = remaining.min(width);
+            let mut plan = engine.begin_group().unwrap();
+            for _ in 0..n {
+                let event = plan
+                    .state()
+                    .prepare_publish("S", "events.a", Bytes::new(), Bytes::from_static(b"v"), 0)
+                    .unwrap();
+                plan.commit(event).unwrap();
+            }
+            engine.commit_group(plan).unwrap();
+            remaining -= n;
+        }
+        let store = engine.into_store();
+        assert!(store.load_checkpoint().unwrap().is_none());
+        let mut engine = Engine::recover(store).unwrap();
+        let mut plan = engine.begin_group().unwrap();
+        for _ in 0..2 {
+            let event = plan
+                .state()
+                .prepare_publish("S", "events.a", Bytes::new(), Bytes::from_static(b"v"), 0)
+                .unwrap();
+            plan.commit(event).unwrap();
+        }
+        engine.commit_group(plan).unwrap();
+        let store = engine.into_store();
+        assert_eq!(store.load_checkpoint().unwrap().unwrap().0, 8193);
+        assert!(store.get(8193).unwrap().is_none());
+        let engine = Engine::recover(store).unwrap();
+        assert_eq!(engine.state().streams["S"].messages.len(), 8192);
+        engine.state().check_invariants().unwrap();
+    }
+}
+
+#[test]
+fn checkpoint_byte_budget_includes_replayed_records() {
+    for grouped in [false, true] {
+        let mut engine = Engine::recover(MemoryStore::default()).unwrap();
+        create(&mut engine, stream(Retention::Limits));
+        let body = Bytes::from(vec![0x5a; 1024 * 1024]);
+        for phase in 0..2 {
+            for _ in 0..2 {
+                if grouped {
+                    let mut plan = engine.begin_group().unwrap();
+                    for _ in 0..2 {
+                        let event = plan
+                            .state()
+                            .prepare_publish("S", "events.a", Bytes::new(), body.clone(), 0)
+                            .unwrap();
+                        plan.commit(event).unwrap();
+                    }
+                    engine.commit_group(plan).unwrap();
+                } else {
+                    for _ in 0..2 {
+                        let event = engine
+                            .state()
+                            .prepare_publish("S", "events.a", Bytes::new(), body.clone(), 0)
+                            .unwrap();
+                        engine.commit(event).unwrap();
+                    }
+                }
+            }
+            let store = engine.into_store();
+            assert_eq!(
+                store.load_checkpoint().unwrap().map(|(seq, _)| seq),
+                if phase == 0 { None } else { Some(9) }
+            );
+            engine = Engine::recover(store).unwrap();
+        }
+        assert_eq!(engine.state().streams["S"].messages.len(), 8);
+        for message in engine.state().streams["S"].messages.values() {
+            assert_eq!(message.payload, body);
+        }
+        engine.state().check_invariants().unwrap();
+    }
+}

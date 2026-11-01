@@ -134,3 +134,21 @@ pub fn group_context(base: u64, records: &[crate::storage::Append]) {
 #[cfg(not(feature = "fault-injection"))]
 #[inline(always)]
 pub fn group_context(_: u64, _: &[crate::storage::Append]) {}
+
+/// Pause after the initial projection, before admitting arrivals during assembly.
+#[cfg(feature = "fault-injection")]
+pub fn group_extend_gate() {
+    let Ok(path) = std::env::var("SCREECH_GROUP_EXTEND_GATE") else {
+        return;
+    };
+    if std::path::Path::new(&format!("{path}.release")).exists() {
+        return;
+    }
+    std::fs::write(format!("{path}.ready"), b"ready").expect("group extension marker");
+    while !std::path::Path::new(&format!("{path}.release")).exists() {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+#[cfg(not(feature = "fault-injection"))]
+#[inline(always)]
+pub fn group_extend_gate() {}

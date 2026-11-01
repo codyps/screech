@@ -2,7 +2,9 @@
 
 Normal synchronous publications, Fetch(1) and ACK requests can share a SQLite FULL
 transaction across streams and consumers. Only already queued work joins a group;
-there is no assembly timer or client extension. Pending pulls and interested push
+there is no assembly timer or client extension. Requests arriving while the private
+projection is being processed can join before its commit. Collection remains FIFO:
+a read/catalog fence or the 32-request/1 MiB limit ends admission to that group. Pending pulls and interested push
 consumers can join the changes that make delivery eligible.
 
 ```mermaid
@@ -34,6 +36,11 @@ Only after FULL commit succeeds does Engine publish the projection and release
 staged JetStream replies, delivery reservations and ACK confirmations. Unknown write
 outcomes poison the engine; no speculative success is exposed before recovery.
 Checkpoints serialize the live model and reclaim covered events atomically.
+Automatic checkpoints trigger after 8,192 records or 8 MiB of encoded event bytes;
+a final group can cross a threshold. Replay restores both counters. This bounds
+recovery work while amortizing snapshot serialization and WAL restart costs. The
+append is fully durable before checkpointing, so the interval affects replay work
+and retained log size, not which confirmed operations survive a crash.
 
 Live Core routing runs separately, before storage admission/completion. Core messages
 can be observed even if their JetStream writes later fail or disappear after a crash.
