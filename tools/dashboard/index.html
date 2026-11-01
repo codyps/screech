@@ -13,7 +13,7 @@
 <section class="intro"><h1>Benchmarks</h1><p class="lede">Screech and NATS, by workload and storage sync mode.</p><div class="meta"><a id="revision"></a><a id="run-link">Workflow run</a><span id="generated"></span></div></section>
 <section class="controls" aria-label="Benchmark controls">
 <label>Campaign<select id="campaign"></select></label>
-<label>Metric<select id="metric"><option value="deliveries_per_second">Throughput · messages/s</option><option value="p50_us">Median latency · µs</option><option value="p95_us">p95 latency · µs</option><option value="p99_us">p99 latency · µs</option><option value="durable_p50_us">Core-on-stream: durable ACK p50 · µs</option><option value="server_cpu_seconds">Server CPU · seconds</option><option value="server_rss_kib">Final server RSS · MiB</option></select></label>
+<label>Metric<select id="metric"><option value="deliveries_per_second">Throughput · messages/s</option><option value="p50_us">Median latency · µs</option><option value="p95_us">p95 latency · µs</option><option value="p99_us">p99 latency · µs</option><option value="fetch_p50_us">Fetch(1) p50 · µs</option><option value="cycle_p50_us">Fetch(1) + ACK cycle p50 · µs</option><option value="durable_p50_us">Core-on-stream: durable ACK p50 · µs</option><option value="server_cpu_seconds">Server CPU · seconds</option><option value="server_rss_kib">Final server RSS · MiB</option></select></label>
 <label>Compare Screech to<select id="baseline"></select></label>
 <label>Find a case<input id="search" type="search" placeholder="Fetch, mixed, 1024…"></label>
 </section>

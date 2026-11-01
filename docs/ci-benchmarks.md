@@ -54,7 +54,11 @@ baseline, search and view are encoded in the URL for sharing. Series visibility 
 local to the current view. Bar scales are per case; raw numbers remain visible.
 
 Sequential consumer latency samples time ACK confirmation only; Fetch is included
-in overall throughput but excluded from those latency samples. Concurrent consumer
+in overall throughput but excluded from those latency samples. Separate Fetch(1)
+also reports fetch_p50/p95/p99_us (request to delivery) and cycle_p50/p95/p99_us
+(request through confirmed ACK, including client validation). The dashboard exposes
+Fetch and cycle p50 separately; cycle percentiles are measured directly rather than
+computed by adding Fetch and ACK percentiles. Concurrent consumer
 samples cover Fetch(1) through confirmed ACK. Core-on-stream callback and durable
 ACK latency are separate metrics. Missing samples remain absent. Reported percentile
 values are medians of per-trial percentiles, not pooled sample percentiles. CPU deltas

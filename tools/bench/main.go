@@ -45,6 +45,11 @@ func run() error {
 	var deliveries int64
 	var latencies []float64
 	var durableLatencies []float64
+	var fetchLatencies, cycleLatencies []float64
+	if *scenario == "consume-one" {
+		fetchLatencies = make([]float64, 0, *n)
+		cycleLatencies = make([]float64, 0, *n)
+	}
 	subject := fmt.Sprintf("bench.%d", time.Now().UnixNano())
 	if *scenario == "core-stream" {
 		elapsed, latencies, durableLatencies, e = runCoreStream(*url, subject, *n, *size, options)
@@ -134,6 +139,7 @@ func run() error {
 		received := 0
 		var nextMessage *nats.Msg
 		for received < *n {
+			cycleStart := time.Now()
 			batch := 128
 			if *scenario == "consume-ack-window" {
 				batch = 1000
@@ -153,6 +159,9 @@ func run() error {
 				if e != nil {
 					return e
 				}
+			}
+			if *scenario == "consume-one" {
+				fetchLatencies = append(fetchLatencies, float64(time.Since(cycleStart).Nanoseconds())/1000)
 			}
 			for i, m := range messages {
 				meta, e := m.Metadata()
@@ -201,6 +210,9 @@ func run() error {
 					}
 					times[i] = float64(time.Since(t).Nanoseconds()) / 1000
 				}
+			}
+			if *scenario == "consume-one" {
+				cycleLatencies = append(cycleLatencies, float64(time.Since(cycleStart).Nanoseconds())/1000)
 			}
 			latencies = append(latencies, times...)
 			received += len(messages)
@@ -455,6 +467,15 @@ func run() error {
 		sort.Float64s(latencies)
 		for _, p := range []int{50, 95, 99} {
 			result[fmt.Sprintf("p%d_us", p)] = latencies[(len(latencies)-1)*p/100]
+		}
+	}
+	for prefix, samples := range map[string][]float64{"fetch": fetchLatencies, "cycle": cycleLatencies} {
+		if len(samples) == 0 {
+			continue
+		}
+		sort.Float64s(samples)
+		for _, p := range []int{50, 95, 99} {
+			result[fmt.Sprintf("%s_p%d_us", prefix, p)] = samples[(len(samples)-1)*p/100]
 		}
 	}
 	return json.NewEncoder(os.Stdout).Encode(result)

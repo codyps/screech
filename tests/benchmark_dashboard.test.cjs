@@ -36,3 +36,13 @@ test('unchecked rows and unknown metrics fail closed', () => {
   assert.throws(()=>summarize([trial('screech',1,{checked:false})],'p50_us'));
   assert.throws(()=>summarize([], 'bogus'));
 });
+
+test('Fetch and cycle metrics preserve missing data and their timing boundaries', () => {
+  const rows = [trial('screech', 20, {scenario:'consume-one', fetch_p50_us:30, cycle_p50_us:55}), trial('nats-main', 10, {scenario:'consume-one'})];
+  assert.equal(summarize(rows, 'fetch_p50_us')[0].series.get('screech').median, 30);
+  assert.equal(summarize(rows, 'cycle_p50_us')[0].series.get('screech').median, 55);
+  assert.equal(summarize(rows, 'cycle_p50_us')[0].series.get('nats-main').median, null);
+  assert.equal(scope(rows[0], 'fetch_p50_us'), 'Fetch(1) request to delivery');
+  assert.equal(scope(rows[0], 'cycle_p50_us'), 'Fetch(1) through confirmed ACK');
+  assert.match(scope(rows[0], 'p50_us'), /Fetch excluded/);
+});

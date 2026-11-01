@@ -6,6 +6,8 @@
     p50_us: {unit: 'µs', note: 'Lower is better. Median of trial p50 values. Read each case’s latency boundary.'},
     p95_us: {unit: 'µs', note: 'Lower is better. Median of trial p95 values, not a pooled p95.'},
     p99_us: {unit: 'µs', note: 'Lower is better. Median of trial p99 values, not a pooled p99.'},
+    fetch_p50_us: {unit: 'µs', note: 'Lower is better. Fetch(1) request to delivery, including the durable reservation.'},
+    cycle_p50_us: {unit: 'µs', note: 'Lower is better. Fetch(1) request through confirmed ACK, including client validation.'},
     durable_p50_us: {unit: 'µs', note: 'Lower is better. Durable publish ACK latency, measured separately from the live Core callback.'},
     server_cpu_seconds: {unit: 's', note: 'Lower is better. Server CPU includes setup, prefill, validation and teardown, not only the timed workload.'},
     server_rss_kib: {unit: 'MiB', note: 'Lower is better. Final resident memory; this is not peak RSS.'}
@@ -33,7 +35,9 @@
     const a = [...values].sort((a, b) => a - b), mid = Math.floor(a.length / 2);
     return a.length % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
   }
-  function scope(row) {
+  function scope(row, metric) {
+    if (metric === 'fetch_p50_us') return 'Fetch(1) request to delivery';
+    if (metric === 'cycle_p50_us') return 'Fetch(1) through confirmed ACK';
     if (row.latency_scope) return row.latency_scope;
     if (['consume', 'consume-one', 'consume-limits', 'consume-parallel', 'consume-ack-window'].includes(row.scenario)) return 'confirmed ACK only; Fetch excluded from latency';
     if (row.scenario === 'consume-next') return 'ACK + next round trip; final ACK only';
@@ -137,7 +141,7 @@
         const tr = el('tr'); for (const text of [`${g.title} · ${details}`, name, `${format(s.median)} ${meta.unit}`, `${format(s.min)}–${format(s.max)}`, s.trials]) tr.append(el('td', text));
         $('table-body').append(tr);
       }
-      card.append(el('p', `Latency: ${scope(r)}. ${meta.unit}. Observed trial ranges are available on each bar.`, 'case-note'));
+      card.append(el('p', `Latency: ${scope(r, state.metric)}. ${meta.unit}. Observed trial ranges are available on each bar.`, 'case-note'));
       $('charts').append(card);
     }
     $('empty').hidden = groups.length > 0; $('charts').hidden = state.table; $('table-view').hidden = !state.table;

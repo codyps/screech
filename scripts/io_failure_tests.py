@@ -11,7 +11,7 @@ def attempt(call):
 
 def run(binary,shim):
     results=[]
-    for phase in ['reservation','ack','checkpoint','reservation-reuse']:
+    for phase in ['reservation','ack','checkpoint','reservation-reuse','ack-reuse']:
         for mode in ['sync-before-eio','sync-after-eio','write-enospc','short-write']:
             with tempfile.TemporaryDirectory(prefix='screech-io-') as tmp:
                 directory=Path(tmp);arm=directory/'armed';hit=directory/'hit'
@@ -21,10 +21,10 @@ def run(binary,shim):
                     r=c.request('$JS.API.STREAM.CREATE.T',{'name':'T','subjects':['test.>'],'storage':'file','retention':'workqueue'})
                     assert 'error' not in r,r
                     c.create_consumer();c.publish(b'old');old=c.pull();c.ack(old);c.publish(b'value')
-                    pending=c.pull() if phase in ['ack','checkpoint'] else None
-                    if phase=='reservation-reuse':assert c.request('$JS.API.SCREECH.CHECKPOINT',{})['success']
+                    pending=c.pull() if phase in ['ack','checkpoint','ack-reuse'] else None
+                    if phase.endswith('-reuse'):assert c.request('$JS.API.SCREECH.CHECKPOINT',{})['success']
                     arm.touch()
-                    if phase=='ack':result=attempt(lambda:(c.ack(pending),True)[1]);success=result is not None
+                    if phase in ['ack','ack-reuse']:result=attempt(lambda:(c.ack(pending),True)[1]);success=result is not None
                     elif phase=='checkpoint':result=attempt(lambda:c.request('$JS.API.SCREECH.CHECKPOINT',{}));success=bool(result and result.get('success'))
                     else:result=attempt(c.pull);success=bool(result and result.get('payload')==b'value')
                     assert hit.exists(),(phase,mode,'interposer never hit',result)
@@ -43,7 +43,7 @@ def run(binary,shim):
                     assert c.get(1) is None,'earlier confirmed ACK was undone'
                     info=c.request('$JS.API.CONSUMER.INFO.T.D',{})
                     retained=c.get(2)
-                    if phase=='ack':
+                    if phase in ['ack','ack-reuse']:
                         assert retained in [None,b'value']
                         committed=retained is None
                         assert info['num_ack_pending']==int(not committed),info

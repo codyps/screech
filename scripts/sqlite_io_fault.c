@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 static atomic_int fired;
+static atomic_uint matching_calls;
 static int matches(int fd, int sync_call) {
     const char *mode = getenv("SCREECH_IO_MODE"), *arm = getenv("SCREECH_IO_ARM");
     if (!mode || !arm || (sync_call != (strncmp(mode, "sync-", 5) == 0)) || access(arm, F_OK)) return 0;
@@ -22,6 +23,9 @@ static int matches(int fd, int sync_call) {
     const char *suffix = target && !strcmp(target, "db") ? "data.db" : "data.db-wal";
     size_t length = strlen(suffix);
     if ((size_t)size < length || strcmp(path+size-length, suffix)) return 0;
+    /* Select a later sync, e.g. the commit after WAL-header synchronization. */
+    const char *skip = getenv("SCREECH_IO_AFTER");
+    if (skip && atomic_fetch_add(&matching_calls, 1) < strtoul(skip, NULL, 10)) return 0;
     int expected = 0;
     return atomic_compare_exchange_strong(&fired, &expected, 1);
 }

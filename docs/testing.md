@@ -113,7 +113,11 @@ it, including file size; unrelated inode timestamps are not part of the contract
 The syscall interposer verifies fdatasync is actually used, injects errors before
 and after real sync, and hangs it on both sides of reservation and ACK commits.
 Tests require no early durable response, same-connection Core progress, committed
-state recovery after successful sync and preservation of the remaining backlog.
+state recovery after successful commit sync and preservation of the remaining backlog.
+After WAL restart, tests separately interrupt the header sync and commit sync. A
+completed header sync does not imply the new transaction committed. An earlier
+confirmed ACK must survive each interruption. WAL reuse is also tested with ACK
+sync errors, ENOSPC and short writes; uncertain failures poison further mutation.
 Process kills before sync may still recover OS-cached writes; they do not model
 page-cache loss. Guest VM kills test the separate page-cache-loss boundary.
 
