@@ -2,10 +2,14 @@ use eyre::Context;
 use std::{collections::HashMap, net::SocketAddr};
 use tokio_util::codec::Decoder;
 use tracing::warn;
+use std::fmt;
+use eyre::WrapErr;
 
 use tokio::net::ToSocketAddrs;
 
-mod msg;
+
+pub use msg::NatsMessage;
+pub mod msg;
 
 struct Client {
     // TODO: allow for unix sockets
@@ -77,6 +81,7 @@ impl Server {
     }
 }
 
+/*
 struct NatsDecoder {
     /// Last index we read to check for a `cr/lf`. Never advanced into a `cr` so we can
     /// always scan for the `cr/lf` pair.
@@ -86,7 +91,7 @@ struct NatsDecoder {
 
 impl Decoder for NatsDecoder {
     // TODO: parse out a message from the bytes
-    type Item = &[u8];
+    type Item = bytes::Bytes;
     type Error = Error;
 
     fn decode(&mut self, src: &mut bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
@@ -108,9 +113,24 @@ impl Decoder for NatsDecoder {
         }
     }
 }
+*/
 
-#[derive(Debug, thiserror::Error)]
-enum Error {
+#[derive(thiserror::Error)]
+pub enum Error {
     // FIXME: eliminate these
     Eyre(#[from] eyre::Report),
+}
+
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Eyre(e) => write!(f, "{:?}", e),
+        }
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Error: {:?}", self)
+    }
 }

@@ -19,7 +19,6 @@
             rustc
             cargo
             rustfmt
-            sccache
             clippy
             rust-analyzer
             cargo-outdated
@@ -29,11 +28,16 @@
             natscli
           ] ++ lib.optional stdenv.isDarwin [
             darwin.apple_sdk.frameworks.SystemConfiguration
+            llvmPackages.lldb
             iconv
           ];
 
-          RUSTC_WRAPPER = "sccache";
+          
           RUST_SRC_PATH = "${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";
+
+          # if we're darwin, set the lldb debugserver path.
+          # This is a hack, see https://github.com/NixOS/nixpkgs/pull/374846 and https://github.com/NixOS/nixpkgs/issues/252838
+          LLDB_DEBUGSERVER_PATH = if pkgs.stdenv.isDarwin then "/Applications/Xcode.app/Contents/SharedFrameworks/LLDB.framework/Versions/A/Resources/debugserver" else null;
         };
       }
     );
