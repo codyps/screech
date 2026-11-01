@@ -85,3 +85,9 @@ The renderer uses Python's standard library and bundles vanilla HTML/CSS/JavaScr
 no third-party CDN or browser build dependencies are needed. Its reducer is tested
 with node --test tests/benchmark_dashboard.test.cjs. Run Python tests with
 python3 -m unittest discover -s tests -p 'test_*.py'.
+
+Core bulk sends use 1024-publication windows. The publisher flush follows routing;
+subscriber flushes follow their queued deliveries before the next window starts.
+This keeps the workload within bounded pending queues, applies identical pacing to
+both servers and is included in throughput timing. Raw rows record core_window.
+Driver errors and per-server logs are preserved in the benchmark-results artifact.

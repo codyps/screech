@@ -4,6 +4,8 @@ import argparse
 import json
 import os
 import re
+import sys
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 import platform
@@ -78,8 +80,14 @@ def main(args):
                             row=json.loads(result.stdout);row.update(server=label,trial=trial,server_rss_kib=after['rss_kib'],server_cpu_seconds=(after['cpu_seconds']-before['cpu_seconds']) if after['cpu_seconds'] is not None and before['cpu_seconds'] is not None else None)
                             rows.append(row);print(json.dumps(row),flush=True)
                             args.output.with_suffix('.jsonl').open('a').write(json.dumps(row)+'\n')
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                    print(f"Checked workload failed: {label} {scenario} size={size} subscribers={subs}",file=sys.stderr)
+                    if error.stdout:print(error.stdout,file=sys.stderr)
+                    if error.stderr:print(error.stderr,file=sys.stderr)
+                    raise
                 finally:
                     process.kill();process.wait();log.close()
+                    shutil.copy2(directory/'server.log',args.output.parent/f'{args.output.stem}-{label}-{"durable" if durable else "core"}-server.log')
     cpu=next((x.split(':',1)[1].strip() for x in Path('/proc/cpuinfo').read_text().splitlines() if x.startswith('model name')),platform.processor())
     output={'environment':{'recorded_at':datetime.now(timezone.utc).isoformat(),'nats_sync_intervals':['always']+(['default 2m'] if args.nats_default else [])+args.nats_sync_interval,'kernel':platform.release(),'cpu':cpu,'logical_cpus':os.cpu_count(),'server_workers':2,'transport':'loopback TCP','durability':'SQLite WAL FULL; nats-main sync_interval always; optional nats-default uses default 2m','nats_commit':args.nats_commit,'screech_binary_sha256':__import__('hashlib').sha256(Path(args.screech).read_bytes()).hexdigest(),'screech_before_binary_sha256':__import__('hashlib').sha256(Path(args.screech_before).read_bytes()).hexdigest() if args.screech_before else None,'nats_binary_sha256':__import__('hashlib').sha256(Path(args.nats).read_bytes()).hexdigest(),'rustc':subprocess.check_output(['rustc','--version'],text=True).strip(),'nats_version':subprocess.check_output([args.nats,'--version'],text=True).strip(),'concurrent_test_workloads':False},'commands':commands,'rows':rows}
     args.output.write_text(json.dumps(output,indent=2)+'\n')

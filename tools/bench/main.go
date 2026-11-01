@@ -307,12 +307,14 @@ func run() error {
 		var once sync.Once
 		var total atomic.Int64
 		seen := make([]atomic.Uint32, *n)
+		var readers []*nats.Conn
 		for s := 0; s < *subscribers; s++ {
 			conn, e := nats.Connect(*url, options...)
 			if e != nil {
 				return e
 			}
 			defer conn.Close()
+			readers = append(readers, conn)
 			expected := uint64(0)
 			callback := func(m *nats.Msg) {
 				if len(m.Data) != *size {
@@ -358,6 +360,19 @@ func run() error {
 				return e
 			}
 		}
+		flushWindow := func() error {
+			if e := pub.Flush(); e != nil {
+				return e
+			}
+			// Publisher PONG follows routing. Each subscriber PONG then follows
+			// its queued deliveries, bounding server backlog to one send window.
+			for _, reader := range readers {
+				if e := reader.Flush(); e != nil {
+					return e
+				}
+			}
+			return nil
+		}
 		start := time.Now()
 		for i := 0; i < *n; i++ {
 			binary.LittleEndian.PutUint64(payload, uint64(i))
@@ -365,12 +380,12 @@ func run() error {
 				return e
 			}
 			if i%1024 == 1023 {
-				if e = pub.Flush(); e != nil {
+				if e = flushWindow(); e != nil {
 					return e
 				}
 			}
 		}
-		if e = pub.Flush(); e != nil {
+		if e = flushWindow(); e != nil {
 			return e
 		}
 		select {
@@ -403,6 +418,9 @@ func run() error {
 		result["latency_scope"] = "request / reply round trip"
 	default:
 		result["latency_scope"] = "throughput only; no latency samples"
+	}
+	if *scenario == "fanout" || *scenario == "wildcard" || *scenario == "queue" {
+		result["core_window"] = 1024
 	}
 	if *scenario == "consume-ack-window" {
 		result["fetch_batch"] = 1000
