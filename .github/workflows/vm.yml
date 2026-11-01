@@ -1,0 +1,39 @@
+name: guest crash recovery
+on:
+  workflow_call:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  vm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          shared-key: debug
+      - run: sudo apt-get update && sudo apt-get install -y linux-image-generic busybox-static qemu-system-x86 e2fsprogs kmod zstd
+      - run: cargo build --locked --features fault-injection
+      - name: Kill and restart a disposable guest three times
+        shell: bash
+        run: |
+          kernel=$(ls -v /boot/vmlinuz-* | tail -1)
+          release=${kernel##*/vmlinuz-}
+          sudo chmod a+r "$kernel"
+          python3 scripts/vm_crash_test.py \
+            --binary target/debug/screech-server \
+            --kernel "$kernel" --modules / --kernel-release "$release" \
+            --busybox /bin/busybox --qemu /usr/bin/qemu-system-x86_64 \
+            --modprobe /sbin/modprobe --mkfs /sbin/mkfs.ext4 \
+            --work-dir vm-work --force-checkpoint --concurrent --output vm-tests.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: vm-crash-tests
+          path: |
+            vm-tests.json
+            vm-work/guest-*.log

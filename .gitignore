@@ -1,1 +1,15 @@
 /target
+/data
+/bench-driver
+/vm-work
+/process-tests.json
+/vm-tests.json
+__pycache__/
+*.pyc
+
+/_site
+/results
+/upstream
+/bin
+/sqlite-io-fault.so
+/*-tests.json

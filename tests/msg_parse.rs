@@ -2,13 +2,7 @@ use screech::{msg, NatsMessage};
 use tracing::info;
 
 pub fn with_tracing<T>(f: impl FnOnce() -> T) -> T {
-    let subscriber = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_line_number(true)
-        .with_file(true)
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-        .finish();
-    tracing::subscriber::with_default(subscriber, f)
+    f()
 }
 
 #[test]

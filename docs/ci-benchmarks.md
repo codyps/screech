@@ -1,0 +1,87 @@
+# CI and the benchmark dashboard
+
+[Live dashboard](https://codyps.github.io/screech/) · [CI runs](https://github.com/codyps/screech/actions/workflows/ci.yml)
+
+CI runs on pushes to main, pull requests, manual dispatch and Mondays at 04:17 UTC.
+The correctness job runs formatting, default/all-feature Clippy, Rust tests, extended
+projection/group properties, dashboard reducer/generator tests and process faults.
+The reusable guest workflow kills and recovers a disposable VM three times, including
+forced checkpoints and concurrent commits. Each test artifact is downloadable from
+its workflow run. A manual guest-only run remains available in vm.yml.
+
+After correctness passes, separate runners execute guest recovery and benchmarks.
+Benchmark jobs build release Screech without fault hooks, the official nats.go driver,
+and NATS from main (or a manually supplied ref). The resolved NATS SHA, binary hashes,
+versions, CPU/kernel, trial counts and commands are preserved with raw JSON. Tests,
+VMs and profiling do not share the benchmark runner. Hosted machines are shared and
+unpinned; cross-run differences can reflect hardware and filesystem variation.
+
+The default campaign runs three checked trials per case, plus warmups. It covers
+Core fanout/wildcards/queues/request-reply, live Core on a stream, sequential and
+concurrent durable publishers, pull consumers, ACK-and-next, dedup, retention and
+mixed workloads. A second campaign runs four concurrent cases at 20,000 messages.
+There are 246 measured trials at the default settings: 198 standard and 48 larger.
+A manual CI run can set trials (1–10) and nats_ref (branch, tag or SHA).
+
+## Storage modes
+
+| Series | Configuration | Interpretation |
+| --- | --- | --- |
+| Screech · FULL | SQLite WAL, synchronous FULL | Durable publish ACKs, reservations and confirmed consumer ACKs follow commit |
+| NATS · always | sync_interval: always | Stream writes are synced; standalone consumer state can still flush asynchronously |
+| NATS · 10 ms | sync_interval: 10ms | Stream syncing is deferred between intervals |
+| NATS · default 2m | sync_interval omitted | NATS' documented two-minute default; this is not an equal power-loss contract |
+
+Core cases use no stream storage; their labels say Core. Additional intervals can
+be added to the runner with repeatable --nats-sync-interval values. These are NATS
+settings; Screech's durability configuration is unchanged. Upstream configuration
+and behavior can evolve, so each campaign records the exact NATS commit.
+
+## Publishing and reading results
+
+A successful main run publishes the static dashboard to GitHub Pages after both
+recovery and benchmark jobs pass. PRs upload the same generated site as a downloadable
+benchmark-site artifact without deploying it. Failed campaigns do not replace the
+last successful page. Benchmark-results retains raw JSON/JSONL and launch metadata;
+benchmark-site contains a self-contained page and raw downloads for that run.
+
+Use Campaign to select standard or larger workloads.
+Use Metric for throughput, latency percentiles, live-Core durable ACK latency, CPU
+or final RSS. Comparison badges compare Screech with the selected server within the
+same case. Checkboxes show/hide sync modes; Table exposes medians, ranges and counts.
+Search matches case names, payload size and publication count. Campaign, metric,
+baseline, search and view are encoded in the URL for sharing. Series visibility is
+local to the current view. Bar scales are per case; raw numbers remain visible.
+
+Sequential consumer latency samples time ACK confirmation only; Fetch is included
+in overall throughput but excluded from those latency samples. Concurrent consumer
+samples cover Fetch(1) through confirmed ACK. Core-on-stream callback and durable
+ACK latency are separate metrics. Missing samples remain absent. Reported percentile
+values are medians of per-trial percentiles, not pooled sample percentiles. CPU deltas
+include setup, prefill, validation and teardown; throughput excludes those phases.
+RSS is final, not peak. NATS modes differ in durability and are not interchangeable.
+
+## Reproduce locally
+
+```sh
+cargo build --release --locked
+mkdir -p bin results
+# Build an explicitly selected upstream checkout and record its revision.
+git clone https://github.com/nats-io/nats-server.git upstream
+git -C upstream rev-parse HEAD > results/nats-commit.txt
+go -C upstream build -o "$PWD/bin/nats-server" .
+go -C tools/bench build -o "$PWD/bin/bench-driver" .
+python3 scripts/benchmark.py --screech target/release/screech-server \
+  --nats bin/nats-server --driver bin/bench-driver \
+  --nats-commit "$(cat results/nats-commit.txt)" \
+  --nats-default --nats-sync-interval 10ms --trials 3 --output results/standard.json
+# Repeat with --scale-only --output results/concurrent.json for larger cases.
+python3 scripts/render_benchmarks.py \
+  --input 'Local standard' results/standard.json --output _site
+python3 -m http.server --directory _site 8000
+```
+
+The renderer uses Python's standard library and bundles vanilla HTML/CSS/JavaScript;
+no third-party CDN or browser build dependencies are needed. Its reducer is tested
+with node --test tests/benchmark_dashboard.test.cjs. Run Python tests with
+python3 -m unittest discover -s tests -p 'test_*.py'.

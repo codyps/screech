@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="Screech and NATS benchmark results by workload and storage sync mode.">
+<title>Screech benchmarks</title>
+<link rel="stylesheet" href="dashboard.css">
+<script defer src="data.js"></script><script defer src="dashboard.js"></script>
+</head>
+<body>
+<header><div class="wrap masthead"><a class="brand" href="https://github.com/codyps/screech">Screech</a><a id="source" href="https://github.com/codyps/screech">Source &amp; tests</a></div></header>
+<main class="wrap">
+<section class="intro"><h1>Benchmarks</h1><p class="lede">Screech and NATS, by workload and storage sync mode.</p><div class="meta"><a id="revision"></a><a id="run-link">Workflow run</a><span id="generated"></span></div></section>
+<section class="controls" aria-label="Benchmark controls">
+<label>Campaign<select id="campaign"></select></label>
+<label>Metric<select id="metric"><option value="deliveries_per_second">Throughput · messages/s</option><option value="p50_us">Median latency · µs</option><option value="p95_us">p95 latency · µs</option><option value="p99_us">p99 latency · µs</option><option value="durable_p50_us">Core-on-stream: durable ACK p50 · µs</option><option value="server_cpu_seconds">Server CPU · seconds</option><option value="server_rss_kib">Final server RSS · MiB</option></select></label>
+<label>Compare Screech to<select id="baseline"></select></label>
+<label>Find a case<input id="search" type="search" placeholder="Fetch, mixed, 1024…"></label>
+</section>
+<div class="view-row"><fieldset id="servers"><legend>Show series</legend></fieldset><div class="tabs" role="group" aria-label="View"><button id="charts-button" type="button" aria-pressed="true">Charts</button><button id="table-button" type="button" aria-pressed="false">Table</button></div></div>
+<div class="summary" id="summary" role="status" aria-live="polite"></div>
+<aside class="contract">Screech uses SQLite WAL + FULL. NATS stream sync modes: always, 10 ms, or default (2 min). Consumer persistence guarantees differ. <a href="#methodology">Methodology</a></aside>
+<p id="metric-note" class="metric-note"></p>
+<section id="charts" class="charts" aria-label="Workload comparisons"></section>
+<section id="table-view" hidden aria-label="Benchmark table"><div class="table-scroll"><table><thead><tr><th>Case</th><th>Server / sync mode</th><th id="value-heading">Median</th><th>Trial range</th><th>Trials</th></tr></thead><tbody id="table-body"></tbody></table></div></section>
+<p id="empty" hidden>No matching cases have this metric. Try another metric or search.</p>
+<details class="method" id="methodology"><summary>Methodology</summary><div class="method-grid"><div><h2>Within a campaign</h2><p>Bars show medians across checked trials. The range shows observed trial minimum and maximum, not a confidence interval. Latency values are medians of trial percentiles, not percentiles of pooled samples. Each case has its own bar scale.</p><p>The comparison badge uses the selected baseline within the same case. Higher throughput is better; lower latency, CPU and memory are better. Missing measurements are shown as “—”, never zero.</p></div><div><h2>Workload boundaries</h2><p>Consumer-only prefill and post-run validation are outside throughput timing. CPU deltas include setup, prefill, validation and teardown; RSS is final, not peak. Mixed cases count a completed publish/consume pair once. Dedup counts unique stored messages. Core-on-stream throughput waits for both durable ACKs and live callbacks.</p><p>NATS standalone consumer state can flush asynchronously even with stream sync set to always; the modes do not guarantee equal consumer power-loss behavior. Core forwarding is transient in every mode. <a href="https://github.com/nats-io/nats.docs/blob/master/nats-concepts/jetstream/README.md#syncing-data-to-disk">NATS sync documentation</a>.</p><p>ACK-only latency and full Fetch/ACK cycle latency are labeled per case. Core bulk cases report throughput only. Raw JSON preserves individual trials.</p></div></div></details>
+<details class="method"><summary>Environment &amp; reproduction</summary><pre id="environment"></pre><p>GitHub-hosted runs use shared, unpinned machines; compare cases within one campaign. Different machines and storage can substantially change these numbers.</p><p><a id="raw">Download this campaign’s raw JSON ↓</a> · <a href="https://github.com/codyps/screech/blob/main/docs/ci-benchmarks.md">Run these benchmarks yourself ↗</a></p></details>
+<noscript><p>JavaScript is needed for the interactive dashboard. Download the checked trial files from the workflow artifacts.</p></noscript>
+<footer><a href="https://github.com/codyps/screech/actions/workflows/ci.yml">CI runs</a></footer>
+</main>
+</body></html>

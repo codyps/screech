@@ -1,0 +1,165 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      trials:
+        description: Checked trials per benchmark case (1–10)
+        type: number
+        default: 3
+      nats_ref:
+        description: NATS branch, tag or commit (resolved SHA is recorded)
+        type: string
+        default: main
+  schedule:
+    - cron: '17 4 * * 1'
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    name: Models, protocol and process failures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      PROPTEST_CASES: 256
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          shared-key: debug
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Dashboard and benchmark-data tests
+        run: |
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
+          node --test tests/benchmark_dashboard.test.cjs
+      - run: cargo test --locked --all-features
+      - name: Extended projection and group histories
+        run: |
+          PROPTEST_CASES=1024 cargo test --locked --all-features --test durable_model tree_projections
+          PROPTEST_CASES=2048 cargo test --locked --all-features --test durable_model mixed_groups
+      - run: cargo build --locked --features fault-injection
+      - run: cc -shared -fPIC -O2 -Wall -Wextra -Werror -o sqlite-io-fault.so scripts/sqlite_io_fault.c -ldl
+      - name: Process kills, stalls, ambiguous writes and recovery
+        run: |
+          mkdir -p results
+          python3 scripts/crash_tests.py target/debug/screech-server --output results/process-tests.json
+          python3 scripts/consumer_crash_tests.py target/debug/screech-server --output results/consumer-process-tests.json
+          python3 scripts/batch_crash_tests.py target/debug/screech-server --output results/batch-process-tests.json
+          python3 scripts/single_crash_tests.py target/debug/screech-server --output results/single-process-tests.json
+          python3 scripts/io_failure_tests.py target/debug/screech-server --shim ./sqlite-io-fault.so --output results/io-process-tests.json
+          python3 scripts/group_crash_tests.py target/debug/screech-server --shim ./sqlite-io-fault.so --output results/group-process-tests.json
+          python3 scripts/core_stall_tests.py target/debug/screech-server --output results/core-stall-tests.json
+          python3 scripts/persistent_crash_tests.py target/debug/screech-server --output results/persistent-process-tests.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: correctness-results
+          path: results/
+  vm:
+    name: Guest power-loss recovery
+    needs: test
+    uses: ./.github/workflows/vm.yml
+  benchmarks:
+    name: Checked NATS comparisons
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      TRIALS: ${{ inputs.trials || '3' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: nats-io/nats-server
+          ref: ${{ inputs.nats_ref || 'main' }}
+          path: upstream
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          shared-key: release
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: upstream/go.mod
+          cache-dependency-path: |
+            tools/bench/go.sum
+            upstream/go.sum
+      - name: Build production servers and checked driver
+        run: |
+          mkdir -p bin results
+          cargo build --release --locked
+          go -C upstream build -o "$GITHUB_WORKSPACE/bin/nats-server" .
+          go -C tools/bench build -o "$GITHUB_WORKSPACE/bin/bench-driver" .
+          git -C upstream rev-parse HEAD > results/nats-commit.txt
+      - name: Standard cases · FULL, always, 10 ms, default
+        run: |
+          python3 scripts/benchmark.py --screech target/release/screech-server \
+            --nats bin/nats-server --driver bin/bench-driver \
+            --nats-commit "$(cat results/nats-commit.txt)" \
+            --nats-default --nats-sync-interval 10ms --trials "$TRIALS" \
+            --reverse --output results/standard.json
+      - name: Larger concurrent cases · 20,000 messages
+        run: |
+          python3 scripts/benchmark.py --screech target/release/screech-server \
+            --nats bin/nats-server --driver bin/bench-driver \
+            --nats-commit "$(cat results/nats-commit.txt)" \
+            --nats-default --nats-sync-interval 10ms --trials "$TRIALS" \
+            --scale-only --output results/concurrent.json
+      - name: Generate benchmark dashboard
+        run: |
+          python3 scripts/render_benchmarks.py \
+            --input 'CI · standard cases' results/standard.json \
+            --input 'CI · 20,000-message concurrent cases' results/concurrent.json \
+            --output _site --revision "$GITHUB_SHA" \
+            --repository "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          printf '### Checked benchmark dashboard\n\n[Published dashboard](https://codyps.github.io/screech/) · Download this run’s benchmark-site artifact for its exact page and raw trials.\n' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: benchmark-results
+          path: results/
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: benchmark-site
+          path: _site/
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        with:
+          path: _site
+  deploy:
+    name: Publish benchmark dashboard
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: [test, vm, benchmarks]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      - uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+        id: deployment
