@@ -21,7 +21,7 @@ jobs:
       - name: Kill and restart a disposable guest three times
         shell: bash
         run: |
-          kernel=$(ls -v /boot/vmlinuz-* | tail -1)
+          kernel=$(ls -v /boot/vmlinuz-*-generic | tail -1)
           release=${kernel##*/vmlinuz-}
           sudo chmod a+r "$kernel"
           python3 scripts/vm_crash_test.py \

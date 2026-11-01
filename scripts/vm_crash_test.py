@@ -82,7 +82,7 @@ ip route add default via 10.0.2.2
 for i in 1 2 3 4 5; do [ -b /dev/vda ] && break; sleep 1; done
 mount -t ext4 /dev/vda /data || exec sh
 export TOKIO_WORKER_THREADS=2
-exec /bin/screech-server --addr 0.0.0.0 --port 4222 --store /data/screech.db
+exec /bin/screech-server --addr 0.0.0.0 --port 4222 --store /data/screech.db --storage-deadline-ms 30000 --write-deadline-ms 10000
 '''
     (root/'init').write_text(init);(root/'init').chmod(0o755)
     archive(root,work/'initramfs.gz')
@@ -104,7 +104,7 @@ class VM:
             if self.process.poll() is not None:
                 self.kill();raise RuntimeError('QEMU exited; inspect '+str(work/f'guest-{cycle}.log'))
             try:
-                c=Client(self.address);c.close();break
+                c=Client(self.address, timeout=30);c.close();break
             except (OSError,AssertionError,EOFError):
                 if time.monotonic()>deadline:self.kill();raise TimeoutError('guest did not start; inspect '+str(work/f'guest-{cycle}.log'))
                 time.sleep(.1)
@@ -119,7 +119,7 @@ def run(args):
     for cycle in range(args.cycles):
         vm=VM(args,work,cycle)
         try:
-            c=Client(vm.address)
+            c=Client(vm.address, timeout=30)
             if cycle==0:
                 c.create()
                 result=c.request('$JS.API.STREAM.CREATE.W',{'name':'W','subjects':['work.>'],'storage':'file','retention':'workqueue'})
@@ -144,7 +144,7 @@ def run(args):
             for seq,value in expected.items():assert c.get(seq)==value,(cycle,seq)
             if args.concurrent:
                 def publish_worker(worker):
-                    client=Client(vm.address);pairs=[]
+                    client=Client(vm.address, timeout=30);pairs=[]
                     try:
                         for i in range(worker,args.messages,16):
                             value=f'{cycle}-{i}'.encode();pairs.append((client.publish(value),value))
@@ -177,7 +177,7 @@ def run(args):
         cycles.append({'cycle':cycle,'acknowledged':len(expected),'guest_sigkill':True})
     vm=VM(args,work,'verify')
     try:
-        c=Client(vm.address)
+        c=Client(vm.address, timeout=30)
         for seq,value in expected.items():assert c.get(seq)==value,seq
         duplicate=c.publish_with_id(b'ignored',prior_id);assert duplicate['duplicate'] and duplicate['seq'] in expected
         assert c.get(prior_acked,name='W') is None

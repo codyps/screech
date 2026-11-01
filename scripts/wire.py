@@ -5,9 +5,9 @@ import socket
 import uuid
 
 class Client:
-    def __init__(self, address):
-        self.socket = socket.create_connection(address, timeout=5)
-        self.socket.settimeout(5)
+    def __init__(self, address, timeout=5):
+        self.socket = socket.create_connection(address, timeout=timeout)
+        self.socket.settimeout(timeout)
         self.file = self.socket.makefile('rb')
         assert self.file.readline().startswith(b'INFO ')
         self.send(b'CONNECT {"verbose":false,"headers":true,"no_responders":true}\r\n')
