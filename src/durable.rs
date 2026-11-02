@@ -1756,6 +1756,9 @@ impl<S: Store> Engine<S> {
     pub fn voter_progress(&self) -> Option<VoterProgress> {
         self.voter
     }
+    pub(crate) fn replicas(&self) -> usize {
+        self.store.as_ref().map_or(1, Store::replicas)
+    }
     pub(crate) fn can_release_output(&self) -> bool {
         !self.poisoned.get()
             && self.pending.is_none()
@@ -1780,6 +1783,14 @@ impl<S: Store> Engine<S> {
     }
     pub fn state(&self) -> &State {
         &self.state
+    }
+    pub(crate) fn read_barrier(&self) -> Result<(), Error> {
+        self.ensure_ready()?;
+        if let Err(error) = self.storage()?.read_barrier() {
+            self.poisoned.set(true);
+            return Err(error.into());
+        }
+        Ok(())
     }
     /// Resolve a selected message without retaining its body in the model.
     pub fn read_message(&self, message: &StoredMessage) -> Result<StoredMessage, Error> {

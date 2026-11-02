@@ -1,0 +1,510 @@
+//! Authoritative Raft entries and committed application indexes share one FULL
+//! SQLite transaction domain. Indexes point into entries; payloads have no second
+//! durability path. Accepted suffixes are never exposed through the Store view.
+use super::{error, Batch, ClusterConfig};
+use crate::storage::{Content, ContentKey, Record};
+use fs2::FileExt;
+use protobuf::Message;
+use raft::{
+    eraftpb::{ConfState, Entry, HardState, Snapshot},
+    GetEntriesContext, RaftState, Storage, StorageError,
+};
+use rusqlite::{params, Connection, OptionalExtension};
+use std::{
+    fs::{File, OpenOptions},
+    io::{self, Write},
+    path::Path,
+    sync::{Arc, Mutex},
+};
+
+fn sql(n: u64) -> io::Result<i64> {
+    i64::try_from(n).map_err(error)
+}
+
+pub(crate) struct Database {
+    pub conn: Connection,
+    pub failed: bool,
+    _lock: File,
+}
+#[derive(Clone)]
+pub(crate) struct LogStorage {
+    pub db: Arc<Mutex<Database>>,
+    pub conf: ConfState,
+}
+impl Database {
+    pub fn open(path: &Path, config: &ClusterConfig, bootstrap: bool) -> io::Result<Self> {
+        let marker = path.with_extension("cluster-lock");
+        let existed = path.exists();
+        if !existed && !bootstrap {
+            return Err(error("fresh cluster storage requires explicit initial bootstrap; lost voters must not be recreated"));
+        }
+        let mut lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&marker)?;
+        lock.try_lock_exclusive()?;
+        if !existed && lock.metadata()?.len() > 0 {
+            return Err(error("missing cluster database"));
+        }
+        let conn = Connection::open(path).map_err(error)?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(error)?;
+        conn.pragma_update(None, "synchronous", "FULL")
+            .map_err(error)?;
+        let initialized: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='cluster_meta')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(error)?;
+        if existed && !initialized {
+            return Err(error("not a cluster database; offline migration required"));
+        }
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS cluster_meta(key TEXT PRIMARY KEY,value BLOB NOT NULL);
+          CREATE TABLE IF NOT EXISTS entries(idx INTEGER PRIMARY KEY,term INTEGER NOT NULL,data BLOB NOT NULL,crc INTEGER NOT NULL);
+          CREATE TABLE IF NOT EXISTS event_index(seq INTEGER PRIMARY KEY,idx INTEGER NOT NULL,ordinal INTEGER NOT NULL);
+          CREATE TABLE IF NOT EXISTS body_index(generation INTEGER NOT NULL,seq INTEGER NOT NULL,idx INTEGER NOT NULL,ordinal INTEGER NOT NULL,PRIMARY KEY(generation,seq));").map_err(error)?;
+        let mut stable = config.clone();
+        stable.max_log_bytes = 0;
+        let identity = serde_json::to_vec(&stable).map_err(error)?;
+        if initialized {
+            let old: Vec<u8> = conn
+                .query_row(
+                    "SELECT value FROM cluster_meta WHERE key='identity'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(error)?;
+            if old != identity {
+                return Err(error("cluster/node identity or membership mismatch"));
+            }
+        } else {
+            conn.execute("INSERT INTO cluster_meta VALUES('identity',?1)", [identity])
+                .map_err(error)?;
+        }
+        lock.write_all(b"screech-cluster-v1\n")?;
+        lock.sync_all()?;
+        File::open(
+            path.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new(".")),
+        )?
+        .sync_all()?;
+        let mut db = Self {
+            conn,
+            _lock: lock,
+            failed: false,
+        };
+        let hard = db.hard()?;
+        let last = db.last()?;
+        if hard.commit > last {
+            return Err(error("committed Raft prefix is missing"));
+        }
+        for idx in 1..=last {
+            let _ = db.entry(idx)?;
+        }
+        // Rebuild indexes from the durable committed prefix, never the accepted tail.
+        db.conn.execute_batch("DELETE FROM event_index;DELETE FROM body_index;DELETE FROM cluster_meta WHERE key='view';").map_err(error)?;
+        db.apply(hard.commit)?;
+        Ok(db)
+    }
+    pub fn meta(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
+        self.conn
+            .query_row("SELECT value FROM cluster_meta WHERE key=?1", [key], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(error)
+    }
+    pub fn hard(&self) -> io::Result<HardState> {
+        self.meta("hard")?
+            .map(|b| HardState::parse_from_bytes(&b).map_err(error))
+            .transpose()
+            .map(|h| h.unwrap_or_default())
+    }
+    pub fn last(&self) -> io::Result<u64> {
+        self.conn
+            .query_row("SELECT coalesce(max(idx),0) FROM entries", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map_err(error)
+            .and_then(|n| u64::try_from(n).map_err(error))
+    }
+    pub fn end(&self) -> io::Result<u64> {
+        self.conn
+            .query_row("SELECT coalesce(max(seq),0) FROM event_index", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map_err(error)
+            .and_then(|n| u64::try_from(n).map_err(error))
+    }
+    pub fn entry(&self, idx: u64) -> io::Result<Entry> {
+        if self.failed {
+            return Err(error("replica quarantined"));
+        }
+        let (bytes, crc): (Vec<u8>, u32) = self
+            .conn
+            .query_row(
+                "SELECT data,crc FROM entries WHERE idx=?1",
+                [sql(idx)?],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(error)?;
+        if crc32fast::hash(&bytes) != crc {
+            return Err(error("Raft entry checksum mismatch"));
+        }
+        let entry = Entry::parse_from_bytes(&bytes).map_err(error)?;
+        if entry.index != idx {
+            return Err(error("Raft entry identity mismatch"));
+        }
+        Ok(entry)
+    }
+    pub fn persist(&mut self, entries: &[Entry], hard: Option<&HardState>) -> io::Result<()> {
+        if self.failed {
+            return Err(error("replica quarantined"));
+        }
+        let old = self.hard()?;
+        let last = self.last()?;
+        if let Some(first) = entries.first() {
+            if first.index > last + 1 || entries.windows(2).any(|p| p[1].index != p[0].index + 1) {
+                return Err(error("noncontiguous accepted suffix"));
+            }
+            if first.index <= old.commit {
+                return Err(error("cannot replace committed entries"));
+            }
+        }
+        if let Some(h) = hard {
+            if h.term < old.term
+                || h.commit < old.commit
+                || h.commit > entries.last().map_or(last, |e| e.index)
+                || (h.term == old.term && old.vote != 0 && h.vote != old.vote)
+            {
+                return Err(error("invalid durable hard state"));
+            }
+        }
+        let tx = self.conn.transaction().map_err(error)?;
+        if let Some(first) = entries.first() {
+            tx.execute("DELETE FROM entries WHERE idx>=?1", [sql(first.index)?])
+                .map_err(error)?;
+            for entry in entries {
+                let bytes = entry.write_to_bytes().map_err(error)?;
+                tx.execute(
+                    "INSERT INTO entries VALUES(?1,?2,?3,?4)",
+                    params![
+                        sql(entry.index)?,
+                        sql(entry.term)?,
+                        bytes,
+                        crc32fast::hash(&bytes)
+                    ],
+                )
+                .map_err(error)?;
+            }
+        }
+        if let Some(h) = hard {
+            tx.execute(
+                "INSERT OR REPLACE INTO cluster_meta VALUES('hard',?1)",
+                [h.write_to_bytes().map_err(error)?],
+            )
+            .map_err(error)?;
+        }
+        crate::fault::point("before_cluster_persist");
+        tx.commit().map_err(error)?;
+        crate::fault::point("after_cluster_persist");
+        Ok(())
+    }
+    pub fn apply(&mut self, commit: u64) -> io::Result<Vec<(Vec<u8>, u64)>> {
+        let base = self
+            .meta("view")?
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap_or([255; 8])))
+            .unwrap_or(0);
+        if base > commit {
+            return Err(error("view ahead of commitment"));
+        }
+        if base == commit {
+            return Ok(Vec::new());
+        }
+        let mut end = self.end()?;
+        let mut decoded = Vec::new();
+        for idx in base + 1..=commit {
+            let entry = self.entry(idx)?;
+            let batch = if entry.data.is_empty() {
+                None
+            } else {
+                Some(Batch::decode(&entry.data)?)
+            };
+            decoded.push((entry, batch));
+        }
+        let tx = self.conn.transaction().map_err(error)?;
+        let mut results = Vec::new();
+        for (entry, batch) in decoded {
+            if let Some(batch) = batch {
+                for (ordinal, _) in batch.records.iter().enumerate() {
+                    end += 1;
+                    tx.execute(
+                        "INSERT INTO event_index VALUES(?1,?2,?3)",
+                        params![sql(end)?, sql(entry.index)?, ordinal as i64],
+                    )
+                    .map_err(error)?;
+                }
+                for (ordinal, c) in batch.contents.iter().enumerate() {
+                    tx.execute(
+                        "INSERT INTO body_index VALUES(?1,?2,?3,?4)",
+                        params![
+                            sql(c.key.generation)?,
+                            sql(c.key.sequence)?,
+                            sql(entry.index)?,
+                            ordinal as i64
+                        ],
+                    )
+                    .map_err(error)?;
+                }
+            }
+            results.push((entry.context.to_vec(), end));
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO cluster_meta VALUES('view',?1)",
+            [commit.to_le_bytes().as_slice()],
+        )
+        .map_err(error)?;
+        tx.commit().map_err(error)?;
+        Ok(results)
+    }
+    pub fn record(&self, sequence: u64) -> io::Result<Option<Record>> {
+        let pos: Option<(i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT idx,ordinal FROM event_index WHERE seq=?1",
+                [sql(sequence)?],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(error)?;
+        pos.map(|(idx, n)| {
+            let batch = Batch::decode(&self.entry(u64::try_from(idx).map_err(error)?)?.data)?;
+            let r = batch
+                .records
+                .get(usize::try_from(n).map_err(error)?)
+                .ok_or_else(|| error("invalid event index"))?;
+            Ok(Record {
+                sequence,
+                subject: r.subject.clone(),
+                headers: r.headers.clone(),
+                payload: r.payload.clone(),
+            })
+        })
+        .transpose()
+    }
+    pub fn content(&self, key: ContentKey) -> io::Result<Option<Content>> {
+        let pos: Option<(i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT idx,ordinal FROM body_index WHERE generation=?1 AND seq=?2",
+                params![sql(key.generation)?, sql(key.sequence)?],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(error)?;
+        pos.map(|(idx, n)| {
+            let batch = Batch::decode(&self.entry(u64::try_from(idx).map_err(error)?)?.data)?;
+            batch
+                .contents
+                .get(usize::try_from(n).map_err(error)?)
+                .filter(|c| c.key == key)
+                .cloned()
+                .ok_or_else(|| error("invalid content identity"))
+        })
+        .transpose()
+    }
+}
+fn raft_error(e: io::Error) -> raft::Error {
+    raft::Error::Store(StorageError::Other(Box::new(e)))
+}
+impl Storage for LogStorage {
+    fn initial_state(&self) -> raft::Result<RaftState> {
+        Ok(RaftState {
+            hard_state: self.db.lock().unwrap().hard().map_err(raft_error)?,
+            conf_state: self.conf.clone(),
+        })
+    }
+    fn entries(
+        &self,
+        low: u64,
+        high: u64,
+        max_size: impl Into<Option<u64>>,
+        _: GetEntriesContext,
+    ) -> raft::Result<Vec<Entry>> {
+        let db = self.db.lock().unwrap();
+        let limit = max_size.into().unwrap_or(u64::MAX);
+        let mut bytes = 0;
+        let mut entries = Vec::new();
+        if high > db.last().map_err(raft_error)? + 1 {
+            return Err(raft::Error::Store(StorageError::Unavailable));
+        }
+        for idx in low..high {
+            let e = db.entry(idx).map_err(raft_error)?;
+            bytes += u64::from(e.compute_size());
+            if !entries.is_empty() && bytes > limit {
+                break;
+            }
+            entries.push(e);
+        }
+        Ok(entries)
+    }
+    fn term(&self, idx: u64) -> raft::Result<u64> {
+        if idx == 0 {
+            Ok(0)
+        } else {
+            self.db
+                .lock()
+                .unwrap()
+                .entry(idx)
+                .map(|e| e.term)
+                .map_err(raft_error)
+        }
+    }
+    fn first_index(&self) -> raft::Result<u64> {
+        Ok(1)
+    }
+    fn last_index(&self) -> raft::Result<u64> {
+        self.db.lock().unwrap().last().map_err(raft_error)
+    }
+    fn snapshot(&self, _: u64, _: u64) -> raft::Result<Snapshot> {
+        Err(raft::Error::Store(
+            StorageError::SnapshotTemporarilyUnavailable,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        cluster::{Batch, Peer},
+        storage::{Append, Content},
+    };
+    use bytes::Bytes;
+    fn config() -> ClusterConfig {
+        ClusterConfig {
+            cluster_id: "test".into(),
+            node_id: 1,
+            secret: "x".repeat(32),
+            max_log_bytes: 128 * 1024 * 1024,
+            peers: (1..=3)
+                .map(|id| {
+                    (
+                        id,
+                        Peer {
+                            raft: format!("127.0.0.1:{}", 20000 + id * 3).parse().unwrap(),
+                            client: format!("127.0.0.1:{}", 20001 + id * 3).parse().unwrap(),
+                            service: format!("127.0.0.1:{}", 20002 + id * 3).parse().unwrap(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+    fn entry(index: u64, term: u64, body: &'static [u8]) -> Entry {
+        let key = ContentKey {
+            generation: 1,
+            sequence: 1,
+        };
+        let batch = Batch {
+            version: 1,
+            records: vec![Append {
+                subject: "event".into(),
+                headers: Bytes::new(),
+                payload: Bytes::new(),
+            }],
+            contents: vec![Content {
+                key,
+                subject: "subject".into(),
+                headers: Bytes::new(),
+                payload: Bytes::from_static(body),
+            }],
+        };
+        Entry {
+            index,
+            term,
+            data: postcard::to_allocvec(&batch).unwrap().into(),
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn conflicting_suffix_has_immutable_bytes_and_committed_only_visibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let c = config();
+        let mut db = Database::open(&path, &c, true).unwrap();
+        let mut hard = HardState {
+            term: 1,
+            vote: 1,
+            ..Default::default()
+        };
+        db.persist(&[entry(1, 1, b"old")], Some(&hard)).unwrap();
+        assert_eq!(db.end().unwrap(), 0);
+        assert!(db
+            .content(ContentKey {
+                generation: 1,
+                sequence: 1
+            })
+            .unwrap()
+            .is_none());
+        drop(db);
+        let mut db = Database::open(&path, &c, true).unwrap();
+        assert_eq!(db.end().unwrap(), 0);
+        hard.term = 2;
+        hard.vote = 2;
+        hard.commit = 1;
+        db.persist(&[entry(1, 2, b"replacement")], Some(&hard))
+            .unwrap();
+        db.apply(1).unwrap();
+        assert_eq!(
+            db.content(ContentKey {
+                generation: 1,
+                sequence: 1
+            })
+            .unwrap()
+            .unwrap()
+            .payload,
+            "replacement"
+        );
+        assert!(db.persist(&[entry(1, 3, b"wrong")], None).is_err());
+        drop(db);
+        let db = Database::open(&path, &c, true).unwrap();
+        assert_eq!(db.end().unwrap(), 1);
+        assert_eq!(db.hard().unwrap(), hard);
+    }
+    #[test]
+    fn votes_identity_missing_and_corrupt_storage_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let c = config();
+        let mut db = Database::open(&path, &c, true).unwrap();
+        let mut hard = HardState {
+            term: 1,
+            vote: 1,
+            ..Default::default()
+        };
+        db.persist(&[entry(1, 1, b"body")], Some(&hard)).unwrap();
+        hard.vote = 2;
+        assert!(db.persist(&[], Some(&hard)).is_err());
+        hard.vote = 1;
+        hard.commit = 2;
+        assert!(db.persist(&[], Some(&hard)).is_err());
+        db.conn
+            .execute("UPDATE entries SET data=x'000000'", [])
+            .unwrap();
+        drop(db);
+        assert!(Database::open(&path, &c, true).is_err());
+        let fresh = dir.path().join("fresh");
+        drop(Database::open(&fresh, &c, true).unwrap());
+        let mut other = c.clone();
+        other.node_id = 2;
+        assert!(Database::open(&fresh, &other, true).is_err());
+        std::fs::remove_file(&fresh).unwrap();
+        assert!(Database::open(&fresh, &c, true).is_err());
+    }
+}

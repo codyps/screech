@@ -411,17 +411,22 @@ fn err(kind: &str, description: &str) -> Value {
 fn not_found(kind: &str, consumer: bool) -> Value {
     json!({"type":format!("io.nats.jetstream.api.v1.{kind}_response"),"error":{"code":404,"err_code":if consumer{10014}else{10059},"description":if consumer{"Consumer not found"}else{"Stream not found"}}})
 }
-fn stream_info(s: &durable::Stream) -> Value {
+fn stream_info(s: &durable::Stream, replicas: usize) -> Value {
     let mut config = serde_json::to_value(&s.config).unwrap();
     config["storage"] = json!("file");
-    config["num_replicas"] = json!(1);
+    config["num_replicas"] = json!(replicas);
     config["allow_direct"] = json!(false);
     json!({"type":"io.nats.jetstream.api.v1.stream_info_response","config":config,"created":timestamp(s.created),"state":{"messages":s.messages.len(),"bytes":s.bytes,"first_seq":s.messages.keys().next().copied().unwrap_or(s.last_sequence.saturating_add(1)),"first_ts":timestamp(s.messages.values().next().map(|m|m.time).unwrap_or(0)),"last_seq":s.last_sequence,"last_ts":timestamp(s.messages.values().next_back().map(|m|m.time).unwrap_or(0)),"consumer_count":s.consumers.len()}})
 }
-fn consumer_info(s: &durable::Stream, c: &durable::Consumer, waiting: usize) -> Value {
+fn consumer_info(
+    s: &durable::Stream,
+    c: &durable::Consumer,
+    waiting: usize,
+    replicas: usize,
+) -> Value {
     let mut config = serde_json::to_value(&c.config).unwrap();
     config["replay_policy"] = json!("instant");
-    config["num_replicas"] = json!(1);
+    config["num_replicas"] = json!(replicas);
     json!({"type":"io.nats.jetstream.api.v1.consumer_info_response","stream_name":s.config.name,"name":c.config.name,"created":timestamp(c.created),"config":config,"delivered":{"consumer_seq":c.delivered,"stream_seq":c.last_stream},"ack_floor":{"consumer_seq":c.ack_floor,"stream_seq":c.ack_stream},"num_ack_pending":c.pending.len(),"num_exhausted":c.exhausted.len(),"num_redelivered":c.pending.values().filter(|p|p.attempt>1).count(),"num_waiting":waiting,"num_pending":c.ready_count(s),"push_bound":c.config.deliver_subject.is_some()})
 }
 fn raw_message(m: &durable::StoredMessage) -> Value {
@@ -439,7 +444,7 @@ fn default_option(v: &Value) -> bool {
         || v.as_array().is_some_and(|a| a.is_empty())
         || v.as_object().is_some_and(|o| o.is_empty())
 }
-fn configuration(v: &Value, name: &str) -> Result<StreamConfig, String> {
+fn configuration(v: &Value, name: &str, replicas: usize) -> Result<StreamConfig, String> {
     let mut object = v
         .as_object()
         .ok_or("Expected stream configuration")?
@@ -458,7 +463,7 @@ fn configuration(v: &Value, name: &str) -> Result<StreamConfig, String> {
             | "duplicate_window"
             | "max_consumers" => true,
             "storage" => v == "file",
-            "num_replicas" => v.as_u64().is_some_and(|n| n <= 1),
+            "num_replicas" => v.as_u64().is_some_and(|n| n <= 1 || n == replicas as u64),
             "compression" => v == "none",
             "consumer_limits" => {
                 v.is_null()
@@ -513,7 +518,11 @@ fn configuration(v: &Value, name: &str) -> Result<StreamConfig, String> {
     }
     serde_json::from_value(Value::Object(object)).map_err(|e| e.to_string())
 }
-fn consumer_configuration(v: &Value, path_name: Option<&str>) -> Result<ConsumerConfig, String> {
+fn consumer_configuration(
+    v: &Value,
+    path_name: Option<&str>,
+    replicas: usize,
+) -> Result<ConsumerConfig, String> {
     let mut obj = v
         .as_object()
         .ok_or("Expected consumer configuration")?
@@ -525,7 +534,7 @@ fn consumer_configuration(v: &Value, path_name: Option<&str>) -> Result<Consumer
             | "filter_subjects" | "deliver_policy" | "opt_start_seq" | "opt_start_time"
             | "max_ack_pending" | "max_waiting" | "max_batch" | "max_expires" | "max_bytes" => true,
             "replay_policy" => v == "instant",
-            "num_replicas" => v.as_u64().is_some_and(|n| n <= 1),
+            "num_replicas" => v.as_u64().is_some_and(|n| n <= 1 || n == replicas as u64),
             _ => default_option(v),
         };
         if !allowed {
@@ -700,6 +709,12 @@ impl<S: Store> Worker<S> {
         ingress: &std_mpsc::Receiver<Request>,
         deferred: &mut Option<Request>,
     ) {
+        if let Err(error) = self.engine.read_barrier() {
+            for request in requests {
+                let _ = request.response.send(Err(error.to_string()));
+            }
+            return;
+        }
         let pulls_before = self.engine.voter_progress().map(|_| self.pulls.clone());
         match self.engine.begin_group() {
             Ok(plan) => self.plan = Some(plan),
@@ -885,6 +900,9 @@ impl<S: Store> Worker<S> {
         Ok(())
     }
     fn handle(&mut self, msg: Message) -> Result<bool, String> {
+        if self.plan.is_none() {
+            self.engine.read_barrier().map_err(|e| e.to_string())?;
+        }
         if self.engine.is_poisoned() {
             return Err("Storage failed: restart required".into());
         }
@@ -1012,7 +1030,7 @@ impl<S: Store> Worker<S> {
                 json!({"type":"io.nats.jetstream.api.v1.account_info_response","memory":0,"storage":self.state().streams.values().map(|s|s.bytes).sum::<u64>(),"streams":self.state().streams.len(),"consumers":self.state().streams.values().map(|s|s.consumers.len()).sum::<usize>(),"limits":{"max_memory":-1,"max_storage":-1,"max_streams":-1,"max_consumers":-1},"api":{"total":0,"errors":0}}),
             ),
             ["STREAM", "CREATE", name] => {
-                let config = configuration(body, name)?;
+                let config = configuration(body, name, self.engine.replicas())?;
                 if let Some(s) = self.state().streams.get(*name) {
                     if s.config != config {
                         return Err("Stream already exists with a different configuration".into());
@@ -1024,18 +1042,18 @@ impl<S: Store> Worker<S> {
                         .map_err(|e| e.to_string())?;
                     self.commit(event)?;
                 }
-                let mut v = stream_info(&self.state().streams[*name]);
+                let mut v = stream_info(&self.state().streams[*name], self.engine.replicas());
                 v["type"] = json!("io.nats.jetstream.api.v1.stream_create_response");
                 Ok(v)
             }
             ["STREAM", "UPDATE", name] => {
-                let config = configuration(body, name)?;
+                let config = configuration(body, name, self.engine.replicas())?;
                 let event = self
                     .state()
                     .prepare_update(config, time)
                     .map_err(|e| e.to_string())?;
                 self.commit(event)?;
-                let mut v = stream_info(&self.state().streams[*name]);
+                let mut v = stream_info(&self.state().streams[*name], self.engine.replicas());
                 v["type"] = json!("io.nats.jetstream.api.v1.stream_update_response");
                 Ok(v)
             }
@@ -1043,7 +1061,7 @@ impl<S: Store> Worker<S> {
                 .state()
                 .streams
                 .get(*name)
-                .map(stream_info)
+                .map(|s| stream_info(s, self.engine.replicas()))
                 .unwrap_or_else(|| not_found("stream_info", false))),
             ["STREAM", "NAMES"] | ["STREAM", "LIST"] => {
                 let offset = body.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -1068,7 +1086,7 @@ impl<S: Store> Worker<S> {
                         if names {
                             json!(s.config.name)
                         } else {
-                            stream_info(s)
+                            stream_info(s, self.engine.replicas())
                         }
                     })
                     .collect();
@@ -1179,6 +1197,7 @@ impl<S: Store> Worker<S> {
                 let config = consumer_configuration(
                     body.get("config").ok_or("Consumer config required")?,
                     name,
+                    self.engine.replicas(),
                 )?;
                 let action = body.get("action").and_then(Value::as_str).unwrap_or("");
                 if !matches!(action, "create" | "update" | "") {
@@ -1220,7 +1239,12 @@ impl<S: Store> Worker<S> {
                     self.commit(event)?;
                 }
                 let s = &self.state().streams[*stream];
-                let mut v = consumer_info(s, &s.consumers[&name], self.waiting(stream, &name));
+                let mut v = consumer_info(
+                    s,
+                    &s.consumers[&name],
+                    self.waiting(stream, &name),
+                    self.engine.replicas(),
+                );
                 v["type"] = json!("io.nats.jetstream.api.v1.consumer_create_response");
                 Ok(v)
             }
@@ -1229,9 +1253,9 @@ impl<S: Store> Worker<S> {
                 .streams
                 .get(*stream)
                 .and_then(|s| {
-                    s.consumers
-                        .get(*name)
-                        .map(|c| consumer_info(s, c, self.waiting(stream, name)))
+                    s.consumers.get(*name).map(|c| {
+                        consumer_info(s, c, self.waiting(stream, name), self.engine.replicas())
+                    })
                 })
                 .unwrap_or_else(|| not_found("consumer_info", true))),
             ["CONSUMER", "DELETE", stream, name] => {
@@ -1267,7 +1291,12 @@ impl<S: Store> Worker<S> {
                         if names {
                             json!(c.config.name)
                         } else {
-                            consumer_info(s, c, self.waiting(stream, &c.config.name))
+                            consumer_info(
+                                s,
+                                c,
+                                self.waiting(stream, &c.config.name),
+                                self.engine.replicas(),
+                            )
                         }
                     })
                     .collect();
@@ -1660,6 +1689,12 @@ impl<S: Store> Worker<S> {
         replied
     }
     fn ack_requests(&mut self, mut requests: Vec<Request>) -> (bool, Vec<Request>) {
+        if let Err(error) = self.engine.read_barrier() {
+            for request in requests.drain(..) {
+                let _ = request.response.send(Err(error.to_string()));
+            }
+            return (false, requests);
+        }
         if requests.len() == 1 {
             // A standalone ACK needs neither an event list nor a valid-request list.
             let request = requests.pop().unwrap();
@@ -1698,6 +1733,13 @@ impl<S: Store> Worker<S> {
     fn maintain(&mut self) -> Result<bool, String> {
         if self.engine.is_poisoned() {
             return Ok(false);
+        }
+        if self.plan.is_none()
+            && (!self.pulls.is_empty()
+                || self.has_push()
+                || self.state().expiration_needed(self.time()))
+        {
+            self.engine.read_barrier().map_err(|e| e.to_string())?;
         }
         self.engine
             .flush_consumer_state(false)

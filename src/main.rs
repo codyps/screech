@@ -39,6 +39,12 @@ struct Args {
     /// Experimental strict fixed single-voter engine (no peer replication yet).
     #[arg(long, requires = "store", conflicts_with = "unsafe_ack_durability")]
     single_voter: bool,
+    /// Fixed-membership Raft cluster configuration (JSON).
+    #[arg(long, requires = "store", conflicts_with_all = ["single_voter", "unsafe_ack_durability"])]
+    cluster_config: Option<std::path::PathBuf>,
+    /// Initialize a fresh voter for the first cluster bootstrap only.
+    #[arg(long, requires = "cluster_config")]
+    cluster_bootstrap: bool,
 }
 fn main() -> std::io::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -56,6 +62,33 @@ async fn run() -> std::io::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let a = Args::parse();
+    if let Some(path) = &a.cluster_config {
+        let config: screech::cluster::ClusterConfig =
+            serde_json::from_slice(&std::fs::read(path)?).map_err(std::io::Error::other)?;
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        spawn_signals(stop);
+        return screech::cluster::run(
+            config,
+            a.store.as_ref().expect("clap requires store"),
+            a.cluster_bootstrap,
+            Config {
+                limits: Limits {
+                    payload: a.max_payload,
+                    ..Limits::default()
+                },
+                max_pending: a.max_pending,
+                max_connections: a.max_connections,
+                max_subscriptions: a.max_subscriptions,
+                write_deadline: Duration::from_millis(a.write_deadline_ms),
+                storage_deadline: Duration::from_millis(a.storage_deadline_ms),
+                ping_interval: Duration::from_millis(a.ping_interval_ms),
+                token: a.token,
+                ..Config::default()
+            },
+            rx,
+        )
+        .await;
+    }
     if a.unsafe_ack_durability {
         eprintln!("UNSAFE ACK DURABILITY ENABLED: consumer reservations and confirmed ACKs may be lost after process or host failure. Consumer-state flush target: 50 ms. Publication ACKs remain durable.");
     }
@@ -97,6 +130,11 @@ async fn run() -> std::io::Result<()> {
     .await?;
     println!("LISTEN {}", server.local_addr()?);
     let (stop, rx) = tokio::sync::watch::channel(false);
+    spawn_signals(stop);
+    server.run(rx).await
+}
+
+fn spawn_signals(stop: tokio::sync::watch::Sender<bool>) {
     tokio::spawn(async move {
         #[cfg(unix)]
         {
@@ -111,7 +149,6 @@ async fn run() -> std::io::Result<()> {
         }
         stop.send_replace(true);
     });
-    server.run(rx).await
 }
 
 #[cfg(test)]

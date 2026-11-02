@@ -12,6 +12,7 @@ pub struct ExecutorStore {
     owner: Option<std::thread::JoinHandle<()>>,
     external: bool,
     checkpoints: bool,
+    replicas: usize,
 }
 impl ExecutorStore {
     pub fn start<S: Store + 'static>(mut store: S) -> Result<Self, StoreError> {
@@ -20,6 +21,7 @@ impl ExecutorStore {
         }
         let external = store.external_content();
         let checkpoints = store.supports_checkpoint();
+        let replicas = store.replicas();
         let (jobs, incoming) = mpsc::sync_channel::<Job>(1);
         let owner = std::thread::Builder::new()
             .name("screech-storage-owner".into())
@@ -33,6 +35,7 @@ impl ExecutorStore {
             owner: Some(owner),
             external,
             checkpoints,
+            replicas,
         })
     }
     fn call<R: Send + 'static>(
@@ -68,6 +71,12 @@ fn stopped() -> StoreError {
     .into()
 }
 impl Store for ExecutorStore {
+    fn replicas(&self) -> usize {
+        self.replicas
+    }
+    fn read_barrier(&self) -> Result<(), StoreError> {
+        self.call(|s| s.read_barrier())
+    }
     fn durable_appends(&self) -> bool {
         true
     }

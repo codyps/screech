@@ -44,7 +44,7 @@ pub struct ContentKey {
     pub generation: u64,
     pub sequence: u64,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Content {
     pub key: ContentKey,
     pub subject: String,
@@ -74,6 +74,14 @@ fn content_checksum(content: &Content) -> u32 {
 }
 /// An atomic durable append log. Metadata and records share one transaction domain.
 pub trait Store: Send {
+    fn replicas(&self) -> usize {
+        1
+    }
+    /// A current committed observation for clustered model reads. Local stores
+    /// need no network barrier. Failures must prevent outputs and new scheduling.
+    fn read_barrier(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
     /// Execute serialization/reachability work in the same ordered I/O domain
     /// as installation. The default preserves synchronous standalone behavior.
     fn checkpoint_job(&mut self, sequence: u64, job: CheckpointJob) -> Result<(), StoreError> {

@@ -1,4 +1,5 @@
 //! Deterministic protocol/routing/durable state, independent of sockets and SQLite.
+pub mod cluster;
 pub mod core;
 pub mod durable;
 pub mod fault;
