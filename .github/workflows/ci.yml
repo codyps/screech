@@ -176,6 +176,9 @@ jobs:
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         with:
           path: _site
+      - name: Verify unsafe-ACK JetStream performance targets
+        if: ${{ !inputs.trials || inputs.trials >= 3 }}
+        run: python3 scripts/check_jetstream_targets.py --standard results/standard.json --concurrent results/concurrent.json --server screech-unsafe-ack --minimum-trials "$TRIALS" --output results/jetstream-unsafe-ack-targets.json
   deploy:
     name: Publish benchmark dashboard
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'

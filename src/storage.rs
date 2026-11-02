@@ -111,6 +111,15 @@ pub trait Store: Send {
     fn get_content(&self, _key: ContentKey) -> Result<Option<Content>, StoreError> {
         Err(StoreError::Invalid)
     }
+    /// Resolve exactly these keys, in order. A missing or corrupt row fails the batch.
+    fn get_contents(&self, keys: &[ContentKey]) -> Result<Vec<Content>, StoreError> {
+        keys.iter()
+            .map(|key| {
+                self.get_content(*key)?
+                    .ok_or(StoreError::Corrupt(key.sequence))
+            })
+            .collect()
+    }
     /// Validate a reference without loading its body when the backend supports it.
     fn validate_content(
         &self,
@@ -463,7 +472,7 @@ impl Store for SqliteStore {
     fn get_content(&self, key: ContentKey) -> Result<Option<Content>, StoreError> {
         let generation = i64::try_from(key.generation).map_err(|_| StoreError::Invalid)?;
         let seq = i64::try_from(key.sequence).map_err(|_| StoreError::Invalid)?;
-        let row = self.connection.query_row("SELECT subject,headers,payload,checksum FROM retained_content WHERE generation=?1 AND seq=?2",[generation,seq], |r| Ok((r.get::<_,String>(0)?,r.get::<_,Vec<u8>>(1)?,r.get::<_,Vec<u8>>(2)?,r.get::<_,u32>(3)?))).optional()?;
+        let row = self.connection.prepare_cached("SELECT subject,headers,payload,checksum FROM retained_content WHERE generation=?1 AND seq=?2")?.query_row([generation,seq], |r| Ok((r.get::<_,String>(0)?,r.get::<_,Vec<u8>>(1)?,r.get::<_,Vec<u8>>(2)?,r.get::<_,u32>(3)?))).optional()?;
         row.map(|(subject, headers, payload, crc)| {
             let content = Content {
                 key,
@@ -478,6 +487,54 @@ impl Store for SqliteStore {
         })
         .transpose()
     }
+    fn get_contents(&self, keys: &[ContentKey]) -> Result<Vec<Content>, StoreError> {
+        let Some(first) = keys.first() else {
+            return Ok(Vec::new());
+        };
+        if keys.len() < 2
+            || !keys.windows(2).all(|p| {
+                p[0].generation == p[1].generation
+                    && p[0].sequence.checked_add(1) == Some(p[1].sequence)
+            })
+        {
+            return keys
+                .iter()
+                .map(|key| {
+                    self.get_content(*key)?
+                        .ok_or(StoreError::Corrupt(key.sequence))
+                })
+                .collect();
+        }
+        let mut statement = self.connection.prepare_cached("SELECT seq,subject,headers,payload,checksum FROM retained_content WHERE generation=?1 AND seq BETWEEN ?2 AND ?3 ORDER BY seq")?;
+        let mut rows = statement.query(params![
+            i64::try_from(first.generation).map_err(|_| StoreError::Invalid)?,
+            i64::try_from(first.sequence).map_err(|_| StoreError::Invalid)?,
+            i64::try_from(keys.last().unwrap().sequence).map_err(|_| StoreError::Invalid)?,
+        ])?;
+        let mut contents = Vec::with_capacity(keys.len());
+        while let Some(row) = rows.next()? {
+            let key = keys
+                .get(contents.len())
+                .ok_or(StoreError::Corrupt(first.sequence))?;
+            if u64::try_from(row.get::<_, i64>(0)?).ok() != Some(key.sequence) {
+                return Err(StoreError::Corrupt(key.sequence));
+            }
+            let content = Content {
+                key: *key,
+                subject: row.get(1)?,
+                headers: row.get::<_, Vec<u8>>(2)?.into(),
+                payload: row.get::<_, Vec<u8>>(3)?.into(),
+            };
+            if content_checksum(&content) != row.get::<_, u32>(4)? {
+                return Err(StoreError::Corrupt(key.sequence));
+            }
+            contents.push(content);
+        }
+        if contents.len() != keys.len() {
+            return Err(StoreError::Corrupt(keys[contents.len()].sequence));
+        }
+        Ok(contents)
+    }
     fn validate_content(
         &self,
         key: ContentKey,
@@ -485,7 +542,7 @@ impl Store for SqliteStore {
         headers: u64,
         payload: u64,
     ) -> Result<(), StoreError> {
-        let row = self.connection.query_row("SELECT subject,length(headers),length(payload) FROM retained_content WHERE generation=?1 AND seq=?2", params![i64::try_from(key.generation).map_err(|_| StoreError::Invalid)?,i64::try_from(key.sequence).map_err(|_| StoreError::Invalid)?], |r| Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?))).optional()?;
+        let row = self.connection.prepare_cached("SELECT subject,length(headers),length(payload) FROM retained_content WHERE generation=?1 AND seq=?2")?.query_row(params![i64::try_from(key.generation).map_err(|_| StoreError::Invalid)?,i64::try_from(key.sequence).map_err(|_| StoreError::Invalid)?], |r| Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?))).optional()?;
         if row.as_ref().is_some_and(|(s, h, p)| {
             s == subject && *h >= 0 && *p >= 0 && *h as u64 == headers && *p as u64 == payload
         }) {

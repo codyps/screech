@@ -515,6 +515,18 @@ impl<S: Store> Worker<S> {
         }
         self.engine.read_message(message).map_err(|e| e.to_string())
     }
+    fn read_messages(
+        &self,
+        messages: &[&durable::StoredMessage],
+    ) -> Result<Vec<durable::StoredMessage>, String> {
+        if self.plan.as_ref().is_some_and(|p| p.has_staged_content()) {
+            messages.iter().map(|m| self.read_message(m)).collect()
+        } else {
+            self.engine
+                .read_messages(messages)
+                .map_err(|e| e.to_string())
+        }
+    }
     fn has_push(&self) -> bool {
         self.state().streams.values().any(|s| {
             s.consumers.values().any(|c| {
@@ -1323,19 +1335,21 @@ impl<S: Store> Worker<S> {
         };
         let stream = &self.state().streams[&p.stream];
         let mut ready = stream.consumers[&p.consumer].ready_count(stream);
-        let messages: Vec<_> = deliveries
+        let selected: Vec<_> = deliveries
             .iter()
-            .map(|d| {
+            .map(|d| &stream.messages[&d.sequence])
+            .collect();
+        let bodies = self.read_messages(&selected)?;
+        let messages: Vec<_> = bodies
+            .into_iter()
+            .zip(deliveries)
+            .map(|(message, d)| {
                 if d.attempt == 1 {
                     ready = ready.saturating_sub(1);
                 }
-                Ok((
-                    self.read_message(&stream.messages[&d.sequence])?,
-                    d.clone(),
-                    ready,
-                ))
+                (message, d.clone(), ready)
             })
-            .collect::<Result<_, String>>()?;
+            .collect();
         self.commit(event)?;
         for (message, delivery, ready) in messages {
             let size = message.size() as usize;

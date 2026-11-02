@@ -1688,6 +1688,38 @@ impl<S: Store> Engine<S> {
         }
         result
     }
+    /// Resolve a bounded selection before committing its reservation/retention effects.
+    pub fn read_messages(&self, messages: &[&StoredMessage]) -> Result<Vec<StoredMessage>, Error> {
+        if self.poisoned.get() {
+            return Err(invalid("Storage failed: restart required"));
+        }
+        let result = (|| {
+            if let Some(keys) = messages
+                .iter()
+                .map(|m| m.content.as_ref().map(|r| r.key))
+                .collect::<Option<Vec<_>>>()
+            {
+                let contents = self.store.get_contents(&keys)?;
+                if contents.len() != messages.len() {
+                    return Err(invalid("Invalid content batch length"));
+                }
+                messages
+                    .iter()
+                    .zip(contents)
+                    .map(|(m, c)| hydrate_content(m, c))
+                    .collect()
+            } else {
+                messages
+                    .iter()
+                    .map(|m| hydrate_message(&self.store, m))
+                    .collect()
+            }
+        })();
+        if result.is_err() {
+            self.poisoned.set(true);
+        }
+        result
+    }
     pub fn is_poisoned(&self) -> bool {
         self.poisoned.get()
     }
@@ -1798,7 +1830,13 @@ impl<S: Store> Engine<S> {
         let mut imports = Vec::new();
         if self.store.external_content() {
             for stream in self.state.streams.values_mut() {
-                let sequences: Vec<_> = stream.messages.keys().copied().collect();
+                let sequences: Vec<_> = stream
+                    .messages
+                    .iter()
+                    .filter_map(|(&sequence, message)| {
+                        message.content.is_none().then_some(sequence)
+                    })
+                    .collect();
                 for sequence in sequences {
                     let message = stream.messages.get_mut(&sequence).unwrap();
                     if message.content.is_none() {
@@ -1998,6 +2036,9 @@ impl GroupPlan {
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
+    pub fn has_staged_content(&self) -> bool {
+        !self.contents.is_empty()
+    }
     pub fn read_staged_message(
         &self,
         message: &StoredMessage,
@@ -2116,11 +2157,14 @@ fn hydrate_content(message: &StoredMessage, content: Content) -> Result<StoredMe
     {
         return Err(StoreError::Corrupt(reference.key.sequence).into());
     }
-    let mut message = message.clone();
-    message.headers = content.headers;
-    message.payload = content.payload;
-    message.content = None;
-    Ok(message)
+    Ok(StoredMessage {
+        sequence: message.sequence,
+        subject: content.subject,
+        headers: content.headers,
+        payload: content.payload,
+        time: message.time,
+        content: None,
+    })
 }
 fn hydrate_message(store: &impl Store, message: &StoredMessage) -> Result<StoredMessage, Error> {
     let Some(reference) = &message.content else {

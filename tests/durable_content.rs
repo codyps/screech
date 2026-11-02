@@ -52,9 +52,10 @@ fn publish<S: Store>(engine: &mut Engine<S>, time: u64) {
 fn equal(disk: &Engine<SqliteStore>, memory: &Engine<MemoryStore>) {
     let mut resolved = disk.state().clone();
     let stream = resolved.streams.get_mut("S").unwrap();
-    for seq in stream.messages.keys().copied().collect::<Vec<_>>() {
-        let message = disk.read_message(&stream.messages[&seq]).unwrap();
-        stream.messages.insert(seq, message);
+    let selected: Vec<_> = stream.messages.values().collect();
+    let messages = disk.read_messages(&selected).unwrap();
+    for message in messages {
+        stream.messages.insert(message.sequence, message);
     }
     assert_eq!(&resolved, memory.state());
     assert!(disk.state().streams["S"]
@@ -334,4 +335,33 @@ proptest! {
             prop_assert_eq!(&resolved,&model);
         }
     }
+}
+
+#[test]
+fn batch_body_read_failure_poisons_before_reservation_or_ack() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let mut disk = setup(SqliteStore::open(&path).unwrap(), Retention::Limits);
+    for time in 0..4 {
+        publish(&mut disk, time);
+    }
+    disk.checkpoint().unwrap();
+    drop(disk.into_store());
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute(
+        "UPDATE retained_content SET payload=zeroblob(length(payload)) WHERE seq=3",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let mut disk = Engine::recover(SqliteStore::open(&path).unwrap()).unwrap();
+    let messages: Vec<_> = disk.state().streams["S"].messages.values().collect();
+    assert!(disk.read_messages(&messages).is_err());
+    assert!(disk.is_poisoned());
+    assert_eq!(disk.state().streams["S"].consumers["D"].delivered, 0);
+    let event = disk.state().prepare_delivery("S", "D", 5).unwrap().unwrap();
+    assert!(disk.commit(event).is_err());
+    drop(disk.into_store());
+    let disk = Engine::recover(SqliteStore::open(&path).unwrap()).unwrap();
+    assert_eq!(disk.state().streams["S"].consumers["D"].delivered, 0);
 }

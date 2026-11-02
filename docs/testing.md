@@ -241,6 +241,10 @@ A version-2 checkpoint migration test verifies content import and reopening.
 Log-budget tests keep external content separate from event bytes across restarts;
 inline-store replay continues counting its bodies as event bytes.
 `storage_content` checks atomic content/event writes and checkpoint garbage collection.
+Consecutive selected content keys use a range cursor; sparse and reordered selections
+preserve request order. Batch corruption/missing-row tests require failure before
+reservation or ACK state changes. Query caching retains prepared statements, not
+message bodies.
 
 On Linux, run `python3 scripts/content_memory_tests.py target/debug/screech-server`.
 It retains 256 MiB in 1024 distinct bodies, requires sampled server RSS below 96 MiB,
@@ -264,6 +268,7 @@ Count, byte and time limits are checked independently at the storage boundary.
 case against NATS `sync_interval: always`, separately for each Screech mode. Targets
 are at least 0.8x throughput and at most 2x p99, using medians of three checked trials.
 Fetch(1) uses full-cycle p99; Core-on-stream uses durable publication p99. Missing,
-unverified, duplicate or invalid trials fail validation. CI currently publishes
-reports even when performance targets miss; a green correctness job is not evidence
-that every performance target passed.
+unverified, duplicate or invalid trials fail validation. CI reports strict-default results separately and gates unsafe-ACK performance
+after publishing the downloadable benchmark artifacts. The gate requires three or
+more trials; shorter manual diagnostic runs produce reports without certifying the
+goal. A green correctness job alone is not evidence that performance targets passed.

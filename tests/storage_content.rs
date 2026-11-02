@@ -91,3 +91,66 @@ fn corrupt_content_is_rejected_on_read() {
         })
         .is_err());
 }
+
+#[test]
+fn content_batch_preserves_order_and_fails_on_missing_or_corrupt_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let mut store = SqliteStore::open(&path).unwrap();
+    let contents: Vec<_> = (1..=6)
+        .map(|seq| content(1, seq))
+        .chain([content(2, 1)])
+        .collect();
+    store.append_with_content(&[record()], &contents).unwrap();
+    for keys in [
+        vec![],
+        vec![contents[0].key],
+        contents.iter().take(6).map(|c| c.key).collect(),
+        vec![
+            contents[4].key,
+            contents[0].key,
+            contents[6].key,
+            contents[0].key,
+        ],
+    ] {
+        let expected: Vec<_> = keys
+            .iter()
+            .map(|k| store.get_content(*k).unwrap().unwrap())
+            .collect();
+        assert_eq!(store.get_contents(&keys).unwrap(), expected);
+    }
+    assert!(store
+        .get_contents(&[
+            ContentKey {
+                generation: 1,
+                sequence: 6
+            },
+            ContentKey {
+                generation: 1,
+                sequence: 7
+            }
+        ])
+        .is_err());
+    drop(store);
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute(
+        "DELETE FROM retained_content WHERE generation=1 AND seq=3",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    let store = SqliteStore::open(&path).unwrap();
+    let keys: Vec<_> = (1..=6)
+        .map(|sequence| ContentKey {
+            generation: 1,
+            sequence,
+        })
+        .collect();
+    assert!(store.get_contents(&keys).is_err());
+    drop(store);
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute("UPDATE retained_content SET payload=zeroblob(length(payload)) WHERE generation=1 AND seq=2",[]).unwrap();
+    drop(db);
+    let store = SqliteStore::open(&path).unwrap();
+    assert!(store.get_contents(&keys[..2]).is_err());
+}
