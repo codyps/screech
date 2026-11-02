@@ -19,7 +19,7 @@ unpinned; cross-run differences can reflect hardware and filesystem variation.
 The default campaign runs three checked trials per case, plus warmups. It covers
 Core fanout/wildcards/queues/request-reply, live Core on a stream, sequential and
 concurrent durable publishers, pull consumers, ACK-and-next, dedup, retention and
-mixed workloads, including a 1000-message outstanding ACK window. A second campaign runs four concurrent cases at 20,000 messages.
+mixed workloads, including a 1000-message outstanding ACK window. A second campaign runs four concurrent cases at 20,000 messages and a 10,000-message limits-retention consumer case.
 There are 258 measured trials at the default settings: 210 standard and 48 larger.
 A manual CI run can set trials (1–10) and nats_ref (branch, tag or SHA).
 

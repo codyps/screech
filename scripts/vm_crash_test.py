@@ -85,6 +85,8 @@ mount -t ext4 /dev/vda /data || exec sh
 export TOKIO_WORKER_THREADS=2
 exec /bin/screech-server --addr 0.0.0.0 --port 4222 --store /data/screech.db --storage-deadline-ms 30000 --write-deadline-ms 10000
 '''
+    if args.unsafe_ack_durability:
+        init=init.replace('--write-deadline-ms 10000\n','--write-deadline-ms 10000 --unsafe-ack-durability\n')
     (root/'init').write_text(init);(root/'init').chmod(0o755)
     archive(root,work/'initramfs.gz')
     with open(work/'disk.raw','wb') as f:f.truncate(128*1024*1024)
@@ -179,6 +181,10 @@ def run(args):
             prior_next_pending=c.publish(b'next',subject='next.x')
             old=c.pull(stream='A');following=c.request_message(old['reply'],b'+NXT')
             assert following['payload']==b'next'
+            if args.unsafe_ack_durability:
+                # Publication success must persist every older consumer transition,
+                # even when the consumer confirmations themselves were unsafe.
+                value=f'publication-fence-{cycle}'.encode();seq=c.publish(value);expected[seq]=value
             if args.force_checkpoint:
                 checkpoint=c.request('$JS.API.SCREECH.CHECKPOINT',{});assert checkpoint.get('success'),checkpoint
             c.close()
@@ -199,12 +205,13 @@ def run(args):
         c.close()
     finally:vm.kill()
     result={'passed':True,'cycles':cycles,'acknowledged_verified':len(expected),'acceleration':'tcg','drive_cache':'none',
-            'scope':'guest kernel crash; host disk/controller failure not simulated','consumer_ack_and_redelivery_verified':True,'dedup_verified':True,'workqueue_retention_verified':True,'checkpoint_recovery_verified':args.force_checkpoint,'reservation_batch_size':8,'ack_next_recovery_verified':True,'concurrent_group_commits_verified':args.concurrent}
+            'scope':'guest kernel crash; host disk/controller failure not simulated','consumer_ack_and_redelivery_verified':True,'dedup_verified':True,'workqueue_retention_verified':True,'unsafe_ack_durability':args.unsafe_ack_durability,'publication_prefix_fence_verified':args.unsafe_ack_durability,'checkpoint_recovery_verified':args.force_checkpoint,'reservation_batch_size':8,'ack_next_recovery_verified':True,'concurrent_group_commits_verified':args.concurrent}
     text=json.dumps(result,indent=2);print(text)
     if args.output:args.output.write_text(text+'\n')
 if __name__=='__main__':
     p=argparse.ArgumentParser()
     for key in ('binary','kernel','modules','busybox','qemu','modprobe','mkfs'):p.add_argument('--'+key,required=True)
     p.add_argument('--work-dir',type=Path,required=True);p.add_argument('--output',type=Path)
+    p.add_argument('--unsafe-ack-durability',action='store_true')
     p.add_argument('--concurrent',action='store_true');p.add_argument('--force-checkpoint',action='store_true');p.add_argument('--kernel-release');p.add_argument('--cycles',type=int,default=3);p.add_argument('--messages',type=int,default=50)
     run(p.parse_args())

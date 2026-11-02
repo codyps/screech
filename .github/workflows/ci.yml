@@ -51,6 +51,7 @@ jobs:
           PROPTEST_CASES=1024 cargo test --locked --all-features --test durable_model tree_projections
           PROPTEST_CASES=2048 cargo test --locked --all-features --test durable_model mixed_groups
           PROPTEST_CASES=1024 cargo test --locked --all-features --test durable_model ack_floors_refine
+          PROPTEST_CASES=1024 cargo test --locked --all-features --test durable_model mixed_ack_batches_refine
           PROPTEST_CASES=1024 cargo test --locked --all-features --test core_model token_index_refines
           PROPTEST_CASES=1024 cargo test --locked --all-features --lib partial_output_refines
           PROPTEST_CASES=1024 cargo test --locked --all-features --lib core_burst_refines
@@ -127,7 +128,7 @@ jobs:
             --nats-commit "$(cat results/nats-commit.txt)" \
             --nats-default --nats-sync-interval 10ms --screech-unsafe-ack --trials "$TRIALS" \
             --reverse --output results/standard.json
-      - name: Larger concurrent cases · 20,000 messages
+      - name: Larger JetStream cases
         run: |
           python3 scripts/benchmark.py --screech target/release/screech-server \
             --nats bin/nats-server --driver bin/bench-driver \
@@ -158,7 +159,7 @@ jobs:
         run: |
           python3 scripts/render_benchmarks.py \
             --input 'CI · standard cases' results/standard.json \
-            --input 'CI · 20,000-message concurrent cases' results/concurrent.json \
+            --input 'CI · larger JetStream cases' results/concurrent.json \
             --output _site --revision "$GITHUB_SHA" \
             --repository "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
             --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"

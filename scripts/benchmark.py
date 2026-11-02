@@ -49,7 +49,7 @@ def usage(pid):
     return {'rss_kib':rss,'cpu_seconds':(int(fields[13])+int(fields[14]))/os.sysconf('SC_CLK_TCK')}
 
 JETSTREAM_CASES = [('core-stream',128,1,5000),('durable',128,1,5000),('consume',128,1,1000),('consume-limits',128,1,1000),('consume-one',128,1,1000),('consume-one',1024,1,1000),('consume-next',128,1,1000),('consume-parallel',128,1,5000),('consume-ack-window',128,1,5000),('dedup',128,1,5000),('durable-parallel',128,1,5000),('consume-one-parallel',128,1,5000),('mixed-parallel',128,1,5000),('mixed-streams',128,1,5000)]
-CONCURRENT_CASES = [(name,128,1,20000) for name in ('durable-parallel','consume-one-parallel','mixed-parallel','mixed-streams')]
+CONCURRENT_CASES = [(name,128,1,20000) for name in ('durable-parallel','consume-one-parallel','mixed-parallel','mixed-streams')] + [('consume-limits',128,1,10000)]
 
 def main(args):
     rows=[];commands=[]

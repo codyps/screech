@@ -272,3 +272,11 @@ unverified, duplicate or invalid trials fail validation. CI reports strict-defau
 after publishing the downloadable benchmark artifacts. The gate requires three or
 more trials; shorter manual diagnostic runs produce reports without certifying the
 goal. A green correctness job alone is not evidence that performance targets passed.
+
+Buffered consumer journal tests cover logical sequence lookup, checksums and range
+bounds, malformed block lengths, cache invalidation, replay in strict mode, and
+publication/checkpoint/purge fences. The VM job additionally runs unsafe mode without
+a forced application checkpoint: a final durable publication fences the consumer
+log before the guest is killed, and the next boot checks that entire prefix.
+Core profiling waits for perf's control-pipe enable acknowledgement before sending
+the measured workload; startup failures and missing acknowledgement fail explicitly.
