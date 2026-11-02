@@ -317,3 +317,23 @@ async fn stalled_partial_write_closes_without_releasing_inflight_credit() {
     assert_eq!(out.bytes, limit);
     assert_eq!(out.count, 1);
 }
+
+#[test]
+fn retained_small_frames_reuse_available_receive_storage() {
+    let mut input = BytesMut::with_capacity(64 * 1024);
+    let mut retained = Vec::new();
+    for n in 0..200 {
+        let tail = input.as_ptr();
+        reserve_input(&mut input, 64 * 1024);
+        assert_eq!(
+            input.as_ptr(),
+            tail,
+            "adequate shared tail space was reallocated"
+        );
+        input.extend_from_slice(&[n as u8; 128]);
+        retained.push(input.split_to(128).freeze());
+    }
+    for (n, frame) in retained.iter().enumerate() {
+        assert!(frame.iter().all(|b| *b == n as u8));
+    }
+}

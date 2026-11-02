@@ -115,6 +115,13 @@ fn field_range(buffer: &[u8], field: &[u8]) -> Range<usize> {
     assert!(end <= buffer.len(), "borrowed parser field bounds");
     start..end
 }
+fn reserve_input(buf: &mut BytesMut, allowance: usize) {
+    // Retained frames can share this allocation. Reuse its tail until growing
+    // is necessary, rather than reserving an entire read window each time.
+    if buf.capacity() - buf.len() < allowance.min(8192) {
+        buf.reserve(allowance);
+    }
+}
 enum FrameData {
     Raw(Bytes),
     Delivery {
@@ -657,7 +664,7 @@ async fn connection(
         task: writer,
         peer: peer.clone(),
     };
-    let mut buf = BytesMut::with_capacity(8192);
+    let mut buf = BytesMut::with_capacity(64 * 1024);
     let mut connected = false;
     let mut verbose = true;
     let mut no_responders = false;
@@ -716,7 +723,7 @@ async fn connection(
             let allowance=max.saturating_sub(buf.len()).min(64*1024);
             if allowance==0 {protocol_error(&peer,"Maximum buffer exceeded");return Ok(());}
 
-            buf.reserve(allowance);
+            reserve_input(&mut buf, allowance);
             let mut destination = (&mut buf).limit(allowance);
             tokio::select! {
                 biased;
