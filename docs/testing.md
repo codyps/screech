@@ -190,3 +190,9 @@ The parser boxes INFO/CONNECT data so hot publication results stay compact.
 Handshake tests retain UTF-8 fields and check pipelined binary publications.
 Routing tests warm exact/queue caches before changing echo, delivery limits,
 subscriptions and disconnects, and compare every delivery with the scan model.
+
+Core receiver notifications are deferred until the available input burst has
+been routed (at most 256 commands), before any wait/yield. A drop guard wakes
+accepted deliveries on early errors and EOF as well. Tests verify pending
+byte/count limits during deferred notification and ordered 1 KiB delivery across
+the command budget followed by publisher EOF or a malformed command.

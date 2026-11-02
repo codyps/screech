@@ -267,7 +267,7 @@ async fn borrowed_body_keeps_inflight_budget_until_write_completes() {
         cancel,
         headers: true,
     };
-    assert!(peer.send_delivery(msg, Arc::from("1")));
+    assert!(peer.send_delivery(msg, Arc::from("1"), None));
     let (write, mut read) = tokio::io::duplex(17);
     let task = tokio::spawn(writer_loop(write, peer.clone(), Duration::from_secs(5)));
     timeout(Duration::from_secs(1), async {
@@ -307,7 +307,7 @@ async fn stalled_partial_write_closes_without_releasing_inflight_credit() {
         cancel,
         headers: true,
     };
-    assert!(peer.send_delivery(msg, Arc::from("1")));
+    assert!(peer.send_delivery(msg, Arc::from("1"), None));
     let (write, _unread) = tokio::io::duplex(17);
     writer_loop(write, peer.clone(), Duration::from_millis(20)).await;
     canceled.changed().await.unwrap();
@@ -336,4 +336,35 @@ fn retained_small_frames_reuse_available_receive_storage() {
     for (n, frame) in retained.iter().enumerate() {
         assert!(frame.iter().all(|b| *b == n as u8));
     }
+}
+
+#[tokio::test]
+async fn deferred_wakes_keep_admission_limits_and_wake_on_early_return() {
+    let (cancel, _) = watch::channel(false);
+    let peer = Peer {
+        out: Arc::new(Mutex::new(Outbox::default())),
+        ready: Arc::new(Notify::new()),
+        max_pending: 4096,
+        cancel,
+        headers: true,
+    };
+    // Dropping the burst guard is also the error/return path. No write task is
+    // notified while routing; accepted frames and their budget remain intact.
+    {
+        let mut wakes = DeliveryWakes::default();
+        let msg = message("s", None, b"", &vec![0xab; 1024], true);
+        assert!(peer.send_delivery(msg.clone(), Arc::from("1"), Some(&mut wakes)));
+        assert!(peer.send_delivery(msg.clone(), Arc::from("1"), Some(&mut wakes)));
+        assert_eq!(wakes.0.len(), 1);
+        assert!(timeout(Duration::from_millis(5), peer.ready.notified())
+            .await
+            .is_err());
+        assert!(peer.send_delivery(msg.clone(), Arc::from("1"), Some(&mut wakes)));
+        assert!(!peer.send_delivery(msg, Arc::from("1"), Some(&mut wakes)));
+        assert_eq!(peer.out.lock().unwrap().count, 3);
+    }
+    timeout(Duration::from_millis(100), peer.ready.notified())
+        .await
+        .unwrap();
+    assert_eq!(peer.out.lock().unwrap().count, 3);
 }

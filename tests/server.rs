@@ -1075,3 +1075,45 @@ async fn fragmented_large_core_frames_preserve_fanout_queue_headers_and_replies(
     );
     server.stop().await;
 }
+
+#[tokio::test]
+async fn core_burst_wakes_receivers_when_publisher_fails_or_closes() {
+    let server = Running::start(Config::default()).await;
+    let mut subscriber = server.raw().await;
+    subscriber
+        .get_mut()
+        .write_all(b"SUB a 1\r\nPING\r\n")
+        .await
+        .unwrap();
+    assert_eq!(line(&mut subscriber).await, "PONG\r\n");
+    for invalid in [false, true] {
+        let mut publisher = server.raw().await;
+        // Cross the per-poll work bound, then exit through EOF or a parse error.
+        let mut burst = Vec::new();
+        let mut want = Vec::new();
+        for n in 0..300u16 {
+            let mut body = vec![0xa5; 1024];
+            body[..2].copy_from_slice(&n.to_le_bytes());
+            burst.extend_from_slice(b"PUB a 1024\r\n");
+            burst.extend_from_slice(&body);
+            burst.extend_from_slice(b"\r\n");
+            want.extend_from_slice(b"MSG a 1 1024\r\n");
+            want.extend_from_slice(&body);
+            want.extend_from_slice(b"\r\n");
+        }
+        if invalid {
+            burst.extend_from_slice(b"INVALID\r\n");
+        }
+        publisher.get_mut().write_all(&burst).await.unwrap();
+        publisher.get_mut().shutdown().await.unwrap();
+        let mut got = vec![0; want.len()];
+        timeout(Duration::from_secs(3), subscriber.read_exact(&mut got))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, want);
+        subscriber.get_mut().write_all(b"PING\r\n").await.unwrap();
+        assert_eq!(line(&mut subscriber).await, "PONG\r\n");
+    }
+    server.stop().await;
+}

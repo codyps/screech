@@ -149,6 +149,17 @@ struct Peer {
     cancel: watch::Sender<bool>,
     headers: bool,
 }
+// Wake receivers after routing the available input burst. Dropping on any
+// early return still wakes every accepted delivery before connection cleanup.
+#[derive(Default)]
+struct DeliveryWakes(Vec<Arc<Notify>>);
+impl Drop for DeliveryWakes {
+    fn drop(&mut self) {
+        for ready in self.0.drain(..) {
+            ready.notify_one();
+        }
+    }
+}
 struct WriterGuard {
     task: tokio::task::JoinHandle<()>,
     peer: Peer,
@@ -170,18 +181,29 @@ impl Peer {
             data: FrameData::Raw(bytes),
         })
     }
-    fn send_delivery(&self, message: Arc<OutboundMessage>, sid: Arc<str>) -> bool {
+    fn send_delivery(
+        &self,
+        message: Arc<OutboundMessage>,
+        sid: Arc<str>,
+        wakes: Option<&mut DeliveryWakes>,
+    ) -> bool {
         let size = wire_size(&message, &sid, self.headers);
-        self.enqueue(Queued {
-            size,
-            data: FrameData::Delivery {
-                message,
-                sid,
-                headers: self.headers,
+        self.enqueue_with_wakes(
+            Queued {
+                size,
+                data: FrameData::Delivery {
+                    message,
+                    sid,
+                    headers: self.headers,
+                },
             },
-        })
+            wakes,
+        )
     }
     fn enqueue(&self, frame: Queued) -> bool {
+        self.enqueue_with_wakes(frame, None)
+    }
+    fn enqueue_with_wakes(&self, frame: Queued, wakes: Option<&mut DeliveryWakes>) -> bool {
         let mut out = self.out.lock().unwrap();
         if out.closed {
             return false;
@@ -197,7 +219,11 @@ impl Peer {
         out.frames.push_back(frame);
         drop(out);
         if wake {
-            self.ready.notify_one();
+            if let Some(wakes) = wakes {
+                wakes.0.push(self.ready.clone());
+            } else {
+                self.ready.notify_one();
+            }
         }
         true
     }
@@ -221,7 +247,7 @@ impl Hub {
         msg: &Message,
     ) -> usize {
         let mut shared = None;
-        self.route(publisher, target, queue, || {
+        self.route(publisher, target, queue, None, || {
             shared
                 .get_or_insert_with(|| Arc::new(OutboundMessage::Owned(msg.clone())))
                 .clone()
@@ -232,13 +258,14 @@ impl Hub {
         publisher: u64,
         target: &str,
         queue: Option<&str>,
+        mut wakes: Option<&mut DeliveryWakes>,
         mut message: impl FnMut() -> Arc<OutboundMessage>,
     ) -> usize {
         let mut dead = Vec::new();
         let Hub { core, peers } = self;
         let count = core.route_with(publisher, target, queue, |client, sid| {
             if let Some(peer) = peers.get(&client) {
-                if !peer.send_delivery(message(), sid.clone()) {
+                if !peer.send_delivery(message(), sid.clone(), wakes.as_deref_mut()) {
                     dead.push(client);
                 }
             }
@@ -677,6 +704,7 @@ async fn connection(
             while let Some(result) = durable.try_join_next() { finish_durable(result)?; }
             // Limit work per poll to give readers, writers, and shutdown a turn.
             let mut processed=0;
+            let mut wakes=DeliveryWakes::default();
             while processed<256 {
                 let parsed=match parse(&buf,config.limits) {Ok(v)=>v,Err(e)=>{protocol_error(&peer,&e.0);return Ok(());}};
                 let Some((cmd,remaining))=parsed else {break;};
@@ -704,17 +732,18 @@ async fn connection(
                     NatsMessage::Pub(p)=>{
                         let subject=field_range(&buf,&p.subject);let reply=p.reply_to.as_deref().map(|v|field_range(&buf,v));let plen=p.payload.len();drop(p);
                         let frame=buf.split_to(consumed).freeze();advanced=true;
-                        let msg=WireMessage{frame,subject,reply,body:consumed-plen-2,header_len:0};publish(&hub,id,msg,no_responders,config.jetstream.as_ref(),&mut durable,config.storage_deadline)?;
+                        let msg=WireMessage{frame,subject,reply,body:consumed-plen-2,header_len:0};publish(&hub,id,msg,&mut wakes,no_responders,&config,&mut durable)?;
                         if verbose{peer.send(Bytes::from_static(b"+OK\r\n"));}}
                     NatsMessage::HPub(p)=>{
                         let subject=field_range(&buf,&p.subject);let reply=p.reply_to.as_deref().map(|v|field_range(&buf,v));let plen=p.payload.len();let hlen=p.headers.len();drop(p);
                         let frame=buf.split_to(consumed).freeze();advanced=true;
-                        let msg=WireMessage{frame,subject,reply,body:consumed-plen-hlen-2,header_len:hlen};publish(&hub,id,msg,no_responders,config.jetstream.as_ref(),&mut durable,config.storage_deadline)?;
+                        let msg=WireMessage{frame,subject,reply,body:consumed-plen-hlen-2,header_len:hlen};publish(&hub,id,msg,&mut wakes,no_responders,&config,&mut durable)?;
                         if verbose{peer.send(Bytes::from_static(b"+OK\r\n"));}}
                     _=>{protocol_error(&peer,"Unexpected server operation");return Ok(());}
                 }
                 if !advanced{buf.advance(consumed);}processed+=1;
             }
+            drop(wakes);
             if processed==256 {tokio::task::yield_now().await;}
             if *canceled.borrow() || *shutdown.borrow(){return Ok(());}
             if processed==256 {continue;}
@@ -759,10 +788,10 @@ fn publish(
     hub: &Arc<Mutex<Hub>>,
     id: u64,
     wire: WireMessage,
+    wakes: &mut DeliveryWakes,
     no_responders: bool,
-    js: Option<&crate::jetstream::Handle>,
+    config: &Config,
     durable: &mut JoinSet<DurableCompletion>,
-    deadline: Duration,
 ) -> io::Result<()> {
     // Core routing is immediate, including publications captured by a stream.
     // Storage admission/completion never holds the routing lock or read loop.
@@ -772,8 +801,8 @@ fn publish(
     let recipients = hub
         .lock()
         .unwrap()
-        .route(id, subject, None, || shared.clone());
-    let Some(js) = js.filter(|js| js.captures(subject)) else {
+        .route(id, subject, None, Some(wakes), || shared.clone());
+    let Some(js) = config.jetstream.as_ref().filter(|js| js.captures(subject)) else {
         if recipients == 0 && no_responders {
             no_response(
                 hub,
@@ -798,7 +827,7 @@ fn publish(
     };
     let pending = js.try_request(msg).map_err(io::Error::other)?;
     let permit = pending.lease();
-    let expires = Instant::now() + deadline;
+    let expires = Instant::now() + config.storage_deadline;
     let hub = hub.clone();
     durable.spawn(async move {
         let result = async {
