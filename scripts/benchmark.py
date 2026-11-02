@@ -40,6 +40,12 @@ def start(binary, label, durable, directory):
     except BaseException:
         process.kill();process.wait();log.close();raise
 
+def filesystem_type(path):
+    try:
+        return subprocess.check_output(['stat','-f','-c','%T',str(path)],text=True,stderr=subprocess.DEVNULL).strip()
+    except (OSError,subprocess.CalledProcessError):
+        return None
+
 def usage(pid):
     if not Path(f'/proc/{pid}/status').exists():return {'rss_kib':None,'cpu_seconds':None}
     rss=0
@@ -94,7 +100,7 @@ def main(args):
                     process.kill();process.wait();log.close()
                     shutil.copy2(directory/'server.log',args.output.parent/f'{args.output.stem}-{label}-{"durable" if durable else "core"}-server.log')
     cpu=next((x.split(':',1)[1].strip() for x in Path('/proc/cpuinfo').read_text().splitlines() if x.startswith('model name')),platform.processor())
-    output={'environment':{'recorded_at':datetime.now(timezone.utc).isoformat(),'nats_sync_intervals':['always']+(['default 2m'] if args.nats_default else [])+args.nats_sync_interval,'kernel':platform.release(),'cpu':cpu,'logical_cpus':os.cpu_count(),'server_workers':2,'transport':'loopback TCP','durability':'SQLite WAL FULL by default; screech-unsafe-ack buffers consumer state for a 50ms flush target, publication ACKs remain FULL; nats-main sync_interval always; optional nats-default uses default 2m','nats_commit':args.nats_commit,'screech_binary_sha256':__import__('hashlib').sha256(Path(args.screech).read_bytes()).hexdigest(),'screech_before_binary_sha256':__import__('hashlib').sha256(Path(args.screech_before).read_bytes()).hexdigest() if args.screech_before else None,'nats_binary_sha256':__import__('hashlib').sha256(Path(args.nats).read_bytes()).hexdigest(),'rustc':subprocess.check_output(['rustc','--version'],text=True).strip(),'nats_version':subprocess.check_output([args.nats,'--version'],text=True).strip(),'concurrent_test_workloads':False},'commands':commands,'rows':rows}
+    output={'environment':{'recorded_at':datetime.now(timezone.utc).isoformat(),'nats_sync_intervals':['always']+(['default 2m'] if args.nats_default else [])+args.nats_sync_interval,'kernel':platform.release(),'cpu':cpu,'logical_cpus':os.cpu_count(),'store_filesystem':filesystem_type(tempfile.gettempdir()),'server_workers':2,'transport':'loopback TCP','durability':'SQLite WAL FULL by default; screech-unsafe-ack buffers consumer state for a 50ms flush target, publication ACKs remain FULL; nats-main sync_interval always; optional nats-default uses default 2m','nats_commit':args.nats_commit,'screech_binary_sha256':__import__('hashlib').sha256(Path(args.screech).read_bytes()).hexdigest(),'screech_before_binary_sha256':__import__('hashlib').sha256(Path(args.screech_before).read_bytes()).hexdigest() if args.screech_before else None,'nats_binary_sha256':__import__('hashlib').sha256(Path(args.nats).read_bytes()).hexdigest(),'rustc':subprocess.check_output(['rustc','--version'],text=True).strip(),'nats_version':subprocess.check_output([args.nats,'--version'],text=True).strip(),'concurrent_test_workloads':False},'commands':commands,'rows':rows}
     args.output.write_text(json.dumps(output,indent=2)+'\n')
 if __name__=='__main__':
     p=argparse.ArgumentParser()

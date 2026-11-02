@@ -266,7 +266,7 @@ Count, byte and time limits are checked independently at the storage boundary.
 
 `check_jetstream_targets.py` reports every standard and larger concurrent JetStream
 case against NATS `sync_interval: always`, separately for each Screech mode. Targets
-are at least 0.8x throughput and at most 2x p99, using medians of three checked trials.
+are at least 1.10x throughput and at most 0.90x p99, using medians of three checked trials.
 Fetch(1) uses full-cycle p99; Core-on-stream uses durable publication p99. Missing,
 unverified, duplicate or invalid trials fail validation. CI reports strict-default results separately and gates unsafe-ACK performance
 after publishing the downloadable benchmark artifacts. The gate requires three or

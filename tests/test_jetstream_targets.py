@@ -16,15 +16,23 @@ class JetStreamTargets(unittest.TestCase):
     def test_exact_boundaries_and_correct_latency_scope(self):
         data=self.data()
         for r in data['rows']:
-            if r['server']=='screech':r.update(publishes_per_second=80,cycle_p99_us=20,p99_us=999)
+            if r['server']=='screech':r.update(publishes_per_second=110,cycle_p99_us=9,p99_us=999)
         result=compare(data,[('consume-one',128,1,1000)],'screech')[0]
         self.assertTrue(result['passed']);self.assertEqual(result['latency_metric'],'cycle_p99_us')
-        data['rows'][0]['cycle_p99_us']=21;data['rows'][1]['cycle_p99_us']=21
+        data['rows'][0]['cycle_p99_us']=9.1;data['rows'][1]['cycle_p99_us']=9.1
         self.assertFalse(compare(data,[('consume-one',128,1,1000)],'screech')[0]['passed'])
+    def test_each_metric_must_beat_baseline_by_ten_percent(self):
+        for throughput, latency in [(109,9), (110,9.1)]:
+            data=self.data()
+            for row in data['rows']:
+                if row['server']=='screech':
+                    row.update(publishes_per_second=throughput,cycle_p99_us=latency)
+            self.assertFalse(compare(data,[('consume-one',128,1,1000)],'screech')[0]['passed'])
+
     def test_core_on_stream_uses_durable_latency(self):
         data=self.data('core-stream')
         for r in data['rows']:
-            if r['server']=='screech':r.update(durable_p99_us=21,p99_us=1)
+            if r['server']=='screech':r.update(durable_p99_us=9.1,p99_us=1)
         self.assertFalse(compare(data,[('core-stream',128,1,1000)],'screech')[0]['passed'])
     def test_missing_unchecked_duplicate_and_invalid_data_fail_closed(self):
         for mutation in ['missing','unchecked','duplicate','nan','wrong-count','missing-cycle']:

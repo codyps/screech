@@ -42,7 +42,7 @@ def compare(data, expected, server, minimum_trials=3):
         p99_ratio = own['p99_us'] / base['p99_us']
         results.append({'scenario':scenario,'payload_bytes':size,'subscribers':subscribers,'messages':count,'trials':len(trials),
             'latency_metric':metric,'series':series,'throughput_ratio':throughput_ratio,'p99_ratio':p99_ratio,
-            'passed':throughput_ratio >= 0.8 and p99_ratio <= 2})
+            'passed':throughput_ratio >= 1.1 and p99_ratio <= 0.9})
     return results
 
 
@@ -59,7 +59,7 @@ def main():
     for name,path,expected in [('standard',args.standard,JETSTREAM_CASES),('concurrent',args.concurrent,CONCURRENT_CASES)]:
         results.extend(dict(campaign=name,**r) for r in compare(json.loads(path.read_text()),expected,args.server,args.minimum_trials))
     report = {'server':args.server,'baseline':'nats-main (sync_interval: always)',
-        'minimum_throughput_ratio':0.8,'maximum_p99_ratio':2,'minimum_trials':args.minimum_trials,'all_passed':all(r['passed'] for r in results),'goal_verified':all(r['passed'] and r['trials']>=3 for r in results),'cases':results}
+        'minimum_throughput_ratio':1.1,'maximum_p99_ratio':0.9,'minimum_trials':args.minimum_trials,'all_passed':all(r['passed'] for r in results),'goal_verified':all(r['passed'] and r['trials']>=3 for r in results),'cases':results}
     args.output.write_text(json.dumps(report,indent=2)+'\n')
     for r in results:
         print(f"{r['campaign']} {r['scenario']} {r['payload_bytes']} B: throughput {r['throughput_ratio']:.3f}x, p99 {r['p99_ratio']:.3f}x {'PASS' if r['passed'] else 'MISS'}")

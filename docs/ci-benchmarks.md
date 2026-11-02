@@ -12,7 +12,7 @@ its workflow run. A manual guest-only run remains available in vm.yml.
 After correctness passes, separate runners execute guest recovery and benchmarks.
 Benchmark jobs build release Screech without fault hooks, the official nats.go driver,
 and NATS from main (or a manually supplied ref). The resolved NATS SHA, binary hashes,
-versions, CPU/kernel, trial counts and commands are preserved with raw JSON. Tests,
+versions, CPU/kernel/filesystem, trial counts and commands are preserved with raw JSON. Tests,
 VMs and profiling do not share the benchmark runner. Hosted machines are shared and
 unpinned; cross-run differences can reflect hardware and filesystem variation.
 
@@ -20,7 +20,7 @@ The default campaign runs three checked trials per case, plus warmups. It covers
 Core fanout/wildcards/queues/request-reply, live Core on a stream, sequential and
 concurrent durable publishers, pull consumers, ACK-and-next, dedup, retention and
 mixed workloads, including a 1000-message outstanding ACK window. A second campaign runs four concurrent cases at 20,000 messages and a 10,000-message limits-retention consumer case.
-There are 258 measured trials at the default settings: 210 standard and 48 larger.
+There are 345 measured trials at the default settings: 270 standard and 75 larger.
 A manual CI run can set trials (1–10) and nats_ref (branch, tag or SHA).
 
 ## Storage modes
@@ -28,13 +28,16 @@ A manual CI run can set trials (1–10) and nats_ref (branch, tag or SHA).
 | Series | Configuration | Interpretation |
 | --- | --- | --- |
 | Screech · FULL | SQLite WAL, synchronous FULL | Durable publish ACKs, reservations and confirmed consumer ACKs follow commit |
+| Screech · UNSAFE ACK durability | --unsafe-ack-durability | Consumer state may roll back after failure; publication ACKs remain FULL |
 | NATS · always | sync_interval: always | Stream writes are synced; standalone consumer state can still flush asynchronously |
 | NATS · 10 ms | sync_interval: 10ms | Stream syncing is deferred between intervals |
 | NATS · default 2m | sync_interval omitted | NATS' documented two-minute default; this is not an equal power-loss contract |
 
 Core cases use no stream storage; their labels say Core. Additional intervals can
 be added to the runner with repeatable --nats-sync-interval values. These are NATS
-settings; Screech's durability configuration is unchanged. Upstream configuration
+settings. Unsafe Screech is the performance target; strict-default results are
+reported separately. Every JetStream case must reach at least 1.10x throughput and
+at most 0.90x p99 versus NATS always, across three or more checked trials. Upstream configuration
 and behavior can evolve, so each campaign records the exact NATS commit.
 
 ## Publishing and reading results
@@ -78,7 +81,7 @@ go -C tools/bench build -o "$PWD/bin/bench-driver" .
 python3 scripts/benchmark.py --screech target/release/screech-server \
   --nats bin/nats-server --driver bin/bench-driver \
   --nats-commit "$(cat results/nats-commit.txt)" \
-  --nats-default --nats-sync-interval 10ms --trials 3 --output results/standard.json
+  --nats-default --nats-sync-interval 10ms --screech-unsafe-ack --trials 3 --output results/standard.json
 # Repeat with --scale-only --output results/concurrent.json for larger cases.
 python3 scripts/render_benchmarks.py \
   --input 'Local standard' results/standard.json --output _site
