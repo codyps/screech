@@ -21,6 +21,9 @@ use tokio::{
     time::{timeout, Instant},
 };
 
+const IO_BATCH_BYTES: usize = 128 * 1024;
+const WRITE_IOV_LIMIT: usize = 256;
+
 #[derive(Clone)]
 pub struct Config {
     pub listen: SocketAddr,
@@ -717,7 +720,7 @@ async fn write_batch<W: AsyncWrite + Unpin>(
     let mut offset = 0;
     while at < parts.len() {
         // Bound each vector; partial writes and non-vectored backends are supported.
-        let mut slices: [IoSlice<'_>; 128] = std::array::from_fn(|_| IoSlice::new(&[]));
+        let mut slices: [IoSlice<'_>; WRITE_IOV_LIMIT] = std::array::from_fn(|_| IoSlice::new(&[]));
         let mut count = 0;
         for (n, part) in parts[at..].iter().take(slices.len()).enumerate() {
             let bytes = part.bytes(data, frames);
@@ -764,7 +767,7 @@ async fn writer_loop<W: AsyncWrite + Unpin>(mut write: W, peer: Peer, deadline: 
         let mut bytes = 0;
         let closed = {
             let mut out = peer.out.lock().unwrap();
-            while bytes < 64 * 1024 {
+            while bytes < IO_BATCH_BYTES {
                 let Some(frame) = out.frames.pop_front() else {
                     break;
                 };
@@ -1063,7 +1066,7 @@ async fn connection(
             if processed==256 {continue;}
             // The parser checks advertised sizes before accepting the payload.
             let max=config.limits.payload.saturating_add(config.limits.control_line).saturating_add(4);
-            let allowance=max.saturating_sub(buf.len()).min(64*1024);
+            let allowance=max.saturating_sub(buf.len()).min(IO_BATCH_BYTES);
             if allowance==0 {protocol_error(&peer,"Maximum buffer exceeded");return Ok(());}
 
             reserve_input(&mut buf, allowance);

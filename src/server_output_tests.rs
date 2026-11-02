@@ -222,7 +222,7 @@ async fn large_headers_empty_bodies_and_many_vectors_preserve_framing() {
             b"\r\n\r\n",
         ]
         .concat();
-        for n in 0..160 {
+        for n in 0..320 {
             let payload = vec![n as u8; if n % 2 == 0 { 0 } else { 65537 }];
             let msg = message("subject", Some("reply"), &headers, &payload, n % 2 == 0);
             want.extend(expected(
@@ -242,7 +242,7 @@ async fn large_headers_empty_bodies_and_many_vectors_preserve_framing() {
         let mut data = Vec::new();
         let mut parts = Vec::new();
         prepare_batch(&mut data, &mut parts, &mut frames);
-        assert!(parts.len() > 128);
+        assert!(parts.len() > WRITE_IOV_LIMIT);
         assert!(data.len() < want.len() / 2);
         let mut output = writer(100000, true);
         write_batch(&mut output, &data, &parts, &frames)

@@ -224,3 +224,8 @@ compare buffered output, credits, cancellation, future queue cursors and deliver
 limits with serial publications, including closed/full receivers and in-flight
 frame credits. Collector tests preserve control/reply boundaries and leave
 partial or malformed input for the normal parser.
+
+Socket reads use a 128 KiB window; writers collect roughly 128 KiB groups with at
+most 256 vectors per syscall. These work bounds do not change protocol payload,
+pending-byte/count or write-deadline limits. Multi-vector framing tests cross the
+vector limit for both header-capable and legacy receivers.
