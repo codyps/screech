@@ -7,10 +7,10 @@ import platform
 import signal
 import subprocess
 import tempfile
-import time
 from pathlib import Path
 
 from benchmark import start, usage
+from perf_control import recording
 
 
 def faults(pid):
@@ -40,13 +40,10 @@ def main():
                       '-scenario', 'fanout', '-size', '1024', '-subscribers', '1']
             try:
                 subprocess.run(driver + ['-n', '10000'], check=True, stdout=subprocess.DEVNULL, timeout=30)
-                with prefix.with_suffix('.perf.log').open('w') as perf_log:
-                    profiler = subprocess.Popen([args.perf, 'record', '-e', event, '-F', '199',
-                        '--call-graph', 'dwarf,4096', '-p', str(process.pid), '-o', str(prefix.with_suffix('.data'))],
-                        stdout=perf_log, stderr=subprocess.STDOUT)
-                    time.sleep(.2)
-                    if profiler.poll() is not None:
-                        raise RuntimeError(prefix.with_suffix('.perf.log').read_text())
+                with prefix.with_suffix('.perf.log').open('w') as perf_log, recording(
+                    [args.perf, 'record', '-e', event, '-F', '199', '--call-graph', 'dwarf,4096',
+                     '-p', str(process.pid), '-o', str(prefix.with_suffix('.data'))], perf_log
+                ) as profiler:
                     before = usage(process.pid)
                     faults_before = faults(process.pid)
                     result = subprocess.run(driver + ['-n', str(args.messages)], check=True,
