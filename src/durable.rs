@@ -1737,9 +1737,6 @@ impl<S: Store> Engine<S> {
                     {
                         return Err(invalid("Invalid content generation"));
                     }
-                    log_bytes = log_bytes
-                        .saturating_add(reference.headers_len as usize)
-                        .saturating_add(reference.payload_len as usize);
                     *message = hydrate_message(&store, message)?;
                     Some((stream.clone(), message.sequence, reference))
                 } else {
@@ -1849,6 +1846,7 @@ impl<S: Store> Engine<S> {
             contents: Vec::new(),
             external_content: self.store.external_content(),
             bytes: 0,
+            log_bytes: 0,
             failed: false,
         })
     }
@@ -1906,7 +1904,7 @@ impl<S: Store> Engine<S> {
         }
         self.state = plan.state;
         self.since_checkpoint += plan.records.len();
-        self.log_bytes += plan.bytes;
+        self.log_bytes += plan.log_bytes;
         if self.store.supports_checkpoint()
             && (self.since_checkpoint >= CHECKPOINT_RECORDS || self.log_bytes >= CHECKPOINT_BYTES)
         {
@@ -1924,12 +1922,7 @@ impl<S: Store> Engine<S> {
         crate::fault::batch_point("before", &event);
         let (record, content, detached) =
             encode_transition(&self.state, &event, self.store.external_content())?;
-        let encoded_bytes = record.headers.len()
-            + record.payload.len()
-            + content
-                .as_ref()
-                .map(|c| c.headers.len() + c.payload.len())
-                .unwrap_or(0);
+        let encoded_bytes = record.headers.len() + record.payload.len();
         let result = if let Some(content) = content {
             self.store
                 .append_with_content(std::slice::from_ref(&record), &[content])
@@ -1975,6 +1968,7 @@ pub struct GroupPlan {
     contents: Vec<Content>,
     external_content: bool,
     bytes: usize,
+    log_bytes: usize,
     failed: bool,
 }
 impl GroupPlan {
@@ -2035,6 +2029,7 @@ impl GroupPlan {
             self.contents.push(content);
         }
         self.bytes += bytes;
+        self.log_bytes += record.headers.len() + record.payload.len();
         self.records.push(record);
         Ok(())
     }

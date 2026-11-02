@@ -198,3 +198,93 @@ fn stream_recreation_does_not_alias_content_and_checkpoint_reclaims_old_generati
         vec![3; 4096]
     );
 }
+
+#[test]
+fn external_bodies_do_not_count_as_event_log_bytes_after_restart() {
+    for grouped in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let mut disk = setup(SqliteStore::open(&path).unwrap(), Retention::Limits);
+        for _ in 0..2 {
+            for _ in 0..8 {
+                let body = Bytes::from(vec![42; 1024 * 1024]);
+                if grouped {
+                    let mut plan = disk.begin_group().unwrap();
+                    let event = plan
+                        .state()
+                        .prepare_publish("S", "a.b", Bytes::new(), body, 0)
+                        .unwrap();
+                    plan.commit(event).unwrap();
+                    disk.commit_group(plan).unwrap();
+                } else {
+                    let event = disk
+                        .state()
+                        .prepare_publish("S", "a.b", Bytes::new(), body, 0)
+                        .unwrap();
+                    disk.commit(event).unwrap();
+                }
+            }
+            let store = disk.into_store();
+            assert!(store.load_checkpoint().unwrap().is_none());
+            assert!(store
+                .get(store.last_sequence().unwrap())
+                .unwrap()
+                .unwrap()
+                .payload
+                .is_empty());
+            drop(store);
+            disk = Engine::recover(SqliteStore::open(&path).unwrap()).unwrap();
+        }
+        assert_eq!(disk.state().streams["S"].messages.len(), 16);
+        for message in disk.state().streams["S"].messages.values() {
+            assert_eq!(
+                disk.read_message(message).unwrap().payload,
+                vec![42; 1024 * 1024]
+            );
+        }
+    }
+}
+
+#[test]
+fn external_content_still_checkpoints_at_record_limit_after_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store");
+    let mut disk = setup(SqliteStore::open(&path).unwrap(), Retention::Limits);
+    // Two setup records plus 8189 publications leaves one record before the cap.
+    for count in (0..8189).step_by(32) {
+        let mut plan = disk.begin_group().unwrap();
+        for _ in 0..(8189 - count).min(32) {
+            let event = plan
+                .state()
+                .prepare_publish("S", "a.b", Bytes::new(), Bytes::from_static(b"body"), 0)
+                .unwrap();
+            plan.commit(event).unwrap();
+        }
+        disk.commit_group(plan).unwrap();
+    }
+    let store = disk.into_store();
+    assert!(store.load_checkpoint().unwrap().is_none());
+    drop(store);
+    let mut disk = Engine::recover(SqliteStore::open(&path).unwrap()).unwrap();
+    let mut plan = disk.begin_group().unwrap();
+    for _ in 0..2 {
+        let event = plan
+            .state()
+            .prepare_publish("S", "a.b", Bytes::new(), Bytes::from_static(b"new"), 0)
+            .unwrap();
+        plan.commit(event).unwrap();
+    }
+    disk.commit_group(plan).unwrap();
+    let store = disk.into_store();
+    assert_eq!(store.load_checkpoint().unwrap().unwrap().0, 8193);
+    assert!(store.get(8193).unwrap().is_none());
+    drop(store);
+    let disk = Engine::recover(SqliteStore::open(&path).unwrap()).unwrap();
+    assert_eq!(disk.state().streams["S"].messages.len(), 8191);
+    assert_eq!(
+        disk.read_message(&disk.state().streams["S"].messages[&8191])
+            .unwrap()
+            .payload,
+        b"new"[..]
+    );
+}

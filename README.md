@@ -79,7 +79,7 @@ persisted/system time. Ambiguous storage errors poison the engine until recovery
 
 Atomic binary checkpoints cover live message metadata, sequence high-water marks,
 consumer floors/pending sets and deduplication windows. They replace covered log
-entries in one FULL transaction, automatically after 8192 events or an 8 MiB tail.
+entries in one FULL transaction, automatically after 8192 events or 8 MiB of event-log bytes.
 Startup validates snapshot/record checksums, versions, continuity and model invariants.
 Known missing/empty databases fail closed. Recovery rejects unsupported record
 and snapshot versions.
@@ -135,7 +135,7 @@ SQLite RESTART checkpoints synchronize the database before the WAL can be reused
 Automatic WAL checkpointing is set to 4096 pages. An 8 MiB journal-size target limits
 retained allocation at WAL reuse; it is not a hard peak quota. Large transactions or
 snapshots can exceed it. Application checkpoints remain at 8192 events / 8 MiB of
-logical tail. Inspect or copy the database only with the server stopped or through a
+event-log bytes (excluding external content). Inspect or copy the database only with the server stopped or through a
 future supported backup interface; SQLite ownership is exclusive while serving.
 See docs/testing.md for real write/sync failure injection and recovery coverage.
 
