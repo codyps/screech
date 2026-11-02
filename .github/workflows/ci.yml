@@ -133,7 +133,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y linux-tools-generic
           sudo sysctl kernel.perf_event_paranoid=1
-          perf_binary=$(find /usr/lib/linux-tools -type f -name perf | sort | tail -1)
+          perf_binary=$(find -L /usr/lib/linux-tools -type f -name perf | sort | tail -1)
+          test -n "$perf_binary"
+          test -x "$perf_binary"
           python3 scripts/profile_core.py --screech target/release/screech-server \
             --nats bin/nats-server --driver bin/bench-driver --perf "$perf_binary" \
             --output core-profiles
