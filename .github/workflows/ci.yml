@@ -139,7 +139,7 @@ jobs:
         run: |
           python3 scripts/check_jetstream_targets.py --standard results/standard.json --concurrent results/concurrent.json --server screech --minimum-trials "$TRIALS" --report-only --output results/jetstream-full-targets.json
           python3 scripts/check_jetstream_targets.py --standard results/standard.json --concurrent results/concurrent.json --server screech-unsafe-ack --minimum-trials "$TRIALS" --report-only --output results/jetstream-unsafe-ack-targets.json
-      - name: Profile Core forwarding and separate Fetch(1)/ACK
+      - name: Profile Core forwarding and confirmed consumer ACKs
         run: |
           sudo apt-get update
           sudo apt-get install -y linux-tools-generic

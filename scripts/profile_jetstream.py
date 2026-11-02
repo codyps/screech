@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Profile separate Fetch(1)/ACK after prefill, before post-workload validation."""
+"""Profile sequential confirmed ACKs with Fetch(128), excluding prefill and validation."""
 import argparse
 import json
 import signal

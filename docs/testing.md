@@ -281,7 +281,7 @@ log before the guest is killed, and the next boot checks that entire prefix.
 Core profiling waits for perf's control-pipe enable acknowledgement before sending
 the measured workload; startup failures and missing acknowledgement fail explicitly.
 
-CI also captures separate Fetch(1)/ACK CPU profiles for unsafe Screech and NATS
-`always`. The checked Go driver pauses after prefill until perf acknowledges event
+CI also captures sequential confirmed ACK CPU profiles (Fetch(128), then one
+ACK round trip per message) for unsafe Screech and NATS `always`. The checked Go driver pauses after prefill until perf acknowledges event
 enablement, and holds post-workload validation until recording stops. These are
 diagnostic profiles; the performance gate uses the unprofiled benchmark trials.

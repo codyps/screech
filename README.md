@@ -171,7 +171,7 @@ failure stops subsequent JetStream success. Buffered events share a checksummed
 journal block while retaining their logical sequence numbers. The first block
 commit upgrades the SQLite store metadata to version 2; current binaries read both
 versions, and unsupported versions fail closed. After a confirmed buffered ACK,
-the worker polls for at most 64 µs before sleeping, trading CPU for lower Fetch(1)
+the worker polls for at most 64 µs before sleeping, trading CPU for lower consumer
 round-trip latency. Strict mode does not poll. This mode makes consumer performance
 comparisons with NATS's buffered consumer state more useful; the guarantees are
 still not identical. Benchmark series label it **UNSAFE ACK durability** separately.
