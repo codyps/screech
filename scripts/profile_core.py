@@ -13,6 +13,11 @@ from pathlib import Path
 from benchmark import start, usage
 
 
+def faults(pid):
+    fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+    return int(fields[7]), int(fields[9])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('screech', 'nats', 'driver', 'perf'):
@@ -43,15 +48,19 @@ def main():
                     if profiler.poll() is not None:
                         raise RuntimeError(prefix.with_suffix('.perf.log').read_text())
                     before = usage(process.pid)
+                    faults_before = faults(process.pid)
                     result = subprocess.run(driver + ['-n', str(args.messages)], check=True,
                                             capture_output=True, text=True, timeout=90)
                     after = usage(process.pid)
+                    faults_after = faults(process.pid)
                     row = json.loads(result.stdout)
                     if not row['checked']:
                         raise RuntimeError('unchecked profile workload')
                     row.update(server=label, command=command,
                         server_cpu_seconds=after['cpu_seconds'] - before['cpu_seconds'],
-                        server_rss_kib=after['rss_kib'])
+                        server_rss_kib=after['rss_kib'],
+                        server_minor_faults=faults_after[0] - faults_before[0],
+                        server_major_faults=faults_after[1] - faults_before[1])
                     rows.append(row)
                     profiler.send_signal(signal.SIGINT)
                     if profiler.wait(timeout=15) not in (0, 128 + signal.SIGINT, -signal.SIGINT):
