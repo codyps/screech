@@ -22,6 +22,7 @@ def start(binary, label, durable, directory):
     if label.startswith('screech'):
         cmd=[binary,'--port',str(port)]
         if durable:cmd+=['--store',str(directory/'screech.db')]
+        if durable and label=='screech-unsafe-ack':cmd+=['--unsafe-ack-durability']
     else:
         config=directory/'nats.conf'
         config.write_text(f'host: 127.0.0.1\nport: {port}\n'+(f'jetstream {{\n store_dir: "{directory}/js"\n'+(' sync_interval: '+json.dumps(label.removeprefix('nats-sync-') if label.startswith('nats-sync-') else 'always')+'\n' if label!='nats-default' else '')+'}\n' if durable else ''))
@@ -47,6 +48,9 @@ def usage(pid):
     fields=Path(f'/proc/{pid}/stat').read_text().split()
     return {'rss_kib':rss,'cpu_seconds':(int(fields[13])+int(fields[14]))/os.sysconf('SC_CLK_TCK')}
 
+JETSTREAM_CASES = [('core-stream',128,1,5000),('durable',128,1,5000),('consume',128,1,1000),('consume-limits',128,1,1000),('consume-one',128,1,1000),('consume-one',1024,1,1000),('consume-next',128,1,1000),('consume-parallel',128,1,5000),('consume-ack-window',128,1,5000),('dedup',128,1,5000),('durable-parallel',128,1,5000),('consume-one-parallel',128,1,5000),('mixed-parallel',128,1,5000),('mixed-streams',128,1,5000)]
+CONCURRENT_CASES = [(name,128,1,20000) for name in ('durable-parallel','consume-one-parallel','mixed-parallel','mixed-streams')]
+
 def main(args):
     rows=[];commands=[]
     if not 1 <= args.trials <= 10: raise ValueError('trials must be 1..10')
@@ -56,16 +60,17 @@ def main(args):
     args.output.with_suffix('.jsonl').write_text('')
     core=[('fanout',8,1,2000000),('wildcard',128,1,2000000),('fanout',128,1,2000000),('fanout',1024,1,1000000),('fanout',128,4,1000000),('queue',128,4,2000000),('request',128,1,50000),('core-subject-churn',128,1,1000000),('core-many-subscriptions',128,1,1000000),('core-churn-many-subscriptions',128,1,1000000)]
     for durable in (False,True):
-        cases=[('core-stream',128,1,5000),('durable',128,1,5000),('consume',128,1,1000),('consume-limits',128,1,1000),('consume-one',128,1,1000),('consume-one',1024,1,1000),('consume-next',128,1,1000),('consume-parallel',128,1,5000),('consume-ack-window',128,1,5000),('dedup',128,1,5000),('durable-parallel',128,1,5000),('consume-one-parallel',128,1,5000),('mixed-parallel',128,1,5000),('mixed-streams',128,1,5000)] if durable else core
+        cases=JETSTREAM_CASES if durable else core
         if args.scale_only:
             if not durable: continue
-            cases=[(name,128,1,20000) for name in ('durable-parallel','consume-one-parallel','mixed-parallel','mixed-streams')]
+            cases=CONCURRENT_CASES
         # Alternate server order each invocation with --reverse for larger campaigns.
         servers=[('screech',args.screech),('nats-main',args.nats)]
-        if args.reverse:servers.reverse()
         if durable and args.nats_default:servers.append(('nats-default',args.nats))
         if durable: servers.extend(('nats-sync-'+interval,args.nats) for interval in args.nats_sync_interval)
         if durable and args.screech_before:servers.append(('screech-before',args.screech_before))
+        if durable and args.screech_unsafe_ack:servers.append(('screech-unsafe-ack',args.screech))
+        if args.reverse:servers.reverse()
         for label,binary in servers:
             with tempfile.TemporaryDirectory(prefix='screech-bench-') as tmp:
                 directory=Path(tmp);process,port,log,cmd=start(binary,label,durable,directory);commands.append({'server':label,'durable':durable,'command':cmd})
@@ -89,10 +94,10 @@ def main(args):
                     process.kill();process.wait();log.close()
                     shutil.copy2(directory/'server.log',args.output.parent/f'{args.output.stem}-{label}-{"durable" if durable else "core"}-server.log')
     cpu=next((x.split(':',1)[1].strip() for x in Path('/proc/cpuinfo').read_text().splitlines() if x.startswith('model name')),platform.processor())
-    output={'environment':{'recorded_at':datetime.now(timezone.utc).isoformat(),'nats_sync_intervals':['always']+(['default 2m'] if args.nats_default else [])+args.nats_sync_interval,'kernel':platform.release(),'cpu':cpu,'logical_cpus':os.cpu_count(),'server_workers':2,'transport':'loopback TCP','durability':'SQLite WAL FULL; nats-main sync_interval always; optional nats-default uses default 2m','nats_commit':args.nats_commit,'screech_binary_sha256':__import__('hashlib').sha256(Path(args.screech).read_bytes()).hexdigest(),'screech_before_binary_sha256':__import__('hashlib').sha256(Path(args.screech_before).read_bytes()).hexdigest() if args.screech_before else None,'nats_binary_sha256':__import__('hashlib').sha256(Path(args.nats).read_bytes()).hexdigest(),'rustc':subprocess.check_output(['rustc','--version'],text=True).strip(),'nats_version':subprocess.check_output([args.nats,'--version'],text=True).strip(),'concurrent_test_workloads':False},'commands':commands,'rows':rows}
+    output={'environment':{'recorded_at':datetime.now(timezone.utc).isoformat(),'nats_sync_intervals':['always']+(['default 2m'] if args.nats_default else [])+args.nats_sync_interval,'kernel':platform.release(),'cpu':cpu,'logical_cpus':os.cpu_count(),'server_workers':2,'transport':'loopback TCP','durability':'SQLite WAL FULL by default; screech-unsafe-ack buffers consumer state for a 50ms flush target, publication ACKs remain FULL; nats-main sync_interval always; optional nats-default uses default 2m','nats_commit':args.nats_commit,'screech_binary_sha256':__import__('hashlib').sha256(Path(args.screech).read_bytes()).hexdigest(),'screech_before_binary_sha256':__import__('hashlib').sha256(Path(args.screech_before).read_bytes()).hexdigest() if args.screech_before else None,'nats_binary_sha256':__import__('hashlib').sha256(Path(args.nats).read_bytes()).hexdigest(),'rustc':subprocess.check_output(['rustc','--version'],text=True).strip(),'nats_version':subprocess.check_output([args.nats,'--version'],text=True).strip(),'concurrent_test_workloads':False},'commands':commands,'rows':rows}
     args.output.write_text(json.dumps(output,indent=2)+'\n')
 if __name__=='__main__':
     p=argparse.ArgumentParser()
     for key in ('screech','nats','driver'):p.add_argument('--'+key,required=True,type=lambda x:str(Path(x).resolve()))
-    p.add_argument('--nats-sync-interval',action='append',default=[],help='Additional NATS stream sync interval, e.g. 10ms (repeatable)');p.add_argument('--scale-only',action='store_true');p.add_argument('--screech-before',type=lambda x:str(Path(x).resolve()));p.add_argument('--nats-default',action='store_true');p.add_argument('--nats-commit',required=True);p.add_argument('--trials',type=int,default=3);p.add_argument('--reverse',action='store_true');p.add_argument('--output',type=Path,required=True)
+    p.add_argument('--screech-unsafe-ack',action='store_true',help='Also benchmark explicitly unsafe consumer ACK durability');p.add_argument('--nats-sync-interval',action='append',default=[],help='Additional NATS stream sync interval, e.g. 10ms (repeatable)');p.add_argument('--scale-only',action='store_true');p.add_argument('--screech-before',type=lambda x:str(Path(x).resolve()));p.add_argument('--nats-default',action='store_true');p.add_argument('--nats-commit',required=True);p.add_argument('--trials',type=int,default=3);p.add_argument('--reverse',action='store_true');p.add_argument('--output',type=Path,required=True)
     main(p.parse_args())

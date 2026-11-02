@@ -249,3 +249,21 @@ checks that checkpoint garbage collection removed the content rows. RSS excludes
 reclaimable kernel file cache. This tests payload paging; it does not establish a
 constant-memory bound for metadata or all possible concurrent workloads. CI saves
 its measurements alongside the failure-test results.
+
+## Unsafe consumer ACK buffering
+
+`unsafe_ack_tests.py` requires the fault-injection binary and SQLite I/O shim.
+It checks early ACK confirmations, recovery after SIGKILL loses
+the buffered suffix, successful flushes, flush EIO before/after real synchronization,
+atomic publication fences and graceful shutdown. The buffered suffix lives in process memory, so SIGKILL loses it without requiring
+loss of the host kernel page cache.
+Model properties compare unsafe histories with the last FULL prefix across restarts.
+Count, byte and time limits are checked independently at the storage boundary.
+
+`check_jetstream_targets.py` reports every standard and larger concurrent JetStream
+case against NATS `sync_interval: always`, separately for each Screech mode. Targets
+are at least 0.8x throughput and at most 2x p99, using medians of three checked trials.
+Fetch(1) uses full-cycle p99; Core-on-stream uses durable publication p99. Missing,
+unverified, duplicate or invalid trials fail validation. CI currently publishes
+reports even when performance targets miss; a green correctness job is not evidence
+that every performance target passed.

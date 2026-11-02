@@ -71,6 +71,8 @@ jobs:
           python3 scripts/datasync_stall_tests.py target/debug/screech-server --shim ./sqlite-io-fault.so --output results/datasync-stall-tests.json
           python3 scripts/multi_pull_crash_tests.py target/debug/screech-server --output results/multi-pull-tests.json
           python3 scripts/group_extension_tests.py target/debug/screech-server --shim ./sqlite-io-fault.so --output results/group-extension-tests.json
+      - name: Unsafe consumer ACK buffering and durable publication fences
+        run: python3 scripts/unsafe_ack_tests.py target/debug/screech-server --shim ./sqlite-io-fault.so --output results/unsafe-ack-tests.json
       - name: Retained content exceeds process memory budget
         run: python3 scripts/content_memory_tests.py target/debug/screech-server --output results/content-memory-tests.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -123,15 +125,19 @@ jobs:
           python3 scripts/benchmark.py --screech target/release/screech-server \
             --nats bin/nats-server --driver bin/bench-driver \
             --nats-commit "$(cat results/nats-commit.txt)" \
-            --nats-default --nats-sync-interval 10ms --trials "$TRIALS" \
+            --nats-default --nats-sync-interval 10ms --screech-unsafe-ack --trials "$TRIALS" \
             --reverse --output results/standard.json
       - name: Larger concurrent cases · 20,000 messages
         run: |
           python3 scripts/benchmark.py --screech target/release/screech-server \
             --nats bin/nats-server --driver bin/bench-driver \
             --nats-commit "$(cat results/nats-commit.txt)" \
-            --nats-default --nats-sync-interval 10ms --trials "$TRIALS" \
+            --nats-default --nats-sync-interval 10ms --screech-unsafe-ack --trials "$TRIALS" \
             --scale-only --output results/concurrent.json
+      - name: JetStream performance target reports
+        run: |
+          python3 scripts/check_jetstream_targets.py --standard results/standard.json --concurrent results/concurrent.json --server screech --minimum-trials "$TRIALS" --report-only --output results/jetstream-full-targets.json
+          python3 scripts/check_jetstream_targets.py --standard results/standard.json --concurrent results/concurrent.json --server screech-unsafe-ack --minimum-trials "$TRIALS" --report-only --output results/jetstream-unsafe-ack-targets.json
       - name: Profile 1 KiB Core forwarding
         run: |
           sudo apt-get update

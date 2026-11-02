@@ -56,3 +56,9 @@ test('Core scaling cases retain topology and Core server labels', () => {
     assert.match(scope(row),/no latency samples/);
   }
 });
+
+test('unsafe durability stays explicit and p99 scopes use the measured boundary', () => {
+  assert.match(seriesName('screech-unsafe-ack', 'consume-one'), /UNSAFE ACK/);
+  assert.equal(scope({}, 'cycle_p99_us'), 'Fetch(1) through confirmed ACK');
+  assert.equal(scope({}, 'durable_p99_us'), 'publish to durable ACK');
+});

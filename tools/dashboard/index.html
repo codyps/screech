@@ -19,7 +19,7 @@
 </section>
 <div class="view-row"><fieldset id="servers"><legend>Show series</legend></fieldset><div class="tabs" role="group" aria-label="View"><button id="charts-button" type="button" aria-pressed="true">Charts</button><button id="table-button" type="button" aria-pressed="false">Table</button></div></div>
 <div class="summary" id="summary" role="status" aria-live="polite"></div>
-<aside class="contract">Screech uses SQLite WAL + FULL. NATS stream sync modes: always, 10 ms, or default (2 min). Consumer persistence guarantees differ. <a href="#methodology">Methodology</a></aside>
+<aside class="contract">Screech defaults to SQLite WAL + FULL. UNSAFE ACK durability buffers consumer state; publication ACKs remain durable. NATS stream sync modes: always, 10 ms, or default (2 min). Consumer persistence guarantees differ. <a href="#methodology">Methodology</a></aside>
 <p id="metric-note" class="metric-note"></p>
 <section id="charts" class="charts" aria-label="Workload comparisons"></section>
 <section id="table-view" hidden aria-label="Benchmark table"><div class="table-scroll"><table><thead><tr><th>Case</th><th>Server / sync mode</th><th id="value-heading">Median</th><th>Trial range</th><th>Trials</th></tr></thead><tbody id="table-body"></tbody></table></div></section>
