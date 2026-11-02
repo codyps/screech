@@ -147,7 +147,7 @@ impl Handle {
                         // Reply-driven clients often issue their next request at once.
                         // Briefly poll to avoid a sleep/wakeup on that round trip;
                         // idle connections and strictly durable stores still sleep.
-                        let until = std::time::Instant::now() + Duration::from_micros(64);
+                        let until = std::time::Instant::now() + Duration::from_micros(128);
                         loop {
                             match rx.try_recv() {
                                 Ok(request) => return Ok(request),
