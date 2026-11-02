@@ -157,3 +157,19 @@ cache limit, exercise Unicode and deep filters, and check index pruning/slot reu
 ```sh
 PROPTEST_CASES=1024 cargo test --locked --all-features --test core_model token_index_refines
 ```
+
+Core transport retains validated immutable PUB/HPUB frames through forwarding.
+Framing tests compare owned and wire-backed messages against independent MSG/HMSG
+encoding, including arbitrary binary bodies, Unicode fields, header stripping,
+partial writes before/within/across vectors, interrupted/zero writes and backends
+without vectored writes. Mixed control frames must remain ordered. Large-header,
+empty-body and multi-vector batches check framing and lifetime boundaries.
+
+A bounded duplex transport stalls after a partial write to verify that in-flight
+bytes/counts remain charged until completion and that the existing write deadline
+closes a stalled writer. Network tests fragment mixed PUB/HPUB inputs across read
+boundaries and check fanout, queue delivery, replies and legacy subscribers.
+
+```sh
+PROPTEST_CASES=1024 cargo test --locked --all-features --lib partial_output_refines
+```

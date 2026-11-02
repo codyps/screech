@@ -961,3 +961,117 @@ async fn cancelled_durable_waiters_do_not_release_queued_admission_slots() {
         .unwrap());
     handle.shutdown().await;
 }
+
+#[tokio::test]
+async fn fragmented_large_core_frames_preserve_fanout_queue_headers_and_replies() {
+    fn body(n: usize) -> Vec<u8> {
+        let mut payload = vec![n as u8; if n == 150 { 65537 } else { 1024 + (n % 7) * 13 }];
+        payload[..8].copy_from_slice(&(n as u64).to_le_bytes());
+        payload
+    }
+    fn headers(n: usize) -> Vec<u8> {
+        if n.is_multiple_of(2) {
+            format!("NATS/1.0\r\nX-Index: {n}\r\n\r\n").into_bytes()
+        } else {
+            Vec::new()
+        }
+    }
+    async fn receive(mut reader: BufReader<TcpStream>, sid: &str, capable: bool) {
+        for n in 0usize..300 {
+            let payload = body(n);
+            let headers = headers(n);
+            let reply = if n.is_multiple_of(3) {
+                " inbox.消息"
+            } else {
+                ""
+            };
+            let hmsg = capable && !headers.is_empty();
+            let mut expected = if hmsg {
+                format!(
+                    "HMSG frame.é {sid}{reply} {} {}\r\n",
+                    headers.len(),
+                    headers.len() + payload.len()
+                )
+                .into_bytes()
+            } else {
+                format!("MSG frame.é {sid}{reply} {}\r\n", payload.len()).into_bytes()
+            };
+            if hmsg {
+                expected.extend_from_slice(&headers);
+            }
+            expected.extend_from_slice(&payload);
+            expected.extend_from_slice(b"\r\n");
+            let mut actual = vec![0; expected.len()];
+            timeout(Duration::from_secs(5), reader.read_exact(&mut actual))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                actual == expected,
+                "frame {n}, SID {sid}: metadata or binary body changed"
+            );
+        }
+        reader.get_mut().write_all(b"PING\r\n").await.unwrap();
+        assert_eq!(line(&mut reader).await, "PONG\r\n"); // No duplicate deliveries remain.
+    }
+    let server = Running::start(Config::default()).await;
+    let mut modern = server.raw().await;
+    modern
+        .get_mut()
+        .write_all(b"SUB frame.> modern\r\nPING\r\n")
+        .await
+        .unwrap();
+    assert_eq!(line(&mut modern).await, "PONG\r\n");
+    let mut legacy = BufReader::new(TcpStream::connect(server.addr).await.unwrap());
+    line(&mut legacy).await;
+    legacy
+        .get_mut()
+        .write_all(
+            b"CONNECT {\"verbose\":false,\"headers\":false}\r\nSUB frame.> legacy\r\nPING\r\n",
+        )
+        .await
+        .unwrap();
+    assert_eq!(line(&mut legacy).await, "PONG\r\n");
+    let mut queued = server.raw().await;
+    queued
+        .get_mut()
+        .write_all(b"SUB frame.> workers q\r\nPING\r\n")
+        .await
+        .unwrap();
+    assert_eq!(line(&mut queued).await, "PONG\r\n");
+    let mut publisher = server.raw().await;
+    let mut packet = Vec::new();
+    for n in 0usize..300 {
+        let payload = body(n);
+        let headers = headers(n);
+        let reply = if n.is_multiple_of(3) {
+            " inbox.消息"
+        } else {
+            ""
+        };
+        packet.extend(if headers.is_empty() {
+            format!("PUB frame.é{reply} {}\r\n", payload.len()).into_bytes()
+        } else {
+            format!(
+                "HPUB frame.é{reply} {} {}\r\n",
+                headers.len(),
+                headers.len() + payload.len()
+            )
+            .into_bytes()
+        });
+        packet.extend(headers);
+        packet.extend(payload);
+        packet.extend_from_slice(b"\r\n");
+    }
+    packet.extend_from_slice(b"PING\r\n");
+    for chunk in packet.chunks(113) {
+        publisher.get_mut().write_all(chunk).await.unwrap();
+    }
+    assert_eq!(line(&mut publisher).await, "PONG\r\n");
+    tokio::join!(
+        receive(modern, "modern", true),
+        receive(legacy, "legacy", false),
+        receive(queued, "q", true)
+    );
+    server.stop().await;
+}

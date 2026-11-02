@@ -52,6 +52,7 @@ jobs:
           PROPTEST_CASES=2048 cargo test --locked --all-features --test durable_model mixed_groups
           PROPTEST_CASES=1024 cargo test --locked --all-features --test durable_model ack_floors_refine
           PROPTEST_CASES=1024 cargo test --locked --all-features --test core_model token_index_refines
+          PROPTEST_CASES=1024 cargo test --locked --all-features --lib partial_output_refines
       - run: cargo build --locked --features fault-injection
       - run: cc -shared -fPIC -O2 -Wall -Wextra -Werror -o sqlite-io-fault.so scripts/sqlite_io_fault.c -ldl
       - name: Process kills, stalls, ambiguous writes and recovery

@@ -4,16 +4,17 @@ use crate::{
     msg::NatsMessage,
     parser::{parse, Limits},
 };
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::{
     collections::{HashMap, VecDeque},
-    io,
+    io::{self, IoSlice},
     net::SocketAddr,
+    ops::Range,
     sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{watch, Notify, Semaphore},
     task::JoinSet,
@@ -51,10 +52,73 @@ impl Default for Config {
         }
     }
 }
+// Parser-validated fields retain one immutable wire allocation through forwarding.
+struct WireMessage {
+    frame: Bytes,
+    subject: Range<usize>,
+    reply: Option<Range<usize>>,
+    body: usize,
+    header_len: usize,
+}
+struct MessageParts<'a> {
+    subject: &'a [u8],
+    reply: Option<&'a [u8]>,
+    headers: &'a [u8],
+    payload: &'a [u8],
+}
+enum OutboundMessage {
+    Owned(Message),
+    Wire(WireMessage),
+}
+impl OutboundMessage {
+    fn parts(&self) -> MessageParts<'_> {
+        match self {
+            Self::Owned(m) => MessageParts {
+                subject: m.subject.as_bytes(),
+                reply: m.reply.as_deref().map(str::as_bytes),
+                headers: &m.headers,
+                payload: &m.payload,
+            },
+            Self::Wire(m) => MessageParts {
+                subject: &m.frame[m.subject.clone()],
+                reply: m.reply.as_ref().map(|r| &m.frame[r.clone()]),
+                headers: &m.frame[m.body..m.body + m.header_len],
+                payload: &m.frame[m.body + m.header_len..m.frame.len() - 2],
+            },
+        }
+    }
+}
+impl WireMessage {
+    fn to_owned_message(&self) -> Message {
+        Message {
+            subject: std::str::from_utf8(&self.frame[self.subject.clone()])
+                .expect("validated subject")
+                .into(),
+            reply: self.reply.as_ref().map(|r| {
+                std::str::from_utf8(&self.frame[r.clone()])
+                    .expect("validated reply")
+                    .into()
+            }),
+            headers: self.frame.slice(self.body..self.body + self.header_len),
+            payload: self
+                .frame
+                .slice(self.body + self.header_len..self.frame.len() - 2),
+        }
+    }
+}
+// parse() returns borrowed PUB/HPUB arguments within this receive buffer.
+fn field_range(buffer: &[u8], field: &[u8]) -> Range<usize> {
+    let start = (field.as_ptr() as usize)
+        .checked_sub(buffer.as_ptr() as usize)
+        .expect("borrowed parser field");
+    let end = start.checked_add(field.len()).expect("parser field length");
+    assert!(end <= buffer.len(), "borrowed parser field bounds");
+    start..end
+}
 enum FrameData {
     Raw(Bytes),
     Delivery {
-        message: Arc<Message>,
+        message: Arc<OutboundMessage>,
         sid: Arc<str>,
         headers: bool,
     },
@@ -99,7 +163,7 @@ impl Peer {
             data: FrameData::Raw(bytes),
         })
     }
-    fn send_delivery(&self, message: Arc<Message>, sid: Arc<str>) -> bool {
+    fn send_delivery(&self, message: Arc<OutboundMessage>, sid: Arc<str>) -> bool {
         let size = wire_size(&message, &sid, self.headers);
         self.enqueue(Queued {
             size,
@@ -149,13 +213,25 @@ impl Hub {
         queue: Option<&str>,
         msg: &Message,
     ) -> usize {
-        let mut dead = Vec::new();
         let mut shared = None;
+        self.route(publisher, target, queue, || {
+            shared
+                .get_or_insert_with(|| Arc::new(OutboundMessage::Owned(msg.clone())))
+                .clone()
+        })
+    }
+    fn route(
+        &mut self,
+        publisher: u64,
+        target: &str,
+        queue: Option<&str>,
+        mut message: impl FnMut() -> Arc<OutboundMessage>,
+    ) -> usize {
+        let mut dead = Vec::new();
         let Hub { core, peers } = self;
         let count = core.route_with(publisher, target, queue, |client, sid| {
             if let Some(peer) = peers.get(&client) {
-                let message = shared.get_or_insert_with(|| Arc::new(msg.clone()));
-                if !peer.send_delivery(message.clone(), sid.clone()) {
+                if !peer.send_delivery(message(), sid.clone()) {
                     dead.push(client);
                 }
             }
@@ -174,7 +250,8 @@ fn digits(n: usize) -> usize {
         n.ilog10() as usize + 1
     }
 }
-fn wire_size(msg: &Message, sid: &str, headers: bool) -> usize {
+fn wire_size(message: &OutboundMessage, sid: &str, headers: bool) -> usize {
+    let msg = message.parts();
     let reply = msg.reply.as_ref().map(|r| r.len() + 1).unwrap_or(0);
     if headers && !msg.headers.is_empty() {
         let total = msg.headers.len() + msg.payload.len();
@@ -188,16 +265,16 @@ fn wire_size(msg: &Message, sid: &str, headers: bool) -> usize {
         10 + msg.subject.len() + sid.len() + reply + digits(msg.payload.len()) + msg.payload.len()
     }
 }
-fn encode_into(out: &mut Vec<u8>, msg: &Message, sid: &str, headers: bool) {
+fn encode_header(out: &mut Vec<u8>, msg: &MessageParts<'_>, sid: &str, headers: bool) {
     let with_headers = headers && !msg.headers.is_empty();
     let mut number = itoa::Buffer::new();
     out.extend_from_slice(if with_headers { b"HMSG " } else { b"MSG " });
-    out.extend_from_slice(msg.subject.as_bytes());
+    out.extend_from_slice(msg.subject);
     out.push(b' ');
     out.extend_from_slice(sid.as_bytes());
     if let Some(reply) = &msg.reply {
         out.push(b' ');
-        out.extend_from_slice(reply.as_bytes());
+        out.extend_from_slice(reply);
     }
     out.push(b' ');
     if with_headers {
@@ -209,13 +286,207 @@ fn encode_into(out: &mut Vec<u8>, msg: &Message, sid: &str, headers: bool) {
                 .as_bytes(),
         );
         out.extend_from_slice(b"\r\n");
-        out.extend_from_slice(&msg.headers);
     } else {
         out.extend_from_slice(number.format(msg.payload.len()).as_bytes());
         out.extend_from_slice(b"\r\n");
     }
-    out.extend_from_slice(&msg.payload);
+}
+fn encode_into(out: &mut Vec<u8>, msg: &MessageParts<'_>, sid: &str, headers: bool) {
+    encode_header(out, msg, sid, headers);
+    if headers && !msg.headers.is_empty() {
+        out.extend_from_slice(msg.headers);
+    }
+    out.extend_from_slice(msg.payload);
     out.extend_from_slice(b"\r\n");
+}
+
+#[derive(Debug)]
+enum WritePart {
+    Buffered(Range<usize>),
+    Headers(usize),
+    Payload(usize),
+}
+impl WritePart {
+    fn bytes<'a>(&self, data: &'a [u8], frames: &'a [Queued]) -> &'a [u8] {
+        match self {
+            Self::Buffered(range) => &data[range.clone()],
+            Self::Headers(index) | Self::Payload(index) => {
+                let FrameData::Delivery { message, .. } = &frames[*index].data else {
+                    unreachable!("borrowed delivery")
+                };
+                let msg = message.parts();
+                if matches!(self, Self::Headers(_)) {
+                    msg.headers
+                } else {
+                    msg.payload
+                }
+            }
+        }
+    }
+}
+// Keep small messages coalesced. Large bodies use scatter/gather while their
+// original frames remain alive; the buffer owns only their headers/trailers.
+fn prepare_batch(data: &mut Vec<u8>, parts: &mut Vec<WritePart>, frames: &mut [Queued]) {
+    data.clear();
+    parts.clear();
+    let mut buffered = 0;
+    for (index, frame) in frames.iter_mut().enumerate() {
+        let mut borrowed = false;
+        match &frame.data {
+            FrameData::Raw(bytes) => data.extend_from_slice(bytes),
+            FrameData::Delivery {
+                message,
+                sid,
+                headers,
+            } => {
+                let msg = message.parts();
+                let with_headers = *headers && !msg.headers.is_empty();
+                if msg.payload.len().saturating_add(if with_headers {
+                    msg.headers.len()
+                } else {
+                    0
+                }) >= 1024
+                {
+                    encode_header(data, &msg, sid, *headers);
+                    if data.len() > buffered {
+                        parts.push(WritePart::Buffered(buffered..data.len()));
+                    }
+                    if with_headers {
+                        parts.push(WritePart::Headers(index));
+                    }
+                    if !msg.payload.is_empty() {
+                        parts.push(WritePart::Payload(index));
+                    }
+                    buffered = data.len();
+                    data.extend_from_slice(b"\r\n");
+                    borrowed = true;
+                } else {
+                    encode_into(data, &msg, sid, *headers);
+                }
+            }
+        }
+        // Copied frames need not pin receive allocations during a stalled write.
+        if !borrowed {
+            frame.data = FrameData::Raw(Bytes::new());
+        }
+    }
+    if data.len() > buffered {
+        parts.push(WritePart::Buffered(buffered..data.len()));
+    }
+}
+async fn write_batch<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    data: &[u8],
+    parts: &[WritePart],
+    frames: &[Queued],
+) -> io::Result<()> {
+    if parts.len() <= 1 {
+        let mut remaining = data;
+        while !remaining.is_empty() {
+            match writer.write(remaining).await {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => remaining = &remaining[n..],
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    tokio::task::yield_now().await
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        return Ok(());
+    }
+    let mut at = 0;
+    let mut offset = 0;
+    while at < parts.len() {
+        // Bound each vector; partial writes and non-vectored backends are supported.
+        let mut slices: [IoSlice<'_>; 128] = std::array::from_fn(|_| IoSlice::new(&[]));
+        let mut count = 0;
+        for (n, part) in parts[at..].iter().take(slices.len()).enumerate() {
+            let bytes = part.bytes(data, frames);
+            slices[count] = IoSlice::new(if n == 0 { &bytes[offset..] } else { bytes });
+            count += 1;
+        }
+        let result = if writer.is_write_vectored() {
+            writer.write_vectored(&slices[..count]).await
+        } else {
+            writer.write(&slices[0]).await
+        };
+        let mut n = match result {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            other => other?,
+        };
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "socket stopped accepting output",
+            ));
+        }
+        while n > 0 {
+            let remaining = parts[at].bytes(data, frames).len() - offset;
+            if n < remaining {
+                offset += n;
+                break;
+            }
+            n -= remaining;
+            at += 1;
+            offset = 0;
+        }
+    }
+    Ok(())
+}
+async fn writer_loop<W: AsyncWrite + Unpin>(mut write: W, peer: Peer, deadline: Duration) {
+    let mut data = Vec::with_capacity(64 * 1024);
+    let mut batch = Vec::with_capacity(64);
+    let mut parts = Vec::with_capacity(16);
+    loop {
+        let notified = peer.ready.notified();
+        let mut bytes = 0;
+        let closed = {
+            let mut out = peer.out.lock().unwrap();
+            while bytes < 64 * 1024 {
+                let Some(frame) = out.frames.pop_front() else {
+                    break;
+                };
+                bytes += frame.size;
+                batch.push(frame);
+            }
+            out.closed
+        };
+        if batch.is_empty() {
+            if closed {
+                break;
+            }
+            notified.await;
+            continue;
+        }
+        let count = batch.len();
+        prepare_batch(&mut data, &mut parts, &mut batch);
+        debug_assert_eq!(
+            parts
+                .iter()
+                .map(|p| p.bytes(&data, &batch).len())
+                .sum::<usize>(),
+            bytes
+        );
+        let result = timeout(deadline, write_batch(&mut write, &data, &parts, &batch)).await;
+        batch.clear();
+        match result {
+            Ok(Ok(())) => {
+                let mut out = peer.out.lock().unwrap();
+                out.bytes -= bytes;
+                out.count -= count;
+            }
+            _ => {
+                peer.close();
+                peer.cancel.send_replace(true);
+                break;
+            }
+        }
+        data.clear();
+    }
+    let _ = write.shutdown().await;
 }
 fn protocol_error(peer: &Peer, msg: &str) {
     peer.send(Bytes::from(format!("-ERR '{msg}'\r\n")));
@@ -358,7 +629,7 @@ async fn connection(
         socket.write_all(format!("INFO {info}\r\n").as_bytes()),
     )
     .await??;
-    let (read, mut write) = socket.into_split();
+    let (read, write) = socket.into_split();
     let mut read = read;
 
     let (cancel, mut canceled) = watch::channel(false);
@@ -381,67 +652,12 @@ async fn connection(
     // A separate writer ensures stalled recipients cannot block a publisher's read loop.
     let deadline = config.write_deadline;
     let writer_peer = peer.clone();
-    let writer = tokio::spawn(async move {
-        let mut data = Vec::with_capacity(64 * 1024);
-        let mut batch = Vec::with_capacity(64);
-        loop {
-            let notified = writer_peer.ready.notified();
-            let mut bytes = 0;
-            let closed = {
-                let mut out = writer_peer.out.lock().unwrap();
-                while bytes < 64 * 1024 {
-                    let Some(frame) = out.frames.pop_front() else {
-                        break;
-                    };
-                    bytes += frame.size;
-                    batch.push(frame);
-                }
-                out.closed
-            };
-            if batch.is_empty() {
-                if closed {
-                    break;
-                }
-                notified.await;
-                continue;
-            }
-            for frame in &batch {
-                let start = data.len();
-                match &frame.data {
-                    FrameData::Raw(bytes) => data.extend_from_slice(bytes),
-                    FrameData::Delivery {
-                        message,
-                        sid,
-                        headers,
-                    } => encode_into(&mut data, message, sid, *headers),
-                }
-                debug_assert_eq!(data.len() - start, frame.size);
-            }
-
-            let count = batch.len();
-            batch.clear();
-            match timeout(deadline, write.write_all(&data)).await {
-                Ok(Ok(())) => {
-                    let mut out = writer_peer.out.lock().unwrap();
-                    out.bytes -= bytes;
-                    out.count -= count;
-                }
-                _ => {
-                    writer_peer.close();
-                    writer_peer.cancel.send_replace(true);
-                    break;
-                }
-            }
-            data.clear();
-        }
-        let _ = write.shutdown().await;
-    });
+    let writer = tokio::spawn(writer_loop(write, writer_peer, deadline));
     let mut writer = WriterGuard {
         task: writer,
         peer: peer.clone(),
     };
     let mut buf = BytesMut::with_capacity(8192);
-    let mut read_chunk = vec![0u8; 64 * 1024];
     let mut connected = false;
     let mut verbose = true;
     let mut no_responders = false;
@@ -479,14 +695,14 @@ async fn connection(
                     }
                     NatsMessage::Unsub(s)=>{hub.lock().unwrap().core.unsubscribe(id,&s.sid,s.max_msgs);if verbose{peer.send(Bytes::from_static(b"+OK\r\n"));}}
                     NatsMessage::Pub(p)=>{
-                        let subject=String::from_utf8_lossy(&p.subject).into_owned();let reply=p.reply_to.as_deref().map(|v|String::from_utf8_lossy(v).into_owned());let plen=p.payload.len();drop(p);
+                        let subject=field_range(&buf,&p.subject);let reply=p.reply_to.as_deref().map(|v|field_range(&buf,v));let plen=p.payload.len();drop(p);
                         let frame=buf.split_to(consumed).freeze();advanced=true;
-                        let msg=Message{subject,reply,headers:Bytes::new(),payload:frame.slice(consumed-plen-2..consumed-2)};publish(&hub,id,&msg,no_responders,config.jetstream.as_ref(),&mut durable,config.storage_deadline)?;
+                        let msg=WireMessage{frame,subject,reply,body:consumed-plen-2,header_len:0};publish(&hub,id,msg,no_responders,config.jetstream.as_ref(),&mut durable,config.storage_deadline)?;
                         if verbose{peer.send(Bytes::from_static(b"+OK\r\n"));}}
                     NatsMessage::HPub(p)=>{
-                        let subject=String::from_utf8_lossy(&p.subject).into_owned();let reply=p.reply_to.as_deref().map(|v|String::from_utf8_lossy(v).into_owned());let plen=p.payload.len();let hlen=p.headers.len();drop(p);
+                        let subject=field_range(&buf,&p.subject);let reply=p.reply_to.as_deref().map(|v|field_range(&buf,v));let plen=p.payload.len();let hlen=p.headers.len();drop(p);
                         let frame=buf.split_to(consumed).freeze();advanced=true;
-                        let msg=Message{subject,reply,headers:frame.slice(consumed-plen-hlen-2..consumed-plen-2),payload:frame.slice(consumed-plen-2..consumed-2)};publish(&hub,id,&msg,no_responders,config.jetstream.as_ref(),&mut durable,config.storage_deadline)?;
+                        let msg=WireMessage{frame,subject,reply,body:consumed-plen-hlen-2,header_len:hlen};publish(&hub,id,msg,no_responders,config.jetstream.as_ref(),&mut durable,config.storage_deadline)?;
                         if verbose{peer.send(Bytes::from_static(b"+OK\r\n"));}}
                     _=>{protocol_error(&peer,"Unexpected server operation");return Ok(());}
                 }
@@ -500,6 +716,8 @@ async fn connection(
             let allowance=max.saturating_sub(buf.len()).min(64*1024);
             if allowance==0 {protocol_error(&peer,"Maximum buffer exceeded");return Ok(());}
 
+            buf.reserve(allowance);
+            let mut destination = (&mut buf).limit(allowance);
             tokio::select! {
                 biased;
                 _=canceled.changed()=>return Ok(()),
@@ -511,7 +729,7 @@ async fn connection(
                     if !peer.send(Bytes::from_static(b"PING\r\n")){return Ok(());}
                     pings+=1;next_ping=Instant::now()+config.ping_interval;
                 }
-                result=read.read(&mut read_chunk[..allowance])=>{let n=result?;if n==0{return Ok(());}buf.extend_from_slice(&read_chunk[..n]);}
+                result=read.read_buf(&mut destination)=>{let n=result?;if n==0{return Ok(());}}
             }
         }
     }.await;
@@ -533,7 +751,7 @@ async fn connection(
 fn publish(
     hub: &Arc<Mutex<Hub>>,
     id: u64,
-    msg: &Message,
+    wire: WireMessage,
     no_responders: bool,
     js: Option<&crate::jetstream::Handle>,
     durable: &mut JoinSet<DurableCompletion>,
@@ -541,25 +759,40 @@ fn publish(
 ) -> io::Result<()> {
     // Core routing is immediate, including publications captured by a stream.
     // Storage admission/completion never holds the routing lock or read loop.
-    let recipients = hub.lock().unwrap().publish(id, msg);
-    let Some(js) = js.filter(|js| js.captures(&msg.subject)) else {
+    let shared = Arc::new(OutboundMessage::Wire(wire));
+    let parts = shared.parts();
+    let subject = std::str::from_utf8(parts.subject).expect("validated subject");
+    let recipients = hub
+        .lock()
+        .unwrap()
+        .route(id, subject, None, || shared.clone());
+    let Some(js) = js.filter(|js| js.captures(subject)) else {
         if recipients == 0 && no_responders {
-            no_response(hub, msg.reply.as_deref());
+            no_response(
+                hub,
+                parts
+                    .reply
+                    .map(|r| std::str::from_utf8(r).expect("validated reply")),
+            );
         }
         return Ok(());
     };
+    let OutboundMessage::Wire(wire) = shared.as_ref() else {
+        unreachable!()
+    };
+    let msg = wire.to_owned_message();
     while let Some(result) = durable.try_join_next() {
         finish_durable(result)?;
     }
-    let pending = js.try_request(msg.clone()).map_err(io::Error::other)?;
-    let permit = pending.lease();
-    let expires = Instant::now() + deadline;
-    let hub = hub.clone();
     let reply = if recipients == 0 && no_responders {
         msg.reply.clone()
     } else {
         None
     };
+    let pending = js.try_request(msg).map_err(io::Error::other)?;
+    let permit = pending.lease();
+    let expires = Instant::now() + deadline;
+    let hub = hub.clone();
     durable.spawn(async move {
         let result = async {
             let handled = tokio::time::timeout_at(expires, pending.wait())
@@ -590,3 +823,7 @@ fn no_response(hub: &Arc<Mutex<Hub>>, reply: Option<&str>) {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "server_output_tests.rs"]
+mod output_tests;
