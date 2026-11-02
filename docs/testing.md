@@ -173,3 +173,20 @@ boundaries and check fanout, queue delivery, replies and legacy subscribers.
 ```sh
 PROPTEST_CASES=1024 cargo test --locked --all-features --lib partial_output_refines
 ```
+
+CI publishes `core-profiles` separately from benchmark results. It runs checked
+1 KiB Core forwarding workloads against both servers with a user-space CPU-clock
+sample profile, keeping profiling overhead outside the benchmark measurements.
+The artifact includes raw perf samples, symbol reports, CPU time, RSS and runner
+CPU/kernel metadata. Download it from the CI run; it is not part of the website.
+
+```sh
+python3 scripts/profile_core.py --screech target/release/screech-server \
+  --nats /path/to/nats-server --driver /path/to/bench-driver \
+  --perf /path/to/perf --output /tmp/core-profiles
+```
+
+The parser boxes INFO/CONNECT data so hot publication results stay compact.
+Handshake tests retain UTF-8 fields and check pipelined binary publications.
+Routing tests warm exact/queue caches before changing echo, delivery limits,
+subscriptions and disconnects, and compare every delivery with the scan model.

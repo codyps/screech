@@ -299,3 +299,74 @@ fn all_matching_literal_and_star_branches_deliver_once_and_prune() {
     assert!(!core.has_interest(subject));
     assert!(core.publish(9, subject).is_empty());
 }
+
+#[test]
+fn cached_exact_routes_survive_echo_limits_and_interest_changes() {
+    let mut core = Core::default();
+    let mut model = Reference::default();
+    for id in 1..=3 {
+        core.connect(id, true);
+        model.clients.insert(id, true);
+    }
+    // Warm exact and queue routes, then mutate every source of route eligibility.
+    for (id, sid, filter, queue) in [
+        (1, "self", "a", None),
+        (2, "q", "a", Some("q")),
+        (3, "wild", ">", None),
+    ] {
+        core.subscribe(id, sid.into(), filter.into(), queue.map(str::to_owned))
+            .unwrap();
+        model.subs.insert(
+            (id, sid.into()),
+            Sub {
+                filter: filter.into(),
+                queue: queue.map(str::to_owned),
+                delivered: 0,
+                maximum: None,
+            },
+        );
+    }
+    for step in 0..100 {
+        if step == 10 {
+            core.connect(1, false);
+            model.clients.insert(1, false);
+        }
+        if step == 20 {
+            core.unsubscribe(2, "q", Some(23));
+            model.unsubscribe(&(2, "q".into()), Some(23));
+        }
+        if step == 30 {
+            core.disconnect(3);
+            model.remove(&(3, "wild".into()));
+            model.clients.remove(&3);
+        }
+        if step == 40 {
+            core.unsubscribe(1, "self", None);
+            model.unsubscribe(&(1, "self".into()), None);
+        }
+        if step == 50 {
+            core.subscribe(2, "new".into(), "a".into(), None).unwrap();
+            model.subs.insert(
+                (2, "new".into()),
+                Sub {
+                    filter: "a".into(),
+                    queue: None,
+                    delivered: 0,
+                    maximum: None,
+                },
+            );
+        }
+        for subject in ["a", "missing", "a"] {
+            let got: Vec<_> = core
+                .publish(1, subject)
+                .into_iter()
+                .map(|d| (d.client, d.sid.to_string()))
+                .collect();
+            assert_eq!(
+                got,
+                model.publish(1, subject, None),
+                "step {step}, {subject}"
+            );
+        }
+    }
+}

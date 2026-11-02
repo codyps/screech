@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum NatsMessage<'a> {
-    Info(Info<'a>),
-    Connect(Connect<'a>),
+    // Keep cold handshake fields out of every hot PUB/HPUB parser result.
+    Info(Box<Info<'a>>),
+    Connect(Box<Connect<'a>>),
     Pub(Pub<'a>),
     HPub(HPub<'a>),
     Sub(Sub<'a>),

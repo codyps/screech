@@ -52,7 +52,7 @@ fn msg_parse_info() {
 
         assert_eq!(
             msg,
-            NatsMessage::Info(msg::Info {
+            NatsMessage::Info(Box::new(msg::Info {
                 server_id: "1".to_string().into(),
                 server_name: "2".to_string().into(),
                 version: "3".to_string().into(),
@@ -78,7 +78,7 @@ fn msg_parse_info() {
                 nonce: None,
                 cluster: None,
                 domain: None,
-            })
+            }))
         );
     });
 }

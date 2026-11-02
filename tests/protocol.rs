@@ -59,3 +59,30 @@ fn embedded_wildcard_characters_are_literals() {
         assert!(screech::core::matches(subject, subject));
     }
 }
+
+#[test]
+fn boxed_handshakes_preserve_fields_and_pipelined_binary_publications() {
+    let connect = r#"cOnNeCt {"verbose":false,"headers":true,"echo":false,"name":"λ","auth_token":"secret","no_responders":true}"#.as_bytes();
+    let mut wire = connect.to_vec();
+    wire.extend_from_slice(b"\r\nPUB a reply 3\r\na\0b\r\nPING\r\n");
+    for end in 0..connect.len() + 2 {
+        assert!(parse(&wire[..end], Limits::default()).unwrap().is_none());
+    }
+    let (command, tail) = parse(&wire, Limits::default()).unwrap().unwrap();
+    let NatsMessage::Connect(c) = command else {
+        panic!("CONNECT")
+    };
+    assert!(!c.verbose);
+    assert_eq!(c.headers, Some(true));
+    assert_eq!(c.echo, Some(false));
+    assert_eq!(c.name.as_deref(), Some("λ"));
+    assert_eq!(c.auth_token.as_deref(), Some("secret"));
+    assert_eq!(c.no_responders, Some(true));
+    let (command, tail) = parse(tail, Limits::default()).unwrap().unwrap();
+    let NatsMessage::Pub(p) = command else {
+        panic!("PUB")
+    };
+    assert_eq!(p.payload.as_ref(), b"a\0b");
+    assert_eq!(p.reply_to.as_deref(), Some(b"reply".as_slice()));
+    assert_eq!(tail, b"PING\r\n");
+}

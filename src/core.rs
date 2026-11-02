@@ -319,9 +319,12 @@ impl Core {
         });
         result
     }
-    fn routes(&mut self, subject: &str) -> Arc<Routes> {
+    fn routes(&mut self, subject: &str) -> Option<Arc<Routes>> {
         if let Some(routes) = self.cache.get(subject) {
-            return routes.clone();
+            return Some(routes.clone());
+        }
+        if self.wild.is_empty() && !self.exact.contains_key(subject) {
+            return None;
         }
         let mut direct = Vec::new();
         let mut groups = BTreeMap::<Arc<str>, Vec<Key>>::new();
@@ -366,7 +369,7 @@ impl Core {
             self.cache_bytes += size;
             self.cache.insert(subject.into(), routes.clone());
         }
-        routes
+        Some(routes)
     }
     pub fn route_with(
         &mut self,
@@ -375,10 +378,9 @@ impl Core {
         queue: Option<&str>,
         mut deliver: impl FnMut(ClientId, &Arc<str>),
     ) -> usize {
-        if self.wild.is_empty() && !self.exact.contains_key(subject) {
+        let Some(routes) = self.routes(subject) else {
             return 0;
-        }
-        let routes = self.routes(subject);
+        };
         let skip_echo = self.clients.get(&publisher) == Some(&false);
         let mut count = 0;
         if queue.is_none() {

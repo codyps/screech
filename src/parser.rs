@@ -95,13 +95,13 @@ pub fn parse(
                 return Err(invalid("Expected JSON object"));
             }
             if cmd == "INFO" {
-                NatsMessage::Info(
+                NatsMessage::Info(Box::new(
                     serde_json::from_str(json).map_err(|_| invalid("Invalid INFO JSON"))?,
-                )
+                ))
             } else {
-                NatsMessage::Connect(
+                NatsMessage::Connect(Box::new(
                     serde_json::from_str(json).map_err(|_| invalid("Invalid CONNECT JSON"))?,
-                )
+                ))
             }
         }
         "PING" if args.is_empty() => NatsMessage::Ping,
