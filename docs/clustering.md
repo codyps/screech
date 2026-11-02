@@ -7,7 +7,7 @@ the intervening content-paging and unsafe-ACK changes materially change this pla
 The local NATS investigation is supporting evidence. This is a proposal, not an
 implemented or benchmarked cluster.
 
-## Implementation status: first single-voter increment
+## Implementation status: single-voter storage executor
 
 The opt-in `--single-voter --store <path>` driver implements the first part of
 phase 1. Standalone startup and its unsafe-ACK option retain their existing behavior.
@@ -22,6 +22,13 @@ promise durable atomic appends.
   output adapter. It waits for one completion before handling more durable work;
   Core traffic and protocol heartbeats remain independent. Strict consumer events
   bypass the standalone consumer-buffering hook.
+- `ExecutorStore` permanently owns the backend on a separate thread. Content
+  reads, replay reads, appends, live-key enumeration, snapshot serialization,
+  checkpoint installation, GC and WAL restart execute on that owner. Capability
+  flags are captured before handoff. An opaque checkpoint job captures a private
+  metadata root; its serialization and installation share the ordered I/O domain.
+  Checkpoint success is reported only after installation completes. Shutdown joins
+  the idle owner before releasing the server, ensuring its exclusive lock is gone.
 - An ambiguous append or incorrect returned position quarantines the engine.
   Recovery of this fixed single-voter log treats complete durable appends as
   committed, including writes whose completion/reply was lost. Existing event and
@@ -29,9 +36,9 @@ promise durable atomic appends.
 - Engine and TCP tests cover delayed completion, retained content, failed writes,
   checkpoints, generated equivalence to standalone, ACK recovery and reply order.
 
-This is not the completion of phase 1 or a Raft implementation. Content reads and
-checkpoints still run synchronously; multiple proposals, asynchronous content-read
-completion, epoch/stepdown handling and a deterministic network/timer simulator
+This is not the completion of phase 1 or a Raft implementation. Storage work is off
+the durable worker, but its waiting adapter still serializes durable requests.
+Multiple proposals, a nonblocking consensus event pump, epoch/stepdown handling and a deterministic network/timer simulator
 remain. Proposal task identity is local to an engine lifetime. Conflict-safe
 replicated content identities, hard state, accepted-suffix recovery and snapshot
 transfer require a new consensus storage format before adding multiple voters.

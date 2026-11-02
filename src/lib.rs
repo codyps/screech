@@ -7,5 +7,6 @@ pub mod msg;
 pub mod parser;
 pub mod server;
 pub mod storage;
+pub mod storage_executor;
 pub use msg::NatsMessage;
 pub use parser::ProtocolError as Error;

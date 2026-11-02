@@ -1756,9 +1756,6 @@ impl<S: Store> Engine<S> {
     pub fn voter_progress(&self) -> Option<VoterProgress> {
         self.voter
     }
-    pub(crate) fn persistence_lost(&self) {
-        self.poisoned.set(true);
-    }
     pub(crate) fn can_release_output(&self) -> bool {
         !self.poisoned.get()
             && self.pending.is_none()
@@ -1944,6 +1941,43 @@ impl<S: Store> Engine<S> {
     }
     pub fn checkpoint(&mut self) -> Result<(), Error> {
         self.ensure_ready()?;
+        if let Some(voter) = &mut self.voter {
+            let state = self.state.clone();
+            let result = self
+                .store
+                .as_mut()
+                .expect("storage available")
+                .checkpoint_job(
+                    self.log_sequence,
+                    Box::new(move || {
+                        let live = state
+                            .streams
+                            .values()
+                            .flat_map(|s| s.messages.values())
+                            .filter_map(|m| m.content.as_ref().map(|r| r.key))
+                            .collect();
+                        let data = postcard::to_allocvec(&SnapshotRef {
+                            version: 3,
+                            state: &state,
+                        })
+                        .map_err(|e| crate::storage::StoreError::Io(std::io::Error::other(e)))?;
+                        Ok(crate::storage::CheckpointImage {
+                            data,
+                            live,
+                            imports: Vec::new(),
+                        })
+                    }),
+                );
+            if let Err(error) = result {
+                self.poisoned.set(true);
+                return Err(error.into());
+            }
+            self.checkpoint_sequence = self.log_sequence;
+            voter.checkpoint = self.log_sequence;
+            self.since_checkpoint = 0;
+            self.log_bytes = 0;
+            return Ok(());
+        }
         let mut imports = Vec::new();
         if self.storage()?.external_content() {
             for stream in self.state.streams.values_mut() {

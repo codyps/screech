@@ -27,8 +27,11 @@ voter and no peer replication, elections or membership changes. It uses the exis
 committed-only store format: existing stores can be opened, and standalone mode
 can reopen its writes. Every complete durable append is committed by the sole
 voter, even if it crashes before applying or replying. Do not interpret this log
-as a multi-voter accepted log. Content reads and checkpoints still run serially;
-there is no cluster availability or performance claim.
+as a multi-voter accepted log. Strict mode gives storage one permanent executor:
+body reads, snapshot serialization, checkpoint installation and WAL maintenance
+run there. Durable requests wait for completion in order; Core traffic and socket
+heartbeats continue independently. There is no cluster availability or performance
+claim.
 
 The binary prints `LISTEN host:port` after binding; `--port 0` selects an available
 port. SIGINT/SIGTERM cancel connection waits and bound output/runtime shutdown,

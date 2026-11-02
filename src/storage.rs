@@ -51,6 +51,13 @@ pub struct Content {
     pub headers: Bytes,
     pub payload: Bytes,
 }
+/// An immutable image built by the storage owner, then installed atomically.
+pub struct CheckpointImage {
+    pub data: Vec<u8>,
+    pub live: Vec<ContentKey>,
+    pub imports: Vec<Content>,
+}
+pub type CheckpointJob = Box<dyn FnOnce() -> Result<CheckpointImage, StoreError> + Send>;
 fn content_checksum(content: &Content) -> u32 {
     let mut h = crc32fast::Hasher::new();
     h.update(&content.key.generation.to_le_bytes());
@@ -67,6 +74,21 @@ fn content_checksum(content: &Content) -> u32 {
 }
 /// An atomic durable append log. Metadata and records share one transaction domain.
 pub trait Store: Send {
+    /// Execute serialization/reachability work in the same ordered I/O domain
+    /// as installation. The default preserves synchronous standalone behavior.
+    fn checkpoint_job(&mut self, sequence: u64, job: CheckpointJob) -> Result<(), StoreError> {
+        let image = job()?;
+        if self.external_content() {
+            self.checkpoint_with_content(
+                sequence,
+                &image.data,
+                &mut image.live.into_iter(),
+                &image.imports,
+            )
+        } else {
+            self.checkpoint(sequence, &image.data)
+        }
+    }
     /// Opt in only when successful appends survive process/host restart. This is
     /// independent of batching: MemoryStore is useful for models, not a voter.
     fn durable_appends(&self) -> bool {
