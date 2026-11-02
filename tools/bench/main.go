@@ -46,6 +46,7 @@ func run() error {
 	var latencies []float64
 	var durableLatencies []float64
 	var fetchLatencies, cycleLatencies []float64
+	var verifiedUnused int64
 	if *scenario == "consume-one" {
 		fetchLatencies = make([]float64, 0, *n)
 		cycleLatencies = make([]float64, 0, *n)
@@ -329,6 +330,10 @@ func run() error {
 		seen := make([]atomic.Uint32, *n)
 		var readers []*nats.Conn
 		var readerClosed []chan struct{}
+		var unusedProbing atomic.Bool
+		unusedProbing.Store(true)
+		var unusedTotal atomic.Int64
+		unusedDone := make(chan struct{})
 		for s := 0; s < *subscribers; s++ {
 			closed := make(chan struct{})
 			readerOptions := append([]nats.Option{}, options...)
@@ -386,7 +391,22 @@ func run() error {
 				return e
 			}
 			for i := 0; i < unusedWildcards; i++ {
-				if _, e = conn.Subscribe(fmt.Sprintf("unused.%d.*", i), func(_ *nats.Msg) { asyncError.Store("unexpected wildcard delivery") }); e != nil {
+				probeSubject := fmt.Sprintf("unused.%d.probe", i)
+				seenProbe := false // Callbacks on each subscription are serialized.
+				if _, e = conn.Subscribe(fmt.Sprintf("unused.%d.*", i), func(m *nats.Msg) {
+					if !unusedProbing.Load() {
+						asyncError.Store("unexpected wildcard delivery")
+						return
+					}
+					if seenProbe || m.Subject != probeSubject || string(m.Data) != "probe" {
+						asyncError.Store("invalid subscription probe")
+						return
+					}
+					seenProbe = true
+					if unusedTotal.Add(1) == int64(unusedWildcards**subscribers) {
+						close(unusedDone)
+					}
+				}); e != nil {
 					return e
 				}
 			}
@@ -394,6 +414,23 @@ func run() error {
 				return e
 			}
 		}
+		if unusedWildcards > 0 {
+			for i := 0; i < unusedWildcards; i++ {
+				if e := pub.Publish(fmt.Sprintf("unused.%d.probe", i), []byte("probe")); e != nil {
+					return e
+				}
+			}
+			if e := pub.Flush(); e != nil {
+				return e
+			}
+			select {
+			case <-unusedDone:
+				verifiedUnused = unusedTotal.Load() / int64(*subscribers)
+			case <-time.After(10 * time.Second):
+				return fmt.Errorf("subscription probe timeout: %d deliveries", unusedTotal.Load())
+			}
+		}
+		unusedProbing.Store(false)
 		flushWindow := func() error {
 			if e := pub.Flush(); e != nil {
 				return e
@@ -470,6 +507,7 @@ func run() error {
 	if coreBulkScenario(*scenario) {
 		result["core_window"] = 1024
 		result["core_subjects"], result["unused_wildcards"] = coreTopology(*scenario)
+		result["verified_unused_wildcards"] = verifiedUnused
 	}
 	if *scenario == "consume-ack-window" {
 		result["fetch_batch"] = 1000

@@ -45,9 +45,9 @@ class BenchmarkSiteTests(unittest.TestCase):
             p,value=self.fixture(tmp)
             for scenario,expected in site.CORE_TOPOLOGIES.items():
                 row=value['rows'][0]
-                row.update(scenario=scenario,core_subjects=expected[0],unused_wildcards=expected[1],core_window=1024)
+                row.update(scenario=scenario,core_subjects=expected[0],unused_wildcards=expected[1],verified_unused_wildcards=expected[1],core_window=1024)
                 p.write_text(json.dumps(value));site.read_campaign(p,'valid')
-                for key in ['core_subjects','unused_wildcards','core_window']:
+                for key in ['core_subjects','unused_wildcards','verified_unused_wildcards','core_window']:
                     broken=json.loads(json.dumps(value));broken['rows'][0].pop(key);p.write_text(json.dumps(broken))
                     with self.assertRaisesRegex(ValueError,'topology'):site.read_campaign(p,'invalid')
                 row['core_subjects']=1 if expected[0]!=1 else 8192

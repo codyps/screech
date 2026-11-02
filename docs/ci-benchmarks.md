@@ -111,7 +111,9 @@ wildcard and queue cases, CI includes these 128-byte, one-subscriber cases with
 Each subscriber also has one active wildcard subscription. Subjects rotate in
 publication order; the unused filters have a separate literal prefix. This separates
 cache-hit behavior from lookup work when the subject set exceeds route-cache capacity.
-Raw rows record core_subjects, unused_wildcards and core_window. The dashboard shows
+Untimed control publications first verify every unused subscription receives its own
+probe exactly once. Raw rows record core_subjects, unused_wildcards,
+verified_unused_wildcards and core_window. The dashboard shows
 these counts and supports searching for them. Core modes carry no storage-sync label.
 
 Every delivery is checked for subject, sequence, length and ordering. Queue cases

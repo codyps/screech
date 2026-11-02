@@ -216,6 +216,9 @@ fn cache_eviction_and_subscription_churn_preserve_interest() {
         core.subscribe(1, format!("unused{n}"), format!("unused.{n}.*"), None)
             .unwrap();
     }
+    for n in 0..512 {
+        assert!(core.has_interest(&format!("unused.{n}.probe")));
+    }
     core.subscribe(1, "active".into(), "a.>".into(), Some("q".into()))
         .unwrap();
     core.subscribe(2, "self".into(), "*.x".into(), Some("q".into()))

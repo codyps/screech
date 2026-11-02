@@ -25,7 +25,7 @@ def read_campaign(path, label):
             raise ValueError(f'{path}: incomplete or unchecked trial')
         if row.get('scenario') in CORE_TOPOLOGIES:
             actual = (row.get('core_subjects'), row.get('unused_wildcards'))
-            if actual != CORE_TOPOLOGIES[row['scenario']] or row.get('core_window') != 1024:
+            if actual != CORE_TOPOLOGIES[row['scenario']] or row.get('core_window') != 1024 or row.get('verified_unused_wildcards') != actual[1]:
                 raise ValueError(f'{path}: invalid Core scaling topology')
         for key, number in row.items():
             if isinstance(number, (float, int)) and (not math.isfinite(number) or number < 0):
