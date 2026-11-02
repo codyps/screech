@@ -205,3 +205,9 @@ model. Network tests cover binary subjects/replies, queue/wildcard delivery,
 headers and no-responder statuses. JSON and the existing JetStream text model
 still validate text at their boundary; unsupported non-UTF-8 durable subjects or
 replies return an error rather than using lossy conversion or panicking.
+
+Single-recipient Core forwarding transfers the immutable input buffer directly
+into a compact descriptor. Multiple recipients share the general message, and
+large control offsets use its full-width representation without truncation or
+new protocol limits. Output properties mix compact, shared-wire and owned frames;
+large-offset tests verify exact fallback framing under short writes. 

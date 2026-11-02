@@ -100,6 +100,21 @@ fn frame(message: Arc<OutboundMessage>, sid: &str, headers: bool) -> Queued {
         },
     }
 }
+fn compact_frame(message: Arc<OutboundMessage>, sid: &str, headers: bool) -> Queued {
+    if let OutboundMessage::Wire(wire) = message.as_ref() {
+        if let Ok(message) = CompactWire::new(wire.clone()) {
+            return Queued {
+                size: wire_size_parts(&message.parts(), sid, headers),
+                data: FrameData::Wire {
+                    message,
+                    sid: Arc::from(sid),
+                    headers,
+                },
+            };
+        }
+    }
+    frame(message, sid, headers)
+}
 struct ShortWriter {
     output: Vec<u8>,
     maximum: usize,
@@ -174,20 +189,20 @@ fn writer(maximum: usize, vectored: bool) -> ShortWriter {
 proptest! {
     #[test]
     fn partial_output_refines_complete_wire_encoding(
-        specs in prop::collection::vec((prop::collection::vec(any::<u8>(),0..4096),any::<bool>(),any::<bool>(),any::<bool>(),any::<bool>()),1..9),
+        specs in prop::collection::vec((prop::collection::vec(any::<u8>(),0..4096),any::<bool>(),any::<bool>(),any::<bool>(),any::<bool>(),any::<bool>()),1..9),
         maximum in 1usize..2048, vectored in any::<bool>()
     ) {
         let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(async {
             let mut frames=Vec::new();let mut want=Vec::new();
-            for (n,(payload,with_headers,capable,reply,wire)) in specs.into_iter().enumerate() {
+            for (n,(payload,with_headers,capable,reply,wire,compact)) in specs.into_iter().enumerate() {
                 let subject=if n%2==0 {"café.x"}else{"消息.test"};let sid=format!("consumer{n}");
                 let headers=if with_headers {b"NATS/1.0\r\nX-Test: yes\r\n\r\n".as_slice()}else{b""};
                 let reply=reply.then_some("inbox.réply");
                 let msg=message(subject,reply,headers,&payload,wire);
                 let next=expected(subject,reply,headers,&payload,&sid,capable);
                 prop_assert_eq!(wire_size(&msg,&sid,capable),next.len());want.extend(next);
-                frames.push(frame(msg,&sid,capable));
+                frames.push(if compact {compact_frame(msg,&sid,capable)} else {frame(msg,&sid,capable)});
                 frames.push(Queued{size:6,data:FrameData::Raw(Bytes::from_static(b"PONG\r\n"))});want.extend_from_slice(b"PONG\r\n");
             }
             let mut data=Vec::new();let mut parts=Vec::new();prepare_batch(&mut data,&mut parts,&mut frames);
@@ -218,7 +233,11 @@ async fn large_headers_empty_bodies_and_many_vectors_preserve_framing() {
                 "1",
                 capable,
             ));
-            frames.push(frame(msg, "1", capable));
+            frames.push(if n % 3 == 0 {
+                compact_frame(msg, "1", capable)
+            } else {
+                frame(msg, "1", capable)
+            });
         }
         let mut data = Vec::new();
         let mut parts = Vec::new();
@@ -399,6 +418,68 @@ fn jetstream_text_boundary_rejects_binary_subjects_and_replies_without_panicking
         assert_eq!(
             wire.to_owned_message().unwrap_err().kind(),
             io::ErrorKind::InvalidData
+        );
+    }
+}
+
+#[tokio::test]
+async fn oversized_compact_offsets_fall_back_without_truncating_fields() {
+    for large_reply in [false, true] {
+        let subject = if large_reply {
+            "s".into()
+        } else {
+            "s".repeat(65536)
+        };
+        let reply = if large_reply {
+            "r".repeat(65536)
+        } else {
+            "r".into()
+        };
+        let mut input = BytesMut::from(format!("PUB {subject} {reply} 0\r\n\r\n").as_bytes());
+        let (msg, tail) = parse(
+            &input,
+            Limits {
+                control_line: 131072,
+                payload: 0,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(tail.is_empty());
+        let NatsMessage::Pub(p) = msg else {
+            panic!("PUB")
+        };
+        let subject_range = field_range(&input, &p.subject);
+        let reply_range = p.reply_to.as_deref().map(|r| field_range(&input, r));
+        let body = input.len() - 2;
+        let wire = WireMessage {
+            frame: input.split().freeze(),
+            subject: subject_range,
+            reply: reply_range,
+            body,
+            header_len: 0,
+        };
+        let (cancel, _) = watch::channel(false);
+        let peer = Peer {
+            out: Arc::new(Mutex::new(Outbox::default())),
+            ready: Arc::new(Notify::new()),
+            max_pending: 262144,
+            cancel,
+            headers: true,
+        };
+        let mut wakes = DeliveryWakes::default();
+        assert!(peer.send_wire(wire, Arc::from("1"), &mut wakes));
+        let mut frames: Vec<_> = peer.out.lock().unwrap().frames.drain(..).collect();
+        let mut data = Vec::new();
+        let mut parts = Vec::new();
+        prepare_batch(&mut data, &mut parts, &mut frames);
+        let mut output = writer(137, true);
+        write_batch(&mut output, &data, &parts, &frames)
+            .await
+            .unwrap();
+        assert_eq!(
+            output.output,
+            expected(&subject, Some(&reply), b"", b"", "1", true)
         );
     }
 }

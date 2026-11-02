@@ -53,6 +53,7 @@ impl Default for Config {
     }
 }
 // Parser-validated fields retain one immutable wire allocation through forwarding.
+#[derive(Clone)]
 struct WireMessage {
     frame: Bytes,
     subject: Range<usize>,
@@ -137,13 +138,78 @@ fn reserve_input(buf: &mut BytesMut, allowance: usize) {
         buf.reserve(allowance);
     }
 }
+// Inline offsets cover ordinary control lines; oversized configured frames keep
+// the general representation. Conversion never truncates offsets or lengths.
+#[derive(Clone, Copy)]
+struct WireFields {
+    subject_start: u16,
+    subject_end: u16,
+    reply_start: u16,
+    reply_end: u16,
+    body: u32,
+    header_len: u32,
+}
+struct CompactWire {
+    frame: Bytes,
+    fields: WireFields,
+}
+impl CompactWire {
+    fn new(wire: WireMessage) -> Result<Self, WireMessage> {
+        let fields = (|| -> Option<WireFields> {
+            let reply = wire.reply.clone().unwrap_or(0..0);
+            Some(WireFields {
+                subject_start: wire.subject.start.try_into().ok()?,
+                subject_end: wire.subject.end.try_into().ok()?,
+                reply_start: reply.start.try_into().ok()?,
+                reply_end: reply.end.try_into().ok()?,
+                body: wire.body.try_into().ok()?,
+                header_len: wire.header_len.try_into().ok()?,
+            })
+        })();
+        match fields {
+            Some(fields) => Ok(Self {
+                frame: wire.frame,
+                fields,
+            }),
+            None => Err(wire),
+        }
+    }
+    #[inline(always)]
+    fn parts(&self) -> MessageParts<'_> {
+        let f = self.fields;
+        let body = f.body as usize;
+        let headers = f.header_len as usize;
+        MessageParts {
+            subject: &self.frame[f.subject_start as usize..f.subject_end as usize],
+            reply: (f.reply_start != f.reply_end)
+                .then(|| &self.frame[f.reply_start as usize..f.reply_end as usize]),
+            headers: &self.frame[body..body + headers],
+            payload: &self.frame[body + headers..self.frame.len() - 2],
+        }
+    }
+}
 enum FrameData {
     Raw(Bytes),
+    Wire {
+        message: CompactWire,
+        sid: Arc<str>,
+        headers: bool,
+    },
     Delivery {
         message: Arc<OutboundMessage>,
         sid: Arc<str>,
         headers: bool,
     },
+}
+impl FrameData {
+    #[inline(always)]
+    fn parts(&self) -> MessageParts<'_> {
+        match self {
+            Self::Wire { message, .. } => message.parts(),
+            Self::Delivery { message, .. } => message.parts(),
+            Self::Raw(_) => unreachable!("delivery frame"),
+        }
+    }
 }
 struct Queued {
     size: usize,
@@ -215,6 +281,27 @@ impl Peer {
             wakes,
         )
     }
+    fn send_wire(&self, wire: WireMessage, sid: Arc<str>, wakes: &mut DeliveryWakes) -> bool {
+        match CompactWire::new(wire) {
+            Ok(message) => {
+                let size = wire_size_parts(&message.parts(), &sid, self.headers);
+                self.enqueue_with_wakes(
+                    Queued {
+                        size,
+                        data: FrameData::Wire {
+                            message,
+                            sid,
+                            headers: self.headers,
+                        },
+                    },
+                    Some(wakes),
+                )
+            }
+            Err(wire) => {
+                self.send_delivery(Arc::new(OutboundMessage::Wire(wire)), sid, Some(wakes))
+            }
+        }
+    }
     fn enqueue(&self, frame: Queued) -> bool {
         self.enqueue_with_wakes(frame, None)
     }
@@ -262,6 +349,53 @@ impl Hub {
                 .clone()
         })
     }
+    fn forward_wire(
+        &mut self,
+        publisher: u64,
+        target: &[u8],
+        wire: WireMessage,
+        wakes: &mut DeliveryWakes,
+    ) -> (usize, Option<WireMessage>) {
+        let mut pending = Some(wire);
+        let mut first = None;
+        let mut shared = None;
+        let mut dead = Vec::new();
+        let Hub { core, peers } = self;
+        let count = core.route_with(publisher, target, None, |client, sid| {
+            let Some(peer) = peers.get(&client) else {
+                return;
+            };
+            if shared.is_none() {
+                let Some((first_client, first_sid)) = first.take() else {
+                    first = Some((client, sid.clone()));
+                    return;
+                };
+                let message =
+                    Arc::new(OutboundMessage::Wire(pending.take().expect("pending wire")));
+                if !peers[&first_client].send_delivery(message.clone(), first_sid, Some(wakes)) {
+                    dead.push(first_client);
+                }
+                shared = Some(message);
+            }
+            if !peer.send_delivery(
+                shared.as_ref().expect("shared wire").clone(),
+                sid.clone(),
+                Some(wakes),
+            ) {
+                dead.push(client);
+            }
+        });
+        if let Some((client, sid)) = first {
+            if !peers[&client].send_wire(pending.take().expect("single wire"), sid, wakes) {
+                dead.push(client);
+            }
+        }
+        for client in dead {
+            self.core.disconnect(client);
+            self.peers.remove(&client);
+        }
+        (count, pending)
+    }
     fn route(
         &mut self,
         publisher: u64,
@@ -294,7 +428,9 @@ fn digits(n: usize) -> usize {
     }
 }
 fn wire_size(message: &OutboundMessage, sid: &str, headers: bool) -> usize {
-    let msg = message.parts();
+    wire_size_parts(&message.parts(), sid, headers)
+}
+fn wire_size_parts(msg: &MessageParts<'_>, sid: &str, headers: bool) -> usize {
     let reply = msg.reply.as_ref().map(|r| r.len() + 1).unwrap_or(0);
     if headers && !msg.headers.is_empty() {
         let total = msg.headers.len() + msg.payload.len();
@@ -355,10 +491,7 @@ impl WritePart {
         match self {
             Self::Buffered(range) => &data[range.clone()],
             Self::Headers(index) | Self::Payload(index) => {
-                let FrameData::Delivery { message, .. } = &frames[*index].data else {
-                    unreachable!("borrowed delivery")
-                };
-                let msg = message.parts();
+                let msg = frames[*index].data.parts();
                 if matches!(self, Self::Headers(_)) {
                     msg.headers
                 } else {
@@ -378,12 +511,8 @@ fn prepare_batch(data: &mut Vec<u8>, parts: &mut Vec<WritePart>, frames: &mut [Q
         let mut borrowed = false;
         match &frame.data {
             FrameData::Raw(bytes) => data.extend_from_slice(bytes),
-            FrameData::Delivery {
-                message,
-                sid,
-                headers,
-            } => {
-                let msg = message.parts();
+            FrameData::Delivery { sid, headers, .. } | FrameData::Wire { sid, headers, .. } => {
+                let msg = frame.data.parts();
                 let with_headers = *headers && !msg.headers.is_empty();
                 if msg.payload.len().saturating_add(if with_headers {
                     msg.headers.len()
@@ -803,6 +932,27 @@ fn publish(
     config: &Config,
     durable: &mut JoinSet<DurableCompletion>,
 ) -> io::Result<()> {
+    let capture = config
+        .jetstream
+        .as_ref()
+        .filter(|js| js.captures(&wire.frame[wire.subject.clone()]));
+    // Keep a bounded stack copy of the target while transferring the original
+    // frame to a single receiver. Longer subjects use the general shared path.
+    let target_len = wire.subject.len();
+    if capture.is_none() && target_len <= 64 {
+        let mut target = [0u8; 64];
+        target[..target_len].copy_from_slice(&wire.frame[wire.subject.clone()]);
+        let (recipients, unrouted) =
+            hub.lock()
+                .unwrap()
+                .forward_wire(id, &target[..target_len], wire, wakes);
+        if recipients == 0 && no_responders {
+            if let Some(wire) = unrouted {
+                no_response(hub, wire.reply.as_ref().map(|r| &wire.frame[r.clone()]));
+            }
+        }
+        return Ok(());
+    }
     // Core routing is immediate, including publications captured by a stream.
     // Storage admission/completion never holds the routing lock or read loop.
     let shared = Arc::new(OutboundMessage::Wire(wire));
@@ -812,7 +962,7 @@ fn publish(
         .lock()
         .unwrap()
         .route(id, subject, None, Some(wakes), || shared.clone());
-    let Some(js) = config.jetstream.as_ref().filter(|js| js.captures(subject)) else {
+    let Some(js) = capture else {
         if recipients == 0 && no_responders {
             no_response(hub, parts.reply);
         }
