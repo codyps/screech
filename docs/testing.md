@@ -228,4 +228,6 @@ partial or malformed input for the normal parser.
 Socket reads use a 128 KiB window; writers collect roughly 128 KiB groups with at
 most 256 vectors per syscall. These work bounds do not change protocol payload,
 pending-byte/count or write-deadline limits. Multi-vector framing tests cross the
-vector limit for both header-capable and legacy receivers.
+vector limit for both header-capable and legacy receivers. Publication framing
+can inline independently of the cold control-command decoder; both retain the
+same incremental framing and validation rules.

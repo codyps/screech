@@ -26,6 +26,7 @@ impl Default for Limits {
 pub fn token(s: &str) -> bool {
     !s.is_empty() && !s.bytes().any(|b| b <= b' ' || b == 127)
 }
+#[inline(always)]
 pub fn subject(s: impl AsRef<[u8]>, wildcard: bool) -> bool {
     let bytes = s.as_ref();
     let mut start = 0;
@@ -57,6 +58,7 @@ fn number(s: &[u8]) -> Result<usize, ProtocolError> {
     })
 }
 
+#[inline(always)]
 pub fn parse(
     src: &[u8],
     limits: Limits,
@@ -101,67 +103,7 @@ pub fn parse(
         *dst = src.to_ascii_uppercase();
     }
     let cmd = &opcode[..op.len()];
-    let msg = match cmd {
-        b"INFO" | b"CONNECT" => {
-            let line = std::str::from_utf8(line).map_err(|_| invalid("Invalid control line"))?;
-            let json = line[op.len()..].trim();
-            if !json.starts_with('{') {
-                return Err(invalid("Expected JSON object"));
-            }
-            if cmd == b"INFO" {
-                NatsMessage::Info(Box::new(
-                    serde_json::from_str(json).map_err(|_| invalid("Invalid INFO JSON"))?,
-                ))
-            } else {
-                NatsMessage::Connect(Box::new(
-                    serde_json::from_str(json).map_err(|_| invalid("Invalid CONNECT JSON"))?,
-                ))
-            }
-        }
-        b"PING" if args.is_empty() => NatsMessage::Ping,
-        b"PONG" if args.is_empty() => NatsMessage::Pong,
-        b"+OK" if args.is_empty() => NatsMessage::Ok,
-        b"-ERR" => {
-            std::str::from_utf8(line).map_err(|_| invalid("Invalid control line"))?;
-            NatsMessage::Err
-        }
-        b"SUB" if args.len() == 2 || args.len() == 3 => {
-            if !subject(args[0], true)
-                || !args[1..]
-                    .iter()
-                    .all(|s| std::str::from_utf8(s).is_ok_and(token))
-            {
-                return Err(invalid("Invalid subscription"));
-            }
-            NatsMessage::Sub(Sub {
-                subject: args[0].into(),
-                queue_group: if args.len() == 3 {
-                    Some(
-                        std::str::from_utf8(args[1])
-                            .map_err(|_| invalid("Invalid control line"))?
-                            .into(),
-                    )
-                } else {
-                    None
-                },
-                sid: std::str::from_utf8(args[args.len() - 1])
-                    .map_err(|_| invalid("Invalid control line"))?
-                    .into(),
-            })
-        }
-        b"UNSUB" if args.len() == 1 || args.len() == 2 => {
-            let max_msgs = if args.len() == 2 {
-                Some(u64::try_from(number(args[1])?).map_err(|_| invalid("Invalid maximum"))?)
-            } else {
-                None
-            };
-            NatsMessage::Unsub(Unsub {
-                sid: std::str::from_utf8(args[0])
-                    .map_err(|_| invalid("Invalid control line"))?
-                    .into(),
-                max_msgs,
-            })
-        }
+    match cmd {
         b"PUB" | b"HPUB" => {
             let headers = cmd == b"HPUB";
             let base = if headers { 3 } else { 2 };
@@ -219,9 +161,82 @@ pub fn parse(
                     payload: payload.into(),
                 })
             };
-            return Ok(Some((msg, &rest[frame_len..])));
+            Ok(Some((msg, &rest[frame_len..])))
+        }
+        _ => Ok(Some((parse_control(cmd, line, args)?, rest))),
+    }
+}
+
+// Keep infrequent controls out of the inlined publication framing path.
+#[cold]
+#[inline(never)]
+fn parse_control<'a>(
+    cmd: &[u8],
+    line: &'a [u8],
+    args: &[&'a [u8]],
+) -> Result<NatsMessage<'a>, ProtocolError> {
+    let msg = match cmd {
+        b"INFO" | b"CONNECT" => {
+            let line = std::str::from_utf8(line).map_err(|_| invalid("Invalid control line"))?;
+            let json = line[cmd.len()..].trim();
+            if !json.starts_with('{') {
+                return Err(invalid("Expected JSON object"));
+            }
+            if cmd == b"INFO" {
+                NatsMessage::Info(Box::new(
+                    serde_json::from_str(json).map_err(|_| invalid("Invalid INFO JSON"))?,
+                ))
+            } else {
+                NatsMessage::Connect(Box::new(
+                    serde_json::from_str(json).map_err(|_| invalid("Invalid CONNECT JSON"))?,
+                ))
+            }
+        }
+        b"PING" if args.is_empty() => NatsMessage::Ping,
+        b"PONG" if args.is_empty() => NatsMessage::Pong,
+        b"+OK" if args.is_empty() => NatsMessage::Ok,
+        b"-ERR" => {
+            std::str::from_utf8(line).map_err(|_| invalid("Invalid control line"))?;
+            NatsMessage::Err
+        }
+        b"SUB" if args.len() == 2 || args.len() == 3 => {
+            if !subject(args[0], true)
+                || !args[1..]
+                    .iter()
+                    .all(|s| std::str::from_utf8(s).is_ok_and(token))
+            {
+                return Err(invalid("Invalid subscription"));
+            }
+            NatsMessage::Sub(Sub {
+                subject: args[0].into(),
+                queue_group: if args.len() == 3 {
+                    Some(
+                        std::str::from_utf8(args[1])
+                            .map_err(|_| invalid("Invalid control line"))?
+                            .into(),
+                    )
+                } else {
+                    None
+                },
+                sid: std::str::from_utf8(args[args.len() - 1])
+                    .map_err(|_| invalid("Invalid control line"))?
+                    .into(),
+            })
+        }
+        b"UNSUB" if args.len() == 1 || args.len() == 2 => {
+            let max_msgs = if args.len() == 2 {
+                Some(u64::try_from(number(args[1])?).map_err(|_| invalid("Invalid maximum"))?)
+            } else {
+                None
+            };
+            NatsMessage::Unsub(Unsub {
+                sid: std::str::from_utf8(args[0])
+                    .map_err(|_| invalid("Invalid control line"))?
+                    .into(),
+                max_msgs,
+            })
         }
         _ => return Err(invalid("Unknown or malformed protocol operation")),
     };
-    Ok(Some((msg, rest)))
+    Ok(msg)
 }
