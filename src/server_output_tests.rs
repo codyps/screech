@@ -285,6 +285,7 @@ async fn borrowed_body_keeps_inflight_budget_until_write_completes() {
         max_pending: limit,
         cancel,
         headers: true,
+        socket: None,
     };
     let wire = match Arc::try_unwrap(msg) {
         Ok(OutboundMessage::Wire(wire)) => wire,
@@ -331,6 +332,7 @@ async fn stalled_partial_write_closes_without_releasing_inflight_credit() {
         max_pending: limit,
         cancel,
         headers: true,
+        socket: None,
     };
     let wire = match Arc::try_unwrap(msg) {
         Ok(OutboundMessage::Wire(wire)) => wire,
@@ -378,6 +380,7 @@ async fn deferred_wakes_keep_admission_limits_and_wake_on_early_return() {
         max_pending: 4096,
         cancel,
         headers: true,
+        socket: None,
     };
     // Dropping the burst guard is also the error/return path. No write task is
     // notified while routing; accepted frames and their budget remain intact.
@@ -478,6 +481,7 @@ async fn oversized_compact_offsets_fall_back_without_truncating_fields() {
             max_pending: 262144,
             cancel,
             headers: true,
+            socket: None,
         };
         let mut wakes = DeliveryWakes::default();
         assert!(peer.send_wire(wire, Arc::from("1"), &mut wakes));
@@ -568,6 +572,7 @@ fn burst_hub(
             },
             cancel,
             headers,
+            socket: None,
         };
         hub.core.connect(client as u64, echo || client != 0);
         if budget != 4 || !closed {
@@ -662,4 +667,144 @@ fn collector_preserves_control_boundaries_partial_frames_and_budget() {
     assert_eq!(wires.len(), 2);
     assert!(input.is_empty());
     assert_eq!(&wires[1].frame[wires[1].subject.clone()], b"a.\xff");
+}
+
+fn protocol_reply(body: &[u8], headers: bool) -> Queued {
+    queued_delivery(
+        Arc::new(OutboundMessage::Reply(Message {
+            subject: "_INBOX.reply".into(),
+            reply: Some("next".into()),
+            headers: Bytes::from_static(b"NATS/1.0 200 OK\r\n\r\n"),
+            payload: Bytes::copy_from_slice(body),
+        })),
+        Arc::from("19"),
+        headers,
+    )
+}
+
+proptest! {
+    #[test]
+    fn immediate_reply_partial_writes_preserve_every_wire_byte(
+        body in prop::collection::vec(any::<u8>(), 0..129), headers in any::<bool>(),
+    ) {
+        let complete = expected("_INBOX.reply", Some("next"), b"NATS/1.0 200 OK\r\n\r\n", &body, "19", headers);
+        for split in 1..=complete.len() {
+            let mut frame = protocol_reply(&body, headers);
+            let mut scratch = Vec::new();
+            let done = try_small_reply(&mut frame, &mut scratch, |wire| {
+                assert_eq!(wire, complete);
+                Ok(split)
+            }).unwrap();
+            prop_assert_eq!(done, split == complete.len());
+            if !done {
+                let FrameData::Raw(suffix) = &frame.data else { panic!("raw suffix"); };
+                prop_assert_eq!(frame.size, complete.len() - split);
+                prop_assert_eq!(suffix.as_ref(), &complete[split..]);
+            }
+        }
+    }
+}
+
+#[test]
+fn immediate_reply_retry_errors_and_delivery_coalescing() {
+    let mut scratch = Vec::new();
+    for kind in [io::ErrorKind::WouldBlock, io::ErrorKind::Interrupted] {
+        let mut frame = protocol_reply(b"ok", true);
+        let original_size = frame.size;
+        assert!(!try_small_reply(&mut frame, &mut scratch, |_| Err(kind.into())).unwrap());
+        assert_eq!(frame.size, original_size);
+        assert!(matches!(frame.data, FrameData::Delivery { .. }));
+    }
+    for (result, kind) in [
+        (Ok::<usize, io::Error>(0), io::ErrorKind::WriteZero),
+        (Ok(usize::MAX), io::ErrorKind::InvalidData),
+        (
+            Err(io::ErrorKind::BrokenPipe.into()),
+            io::ErrorKind::BrokenPipe,
+        ),
+    ] {
+        assert_eq!(
+            try_small_reply(&mut protocol_reply(b"ok", true), &mut scratch, |_| {
+                match &result {
+                    Ok(n) => Ok(*n),
+                    Err(e) => Err(e.kind().into()),
+                }
+            })
+            .unwrap_err()
+            .kind(),
+            kind
+        );
+    }
+    for mut frame in [
+        protocol_reply(&[0; 513], true),
+        queued_delivery(
+            message("subject", None, &[], b"body", false),
+            Arc::from("1"),
+            false,
+        ),
+        Queued {
+            size: 4,
+            data: FrameData::Raw(Bytes::from_static(b"PING")),
+        },
+    ] {
+        assert!(
+            !try_small_reply(&mut frame, &mut scratch, |_| panic!("must stay queued")).unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn immediate_reply_respects_inflight_credit_closed_state_and_budget() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (socket, _) = listener.accept().await.unwrap();
+    let (_, write) = socket.into_split();
+    write.writable().await.unwrap();
+    let (cancel, mut canceled) = watch::channel(false);
+    let peer = Peer {
+        out: Arc::new(Mutex::new(Outbox::default())),
+        ready: Arc::new(Notify::new()),
+        max_pending: 1024,
+        cancel,
+        headers: true,
+        socket: Some(SharedSocketWrite(Arc::new(Mutex::new(write)))),
+    };
+    // A batch removed from frames remains in flight until its complete write.
+    peer.out.lock().unwrap().count = 1;
+    assert!(peer.enqueue(protocol_reply(b"queued", true)));
+    assert_eq!(peer.out.lock().unwrap().count, 2);
+    let mut data = [0; 512];
+    assert_eq!(
+        client.try_read(&mut data).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    *peer.out.lock().unwrap() = Outbox::default();
+    assert!(peer.enqueue(protocol_reply(b"direct", true)));
+    assert_eq!(peer.out.lock().unwrap().count, 0);
+    client.readable().await.unwrap();
+    let n = client.try_read(&mut data).unwrap();
+    assert_eq!(
+        &data[..n],
+        expected(
+            "_INBOX.reply",
+            Some("next"),
+            b"NATS/1.0 200 OK\r\n\r\n",
+            b"direct",
+            "19",
+            true
+        )
+    );
+    let mut limited = peer.clone();
+    limited.max_pending = 1;
+    assert!(!limited.enqueue(protocol_reply(b"over budget", true)));
+    assert!(*canceled.borrow_and_update());
+    peer.close();
+    assert!(!peer.enqueue(protocol_reply(b"closed", true)));
+    assert_eq!(peer.out.lock().unwrap().count, 0);
+    assert_eq!(
+        client.try_read(&mut data).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
 }

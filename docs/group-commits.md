@@ -50,7 +50,7 @@ not provide a disk fence.
 ## Bounds and accounting
 
 A group gathers at most 32 queued requests and 1 MiB of input. Large requests or
-object names use the individual path. Staged output shares channel capacity and an
+object names use the individual path. Staged output is limited to 1,024 messages and an
 8 MiB soft byte budget that a final message can exceed. Internal projections cap
 encoded records at 8192 / 32 MiB. These are work bounds, not a retained-data quota.
 
@@ -86,3 +86,17 @@ With `--unsafe-ack-durability`, consumer-only groups can replace their model and
 release replies while their records remain in the bounded storage buffer. Groups
 containing publications or catalog changes still commit FULL and include the older
 buffered prefix. Periodic flush and shutdown use the same FULL transaction path.
+
+## Output scheduling
+
+After the storage fence, the TCP adapter routes committed output in order directly
+into bounded connection queues. It drains startup output before attaching this
+adapter. Slow recipients retain the existing byte/message limits and disconnect
+policy. The storage worker does not wait for sockets to become writable.
+
+An idle JetStream connection can send a protocol reply of at most 512 encoded bytes
+with one nonblocking write. Deliveries and advisories retain the batching writer.
+Queued or in-flight output prevents this shortcut; a partial reply queues its exact
+remaining suffix before later frames. Core-only connections use their existing
+writer without a shared socket lock. These scheduling choices do not change the
+default FULL commit fence or the explicitly unsafe consumer buffering policy.

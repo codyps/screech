@@ -18,9 +18,11 @@ use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 #[derive(Clone)]
 pub struct Outbound {
     pub target: String,
+    pub protocol_reply: bool,
     pub queue: Option<String>,
     pub message: Message,
 }
+type OutputSink = Arc<dyn Fn(Outbound) -> Result<(), String> + Send + Sync>;
 type Interest = Arc<dyn Fn(&str, Option<&str>) -> bool + Send + Sync>;
 #[derive(Clone)]
 pub struct Handle {
@@ -29,6 +31,7 @@ pub struct Handle {
     catalog_pending: Arc<std::sync::atomic::AtomicUsize>,
     interests: Arc<RwLock<Vec<String>>>,
     output: Arc<Mutex<Option<mpsc::Receiver<Outbound>>>>,
+    sink: Arc<RwLock<Option<OutputSink>>>,
     observer: Arc<RwLock<Option<Interest>>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     done: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
@@ -88,6 +91,7 @@ struct Worker<S> {
     staged_count: Cell<usize>,
     staged_bytes: Cell<usize>,
     output: mpsc::Sender<Outbound>,
+    sink: Arc<RwLock<Option<OutputSink>>>,
     pulls: VecDeque<Pull>,
     observer: Arc<RwLock<Option<Interest>>>,
     interests: Arc<RwLock<Vec<String>>>,
@@ -106,6 +110,8 @@ impl Handle {
         let worker_interests = interests.clone();
         let (tx, rx) = std_mpsc::channel::<Request>();
         let (out, output) = mpsc::channel(1024);
+        let sink = Arc::new(RwLock::new(None));
+        let worker_sink = sink.clone();
         let observer = Arc::new(RwLock::new(None));
         let worker_observer = observer.clone();
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -122,6 +128,7 @@ impl Handle {
                 staged_count: Cell::new(0),
                 staged_bytes: Cell::new(0),
                 output: out,
+                sink: worker_sink,
                 pulls: VecDeque::new(),
                 observer: worker_observer,
                 interests: worker_interests,
@@ -230,6 +237,7 @@ impl Handle {
             catalog_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             interests,
             output: Arc::new(Mutex::new(Some(output))),
+            sink,
             observer,
             stop,
             done: Arc::new(Mutex::new(Some(done_rx))),
@@ -244,6 +252,23 @@ impl Handle {
             .ok_or("Storage worker already attached")?;
         *self.observer.write().unwrap() = Some(observer);
         Ok(output)
+    }
+    pub(crate) fn attach_output(&self, observer: Interest, sink: OutputSink) -> Result<(), String> {
+        // Exclude concurrent sends while draining startup output and installing
+        // the synchronous adapter, so no output may overtake an earlier frame.
+        let mut destination = self.sink.write().unwrap();
+        let mut output = self
+            .output
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or("Storage worker already attached")?;
+        *self.observer.write().unwrap() = Some(observer);
+        while let Ok(frame) = output.try_recv() {
+            sink(frame)?;
+        }
+        *destination = Some(sink);
+        Ok(())
     }
     pub async fn shutdown(&self) {
         self.stop.store(true, std::sync::atomic::Ordering::Release);
@@ -577,17 +602,33 @@ impl<S: Store> Worker<S> {
     }
     fn output_capacity(&self) -> usize {
         if self.plan.is_none() {
-            return self.output.capacity();
+            return self.available_output();
         }
         if self.staged_bytes.get() >= 8 * 1024 * 1024 {
             0
         } else {
-            self.output
-                .capacity()
+            self.available_output()
                 .saturating_sub(self.staged_count.get())
         }
     }
 
+    fn available_output(&self) -> usize {
+        if self.sink.read().unwrap().is_some() {
+            1024
+        } else {
+            self.output.capacity()
+        }
+    }
+    fn dispatch(&self, message: Outbound) -> Result<(), String> {
+        let destination = self.sink.read().unwrap();
+        if let Some(sink) = destination.as_ref() {
+            sink(message)
+        } else {
+            self.output
+                .try_send(message)
+                .map_err(|_| "Durable output queue full or closed".into())
+        }
+    }
     fn send(&self, message: Outbound) -> Result<(), String> {
         if self.plan.is_some() {
             if self.output_capacity() == 0 {
@@ -607,9 +648,7 @@ impl<S: Store> Worker<S> {
             self.effects.borrow_mut().push(Effect::Message(message));
             Ok(())
         } else {
-            self.output
-                .try_send(message)
-                .map_err(|_| "Durable output queue full or closed".into())
+            self.dispatch(message)
         }
     }
     #[cfg(feature = "fault-injection")]
@@ -690,7 +729,7 @@ impl<S: Store> Worker<S> {
                     #[cfg(feature = "fault-injection")]
                     Effect::Point(name) => crate::fault::point(name),
                     Effect::Message(out) => {
-                        if self.output.try_send(out).is_err() {
+                        if self.dispatch(out).is_err() {
                             committed = Err("Durable output queue full or closed".into());
                             break;
                         }
@@ -715,6 +754,7 @@ impl<S: Store> Worker<S> {
     fn emit_to(&self, target: String, message: Message) -> Result<(), String> {
         self.send(Outbound {
             target,
+            protocol_reply: true,
             queue: None,
             message,
         })
@@ -787,7 +827,12 @@ impl<S: Store> Worker<S> {
                     format!("$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.{stream}.{consumer}"),
                     json!({"type":"io.nats.jetstream.advisory.v1.max_deliver","id":format!("{generation}-{sequence}"),"timestamp":timestamp(time),"stream":stream,"consumer":consumer,"stream_seq":sequence,"deliveries":attempts}),
                 );
-                if let Err(error) = self.emit(advisory) {
+                if let Err(error) = self.send(Outbound {
+                    target: advisory.subject.clone(),
+                    protocol_reply: false,
+                    queue: None,
+                    message: advisory,
+                }) {
                     tracing::warn!(%error,"consumer delivery-limit advisory dropped");
                 }
             }
@@ -1416,6 +1461,7 @@ impl<S: Store> Worker<S> {
         };
         self.send(Outbound {
             target: target.into(),
+            protocol_reply: false,
             queue: c.config.deliver_group.clone(),
             message: Message {
                 subject: m.subject,
@@ -1684,5 +1730,77 @@ impl<S: Store> Worker<S> {
             progressed |= p.remaining < before;
         }
         Ok(progressed)
+    }
+}
+
+#[cfg(test)]
+mod output_adapter_tests {
+    use super::*;
+
+    fn info(inbox: &str) -> Message {
+        Message {
+            subject: "$JS.API.INFO".into(),
+            reply: Some(inbox.into()),
+            headers: Bytes::new(),
+            payload: Bytes::from_static(b"{}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_adapter_drains_startup_output_before_live_replies_and_attaches_once() {
+        let handle = Handle::start(crate::storage::MemoryStore::default()).unwrap();
+        for i in 0..8 {
+            assert!(handle.request(info(&format!("_INBOX.{i}"))).await.unwrap());
+        }
+        let pending: Vec<_> = (8..32)
+            .map(|i| handle.try_request(info(&format!("_INBOX.{i}"))).unwrap())
+            .collect();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = seen.clone();
+        handle
+            .attach_output(
+                Arc::new(|_, _| true),
+                Arc::new(move |out| {
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push((out.target, out.protocol_reply));
+                    Ok(())
+                }),
+            )
+            .unwrap();
+        for request in pending {
+            assert!(request.wait().await.unwrap());
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            (0..32)
+                .map(|i| (format!("_INBOX.{i}"), true))
+                .collect::<Vec<_>>()
+        );
+        assert!(handle.take_output(Arc::new(|_, _| true)).is_err());
+        assert!(handle
+            .attach_output(Arc::new(|_, _| true), Arc::new(|_| Ok(())))
+            .is_err());
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn direct_adapter_propagates_dispatch_failure_and_cannot_replace_a_receiver() {
+        let handle = Handle::start(crate::storage::MemoryStore::default()).unwrap();
+        handle
+            .attach_output(
+                Arc::new(|_, _| true),
+                Arc::new(|_| Err("adapter stopped".into())),
+            )
+            .unwrap();
+        assert!(handle.request(info("_INBOX.failure")).await.is_err());
+        handle.shutdown().await;
+        let handle = Handle::start(crate::storage::MemoryStore::default()).unwrap();
+        let _receiver = handle.take_output(Arc::new(|_, _| true)).unwrap();
+        assert!(handle
+            .attach_output(Arc::new(|_, _| true), Arc::new(|_| Ok(())))
+            .is_err());
+        handle.shutdown().await;
     }
 }

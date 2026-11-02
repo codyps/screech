@@ -53,6 +53,7 @@ jobs:
           PROPTEST_CASES=1024 cargo test --locked --all-features --test durable_model ack_floors_refine
           PROPTEST_CASES=1024 cargo test --locked --all-features --test durable_model mixed_ack_batches_refine
           PROPTEST_CASES=1024 cargo test --locked --all-features --test core_model token_index_refines
+          PROPTEST_CASES=1024 cargo test --locked --all-features --lib immediate_reply_partial
           PROPTEST_CASES=1024 cargo test --locked --all-features --lib partial_output_refines
           PROPTEST_CASES=1024 cargo test --locked --all-features --lib core_burst_refines
           PROPTEST_CASES=4096 cargo test --locked --all-features --test protocol subject_validation

@@ -165,6 +165,11 @@ partial writes before/within/across vectors, interrupted/zero writes and backend
 without vectored writes. Mixed control frames must remain ordered. Large-header,
 empty-body and multi-vector batches check framing and lifetime boundaries.
 
+Immediate-reply properties exercise every partial-write offset, binary payloads,
+headers, retryable errors and fatal writes. Socket tests check in-flight credit,
+closed connections and admission limits. Adapter tests check ordered startup drain
+while live replies arrive, exclusive attachment and dispatch failures.
+
 A bounded duplex transport stalls after a partial write to verify that in-flight
 bytes/counts remain charged until completion and that the existing write deadline
 closes a stalled writer. Network tests fragment mixed PUB/HPUB inputs across read

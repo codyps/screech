@@ -10,12 +10,14 @@ use std::{
     io::{self, IoSlice},
     net::SocketAddr,
     ops::Range,
+    pin::Pin,
     sync::{Arc, Mutex, MutexGuard},
+    task::{Context, Poll},
     time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{tcp::OwnedWriteHalf, TcpListener, TcpStream},
     sync::{watch, Notify, Semaphore},
     task::JoinSet,
     time::{timeout, Instant},
@@ -72,13 +74,14 @@ struct MessageParts<'a> {
 }
 enum OutboundMessage {
     Owned(Message),
+    Reply(Message),
     Wire(WireMessage),
 }
 impl OutboundMessage {
     #[inline(always)]
     fn parts(&self) -> MessageParts<'_> {
         match self {
-            Self::Owned(m) => MessageParts {
+            Self::Owned(m) | Self::Reply(m) => MessageParts {
                 subject: m.subject.as_bytes(),
                 reply: m.reply.as_deref().map(str::as_bytes),
                 headers: &m.headers,
@@ -224,6 +227,7 @@ struct Outbox {
     bytes: usize,
     count: usize,
     closed: bool,
+    reply_scratch: Vec<u8>,
 }
 #[derive(Clone)]
 struct Peer {
@@ -232,6 +236,36 @@ struct Peer {
     max_pending: usize,
     cancel: watch::Sender<bool>,
     headers: bool,
+    socket: Option<SharedSocketWrite>,
+}
+
+// Both paths serialize writes through this lock, which is held only for a poll.
+#[derive(Clone)]
+struct SharedSocketWrite(Arc<Mutex<OwnedWriteHalf>>);
+impl AsyncWrite for SharedSocketWrite {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *self.0.lock().unwrap()).poll_write(cx, bytes)
+    }
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut *self.0.lock().unwrap()).poll_write_vectored(cx, bytes)
+    }
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.0.lock().unwrap()).poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.0.lock().unwrap()).poll_shutdown(cx)
+    }
 }
 // Wake receivers after routing the available input burst. Dropping on any
 // early return still wakes every accepted delivery before connection cleanup.
@@ -284,7 +318,7 @@ impl Peer {
     fn enqueue(&self, frame: Queued) -> bool {
         self.enqueue_with_wakes(frame, None)
     }
-    fn enqueue_with_wakes(&self, frame: Queued, wakes: Option<&mut DeliveryWakes>) -> bool {
+    fn enqueue_with_wakes(&self, mut frame: Queued, wakes: Option<&mut DeliveryWakes>) -> bool {
         let mut out = self.out.lock().unwrap();
         if out.closed {
             return false;
@@ -293,6 +327,26 @@ impl Peer {
             drop(out);
             self.cancel.send_replace(true);
             return false;
+        }
+        // Count includes the writer's in-flight batch. Only an idle socket may
+        // send a small protocol reply directly; deliveries retain coalescing.
+        if out.count == 0 {
+            if let Some(shared) = &self.socket {
+                match try_small_reply(&mut frame, &mut out.reply_scratch, |bytes| {
+                    match shared.0.try_lock() {
+                        Ok(socket) => socket.try_write(bytes),
+                        Err(_) => Err(io::ErrorKind::WouldBlock.into()),
+                    }
+                }) {
+                    Ok(true) => return true,
+                    Ok(false) => {}
+                    Err(_) => {
+                        drop(out);
+                        self.cancel.send_replace(true);
+                        return false;
+                    }
+                }
+            }
         }
         let wake = out.frames.is_empty();
         out.bytes += frame.size;
@@ -320,11 +374,18 @@ impl Hub {
         target: &str,
         queue: Option<&str>,
         msg: &Message,
+        protocol_reply: bool,
     ) -> usize {
         let mut shared = None;
         self.route(publisher, target.as_bytes(), queue, None, || {
             shared
-                .get_or_insert_with(|| Arc::new(OutboundMessage::Owned(msg.clone())))
+                .get_or_insert_with(|| {
+                    Arc::new(if protocol_reply {
+                        OutboundMessage::Reply(msg.clone())
+                    } else {
+                        OutboundMessage::Owned(msg.clone())
+                    })
+                })
                 .clone()
         })
     }
@@ -502,6 +563,54 @@ impl BurstOutboxes<'_, '_> {
         }
     }
 }
+// Return true only when the complete frame was sent. A partial write replaces
+// the frame with its exact suffix for the ordinary writer, preserving ordering.
+fn try_small_reply(
+    frame: &mut Queued,
+    scratch: &mut Vec<u8>,
+    mut write: impl FnMut(&[u8]) -> io::Result<usize>,
+) -> io::Result<bool> {
+    if frame.size > 512 {
+        return Ok(false);
+    }
+    let FrameData::Delivery {
+        message,
+        sid,
+        headers,
+    } = &frame.data
+    else {
+        return Ok(false);
+    };
+    if !matches!(message.as_ref(), OutboundMessage::Reply(_)) {
+        return Ok(false);
+    }
+    scratch.clear();
+    encode_into(scratch, &message.parts(), sid, *headers);
+    debug_assert_eq!(scratch.len(), frame.size);
+    match write(scratch) {
+        Ok(n) if n == scratch.len() => Ok(true),
+        Ok(n) if n > 0 && n < scratch.len() => {
+            let remainder = Bytes::copy_from_slice(&scratch[n..]);
+            *frame = Queued {
+                size: remainder.len(),
+                data: FrameData::Raw(remainder),
+            };
+            Ok(false)
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e),
+        Ok(0) => Err(io::ErrorKind::WriteZero.into()),
+        Ok(_) => Err(io::ErrorKind::InvalidData.into()),
+    }
+}
+
 fn queued_delivery(message: Arc<OutboundMessage>, sid: Arc<str>, headers: bool) -> Queued {
     Queued {
         size: wire_size(&message, &sid, headers),
@@ -860,23 +969,28 @@ impl Server {
             core: Core::default(),
             peers: HashMap::new(),
         }));
-        let mut output_task = None;
         if let Some(js) = &self.config.jetstream {
             let weak = Arc::downgrade(&hub);
-            let mut output = js
-                .take_output(Arc::new(move |target, queue| {
+            let output_hub = Arc::downgrade(&hub);
+            js.attach_output(
+                Arc::new(move |target, queue| {
                     weak.upgrade().is_some_and(|h| {
                         h.lock().unwrap().core.has_interest_in_queue(target, queue)
                     })
-                }))
-                .map_err(io::Error::other)?;
-            let output_hub = hub.clone();
-            let mut stop = shutdown.clone();
-            output_task = Some(tokio::spawn(async move {
-                loop {
-                    tokio::select! {biased;_=stop.changed()=>break,frame=output.recv()=>{let Some(frame)=frame else{break;};output_hub.lock().unwrap().publish_to_queue(0,&frame.target,frame.queue.as_deref(),&frame.message);}}
-                }
-            }));
+                }),
+                Arc::new(move |frame| {
+                    let h = output_hub.upgrade().ok_or("Server stopped")?;
+                    h.lock().unwrap().publish_to_queue(
+                        0,
+                        &frame.target,
+                        frame.queue.as_deref(),
+                        &frame.message,
+                        frame.protocol_reply,
+                    );
+                    Ok(())
+                }),
+            )
+            .map_err(io::Error::other)?;
         }
         let slots = Arc::new(Semaphore::new(self.config.max_connections));
         let config = Arc::new(self.config);
@@ -910,10 +1024,6 @@ impl Server {
             }
         }
         while tasks.join_next().await.is_some() {}
-        if let Some(task) = output_task {
-            task.abort();
-            let _ = task.await;
-        }
         if let Some(js) = &config.jetstream {
             js.shutdown().await;
         }
@@ -953,6 +1063,11 @@ async fn connection(
     .await??;
     let (read, write) = socket.into_split();
     let mut read = read;
+    let mut write = Some(write);
+    let shared_write = config
+        .jetstream
+        .as_ref()
+        .map(|_| SharedSocketWrite(Arc::new(Mutex::new(write.take().unwrap()))));
 
     let (cancel, mut canceled) = watch::channel(false);
     let peer = Peer {
@@ -961,6 +1076,7 @@ async fn connection(
         max_pending: config.max_pending,
         cancel,
         headers: false,
+        socket: shared_write.clone(),
     };
     {
         let mut h = hub.lock().unwrap();
@@ -974,7 +1090,11 @@ async fn connection(
     // A separate writer ensures stalled recipients cannot block a publisher's read loop.
     let deadline = config.write_deadline;
     let writer_peer = peer.clone();
-    let writer = tokio::spawn(writer_loop(write, writer_peer, deadline));
+    let writer = if let Some(shared) = shared_write {
+        tokio::spawn(writer_loop(shared, writer_peer, deadline))
+    } else {
+        tokio::spawn(writer_loop(write.unwrap(), writer_peer, deadline))
+    };
     let mut writer = WriterGuard {
         task: writer,
         peer: peer.clone(),
