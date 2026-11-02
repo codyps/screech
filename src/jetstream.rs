@@ -128,15 +128,35 @@ impl Handle {
             };
             let mut deferred = None;
             let mut idle_wait = Duration::from_millis(10);
+            let mut spin_after_ack = false;
             loop {
                 if worker_stop.load(std::sync::atomic::Ordering::Acquire) {
                     break;
                 }
-                match deferred
-                    .take()
-                    .map(Ok)
-                    .unwrap_or_else(|| rx.recv_timeout(idle_wait))
-                {
+                let next = deferred.take().map(Ok).unwrap_or_else(|| {
+                    if spin_after_ack {
+                        // A confirmed buffered ACK often precedes the next Fetch(1).
+                        // Briefly poll to avoid a sleep/wakeup on that round trip;
+                        // idle connections and strictly durable stores still sleep.
+                        let until = std::time::Instant::now() + Duration::from_micros(16);
+                        loop {
+                            match rx.try_recv() {
+                                Ok(request) => return Ok(request),
+                                Err(std_mpsc::TryRecvError::Disconnected) => {
+                                    return Err(std_mpsc::RecvTimeoutError::Disconnected)
+                                }
+                                Err(std_mpsc::TryRecvError::Empty) => (),
+                            }
+                            if std::time::Instant::now() >= until {
+                                break;
+                            }
+                            std::hint::spin_loop();
+                        }
+                    }
+                    rx.recv_timeout(idle_wait)
+                });
+                spin_after_ack = false;
+                match next {
                     Ok(req) if worker.groupable(&req.message) => {
                         crate::fault::group_gate();
                         let mut bytes = req.message.payload.len() + req.message.headers.len();
@@ -164,7 +184,8 @@ impl Handle {
                         let active_consumers = !worker.pulls.is_empty() || worker.has_push();
                         if requests.iter().all(|req| simple_ack(&req.message)) && !active_consumers
                         {
-                            worker.ack_requests(requests);
+                            spin_after_ack = worker.ack_requests(requests)
+                                && worker.engine.buffers_consumer_state();
                         } else if worker.engine.supports_groups()
                             && (requests.len() > 1 || active_consumers)
                         {
@@ -1400,8 +1421,9 @@ impl<S: Store> Worker<S> {
     }
 
     fn prepare_ack_message(&self, msg: &Message) -> Option<(Event, Option<Value>)> {
-        let t: Vec<_> = msg.subject.split('.').collect();
-        if t.len() != 12 {
+        let mut parts = msg.subject.split('.');
+        let t: [&str; 12] = std::array::from_fn(|_| parts.next().unwrap_or(""));
+        if parts.next().is_some() {
             return None;
         }
         let (Ok(sgen), Ok(generation), Ok(sequence), Ok(cseq)) = (
@@ -1522,7 +1544,7 @@ impl<S: Store> Worker<S> {
         }
         Ok(true)
     }
-    fn ack_requests(&mut self, requests: Vec<Request>) {
+    fn ack_requests(&mut self, requests: Vec<Request>) -> bool {
         let mut events = Vec::with_capacity(requests.len());
         let mut valid = Vec::with_capacity(requests.len());
         for request in requests {
@@ -1534,7 +1556,7 @@ impl<S: Store> Worker<S> {
             }
         }
         if events.is_empty() {
-            return;
+            return false;
         }
         let event = if events.len() == 1 {
             events.pop().unwrap()
@@ -1542,7 +1564,9 @@ impl<S: Store> Worker<S> {
             Event::AckBatch { events }
         };
         let result = self.commit(event);
+        let mut replied = false;
         for request in valid {
+            let has_reply = request.message.reply.is_some();
             let result = result.clone().and_then(|()| {
                 self.after_commit_point("before_ack_reply");
                 if let Some(reply) = request.message.reply {
@@ -1555,8 +1579,10 @@ impl<S: Store> Worker<S> {
                 }
                 Ok(true)
             });
+            replied |= has_reply && result.is_ok();
             let _ = request.response.send(result);
         }
+        replied
     }
     fn maintain(&mut self) -> Result<bool, String> {
         if self.engine.is_poisoned() {

@@ -4,6 +4,7 @@
 use bytes::Bytes;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::{
+    cell::RefCell,
     collections::BTreeMap,
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
@@ -29,7 +30,7 @@ pub struct Record {
     pub payload: Bytes,
 }
 /// Input records for one atomic durable transaction. Success covers every record.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Append {
     pub subject: String,
     pub headers: Bytes,
@@ -77,6 +78,9 @@ pub trait Store: Send {
         }
     }
     fn supports_batch(&self) -> bool {
+        false
+    }
+    fn buffers_consumer_state(&self) -> bool {
         false
     }
     /// Consumer-only transitions. Backends remain strictly durable by default.
@@ -225,6 +229,23 @@ impl Store for MemoryStore {
         Ok(())
     }
 }
+const UNSAFE_CONSUMER_RECORDS: usize = 1024;
+struct ConsumerBlock {
+    first: u64,
+    records: Vec<Append>,
+}
+impl ConsumerBlock {
+    fn get(&self, sequence: u64) -> Option<Record> {
+        let index = usize::try_from(sequence.checked_sub(self.first)?).ok()?;
+        let r = self.records.get(index)?;
+        Some(Record {
+            sequence,
+            subject: r.subject.clone(),
+            headers: r.headers.clone(),
+            payload: r.payload.clone(),
+        })
+    }
+}
 pub struct SqliteStore {
     connection: Connection,
     _lock: File,
@@ -233,6 +254,7 @@ pub struct SqliteStore {
     buffered_since: Option<std::time::Instant>,
     buffered_consumer: Vec<Append>,
     buffered_bytes: usize,
+    consumer_cache: RefCell<Option<ConsumerBlock>>,
 }
 fn checksum(sequence: u64, subject: &str, headers: &[u8], payload: &[u8]) -> u32 {
     let mut h = crc32fast::Hasher::new();
@@ -257,8 +279,29 @@ impl SqliteStore {
             .checked_add((self.buffered_consumer.len() + records.len()) as u64)
             .filter(|n| *n <= i64::MAX as u64)
             .ok_or(StoreError::Invalid)?;
+        let block = if self.buffered_consumer.is_empty() {
+            None
+        } else {
+            Some(postcard::to_allocvec(&self.buffered_consumer).map_err(|_| StoreError::Invalid)?)
+        };
         let tx = self.connection.transaction()?;
         {
+            if let Some(block) = &block {
+                let first = last + 1;
+                let through = last + self.buffered_consumer.len() as u64;
+                tx.prepare_cached("INSERT INTO consumer_blocks VALUES(?1,?2,?3,?4)")?
+                    .execute(params![
+                        first as i64,
+                        through as i64,
+                        block,
+                        checksum(
+                            first,
+                            "$SCREECH.consumer-block.v1",
+                            &through.to_le_bytes(),
+                            block
+                        )
+                    ])?;
+            }
             let mut insert =
                 tx.prepare_cached("INSERT INTO retained_content VALUES(?1,?2,?3,?4,?5,?6)")?;
             for c in content {
@@ -272,8 +315,8 @@ impl SqliteStore {
                 ])?;
             }
             let mut insert = tx.prepare_cached("INSERT INTO messages VALUES(?1,?2,?3,?4,?5)")?;
-            for (offset, r) in self.buffered_consumer.iter().chain(records).enumerate() {
-                let seq = last + offset as u64 + 1;
+            for (offset, r) in records.iter().enumerate() {
+                let seq = last + self.buffered_consumer.len() as u64 + offset as u64 + 1;
                 insert.execute(params![
                     seq as i64,
                     r.subject,
@@ -283,8 +326,13 @@ impl SqliteStore {
                 ])?;
             }
         }
+        let update = if block.is_some() {
+            "UPDATE meta SET version=2,last_seq=?1 WHERE id=1 AND last_seq=?2"
+        } else {
+            "UPDATE meta SET last_seq=?1 WHERE id=1 AND last_seq=?2"
+        };
         if tx
-            .prepare_cached("UPDATE meta SET last_seq=?1 WHERE id=1 AND last_seq=?2")?
+            .prepare_cached(update)?
             .execute([end as i64, last as i64])?
             != 1
         {
@@ -305,12 +353,58 @@ impl SqliteStore {
         self.buffered_bytes = 0;
         Ok(end)
     }
+    fn get_consumer_record(&self, sequence: u64) -> Result<Option<Record>, StoreError> {
+        if let Some(record) = self
+            .consumer_cache
+            .borrow()
+            .as_ref()
+            .and_then(|b| b.get(sequence))
+        {
+            return Ok(Some(record));
+        }
+        let row = self.connection.prepare_cached("SELECT first_seq,last_seq,data,checksum FROM consumer_blocks WHERE first_seq<=?1 ORDER BY first_seq DESC LIMIT 1")?.query_row([sequence as i64],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,Vec<u8>>(2)?,r.get::<_,u32>(3)?))).optional()?;
+        let Some((first, through, data, crc)) = row else {
+            return Ok(None);
+        };
+        let first = u64::try_from(first).map_err(|_| StoreError::Corrupt(sequence))?;
+        let through = u64::try_from(through).map_err(|_| StoreError::Corrupt(sequence))?;
+        if through < sequence {
+            return Ok(None);
+        }
+        if through < first
+            || through > self.last
+            || through - first + 1 > UNSAFE_CONSUMER_RECORDS as u64
+            || data.len() > 1024 * 1024
+            || checksum(
+                first,
+                "$SCREECH.consumer-block.v1",
+                &through.to_le_bytes(),
+                &data,
+            ) != crc
+        {
+            return Err(StoreError::Corrupt(sequence));
+        }
+        let (count, _) =
+            postcard::take_from_bytes::<usize>(&data).map_err(|_| StoreError::Corrupt(sequence))?;
+        if count as u64 != through - first + 1 {
+            return Err(StoreError::Corrupt(sequence));
+        }
+        let (records, remaining): (Vec<Append>, _) =
+            postcard::take_from_bytes(&data).map_err(|_| StoreError::Corrupt(sequence))?;
+        if !remaining.is_empty() || records.len() != count {
+            return Err(StoreError::Corrupt(sequence));
+        }
+        let block = ConsumerBlock { first, records };
+        let record = block.get(sequence).ok_or(StoreError::Corrupt(sequence))?;
+        *self.consumer_cache.borrow_mut() = Some(block);
+        Ok(Some(record))
+    }
     /// Opt in to acknowledging consumer state before a durable flush.
     /// Publication/content appends and checkpoints still use FULL synchronization.
     pub fn open_with_unsafe_ack_durability(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let mut store = Self::open(path)?;
         store.unsafe_ack_durability = true;
-        store.buffered_consumer = Vec::with_capacity(256);
+        store.buffered_consumer = Vec::with_capacity(UNSAFE_CONSUMER_RECORDS);
         Ok(store)
     }
     /// Use a pre-existing data directory. Lock prevents two servers owning one log.
@@ -357,9 +451,10 @@ impl SqliteStore {
         }
         conn.execute_batch("CREATE TABLE IF NOT EXISTS meta (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, last_seq INTEGER NOT NULL CHECK(last_seq>=0)); INSERT OR IGNORE INTO meta VALUES(1,1,0); CREATE TABLE IF NOT EXISTS snapshot(id INTEGER PRIMARY KEY CHECK(id=1), seq INTEGER NOT NULL, data BLOB NOT NULL, checksum INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS messages(seq INTEGER PRIMARY KEY CHECK(seq>0), subject TEXT NOT NULL, headers BLOB NOT NULL, payload BLOB NOT NULL, checksum INTEGER NOT NULL);")?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS retained_content(generation INTEGER NOT NULL CHECK(generation>0),seq INTEGER NOT NULL CHECK(seq>0),subject TEXT NOT NULL,headers BLOB NOT NULL,payload BLOB NOT NULL,checksum INTEGER NOT NULL,PRIMARY KEY(generation,seq)) WITHOUT ROWID; CREATE INDEX IF NOT EXISTS retained_content_keys ON retained_content(generation,seq);")?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS consumer_blocks(first_seq INTEGER PRIMARY KEY CHECK(first_seq>0),last_seq INTEGER NOT NULL CHECK(last_seq>=first_seq),data BLOB NOT NULL CHECK(length(data)<=1048576),checksum INTEGER NOT NULL);")?;
         let version: i64 =
             conn.query_row("SELECT version FROM meta WHERE id=1", [], |r| r.get(0))?;
-        if version != 1 {
+        if ![1, 2].contains(&version) {
             return Err(StoreError::Invalid);
         }
         let check: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
@@ -390,6 +485,7 @@ impl SqliteStore {
             buffered_since: None,
             buffered_consumer: Vec::new(),
             buffered_bytes: 0,
+            consumer_cache: RefCell::new(None),
         };
         let last = store.last_sequence()?;
         let mut stmt = store
@@ -404,10 +500,37 @@ impl SqliteStore {
             store.get(seq)?;
         }
         drop(stmt);
+        let mut stmt = store
+            .connection
+            .prepare("SELECT first_seq,last_seq FROM consumer_blocks ORDER BY first_seq")?;
+        let ranges = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut previous = 0;
+        for range in ranges {
+            let (first, through) = range?;
+            let (first, through) = (
+                u64::try_from(first).map_err(|_| StoreError::Corrupt(0))?,
+                u64::try_from(through).map_err(|_| StoreError::Corrupt(0))?,
+            );
+            if version < 2 || first <= previous || through < first || through > last {
+                return Err(StoreError::Corrupt(first));
+            }
+            store
+                .get_consumer_record(first)?
+                .ok_or(StoreError::Corrupt(first))?;
+            previous = through;
+        }
+        let overlap:bool=store.connection.query_row("SELECT EXISTS(SELECT 1 FROM consumer_blocks b JOIN messages m ON m.seq BETWEEN b.first_seq AND b.last_seq)",[],|r|r.get(0))?;
+        if overlap {
+            return Err(StoreError::Corrupt(0));
+        }
+        drop(stmt);
         Ok(store)
     }
 }
 impl Store for SqliteStore {
+    fn buffers_consumer_state(&self) -> bool {
+        self.unsafe_ack_durability
+    }
     fn append_consumer_state(&mut self, records: &[Append]) -> Result<u64, StoreError> {
         if records.is_empty() {
             return Err(StoreError::Invalid);
@@ -421,10 +544,10 @@ impl Store for SqliteStore {
                 .saturating_add(r.payload.len())
                 .saturating_add(std::mem::size_of::<Append>())
         });
-        if records.len() > 256 || bytes > 1024 * 1024 {
+        if records.len() > UNSAFE_CONSUMER_RECORDS || bytes > 1024 * 1024 {
             return self.append_transaction(records, &[]);
         }
-        if self.buffered_consumer.len() + records.len() > 256
+        if self.buffered_consumer.len() + records.len() > UNSAFE_CONSUMER_RECORDS
             || self.buffered_bytes.saturating_add(bytes) > 1024 * 1024
         {
             self.flush_consumer_state(true)?;
@@ -591,9 +714,14 @@ impl Store for SqliteStore {
         }
         tx.execute("INSERT INTO snapshot VALUES(1,?1,?2,?3) ON CONFLICT(id) DO UPDATE SET seq=excluded.seq,data=excluded.data,checksum=excluded.checksum",params![sequence as i64,state,checksum(sequence,"$SCREECH.snapshot.v2",&[],state)])?;
         tx.execute("DELETE FROM messages WHERE seq<=?1", [sequence as i64])?;
+        tx.execute(
+            "DELETE FROM consumer_blocks WHERE last_seq<=?1",
+            [sequence as i64],
+        )?;
         tx.execute("DELETE FROM retained_content WHERE (generation,seq) IN (SELECT c.generation,c.seq FROM retained_content c INDEXED BY retained_content_keys WHERE NOT EXISTS(SELECT 1 FROM live_content l WHERE l.generation=c.generation AND l.seq=c.seq))",[])?;
         crate::fault::point("before_checkpoint_commit");
         tx.commit()?;
+        self.consumer_cache.get_mut().take();
         crate::fault::point("after_checkpoint_commit");
         crate::fault::point("before_wal_restart");
         let (busy, _, _): (i64, i64, i64) =
@@ -654,8 +782,13 @@ impl Store for SqliteStore {
         let tx = self.connection.transaction()?;
         tx.execute("INSERT INTO snapshot VALUES(1,?1,?2,?3) ON CONFLICT(id) DO UPDATE SET seq=excluded.seq,data=excluded.data,checksum=excluded.checksum",params![sequence as i64,state,checksum(sequence,"$SCREECH.snapshot.v2",&[],state)])?;
         tx.execute("DELETE FROM messages WHERE seq<=?1", [sequence as i64])?;
+        tx.execute(
+            "DELETE FROM consumer_blocks WHERE last_seq<=?1",
+            [sequence as i64],
+        )?;
         crate::fault::point("before_checkpoint_commit");
         tx.commit()?;
+        self.consumer_cache.get_mut().take();
         crate::fault::point("after_checkpoint_commit");
         crate::fault::point("before_wal_restart");
         // RESTART synchronizes the database before allowing WAL reuse. Keeping a
@@ -713,6 +846,15 @@ impl Store for SqliteStore {
         Ok(seq)
     }
     fn get(&self, sequence: u64) -> Result<Option<Record>, StoreError> {
+        if let Some(record) = self
+            .consumer_cache
+            .borrow()
+            .as_ref()
+            .and_then(|b| b.get(sequence))
+        {
+            return Ok(Some(record));
+        }
+
         if sequence > self.last {
             if let Some(r) = self
                 .buffered_consumer
@@ -745,18 +887,20 @@ impl Store for SqliteStore {
                 },
             )
             .optional()?;
-        row.map(|(subject, headers, payload, crc)| {
+        let Some((subject, headers, payload, crc)) = row else {
+            return self.get_consumer_record(sequence);
+        };
+        {
             if checksum(sequence, &subject, &headers, &payload) != crc {
                 return Err(StoreError::Corrupt(sequence));
             }
-            Ok(Record {
+            Ok(Some(Record {
                 sequence,
                 subject,
                 headers: headers.into(),
                 payload: payload.into(),
-            })
-        })
-        .transpose()
+            }))
+        }
     }
     fn last_sequence(&self) -> Result<u64, StoreError> {
         let persisted = u64::try_from(self.connection.query_row(
@@ -773,8 +917,10 @@ impl Store for SqliteStore {
         self.flush_consumer_state(true)?;
         let tx = self.connection.transaction()?;
         tx.execute("DELETE FROM messages", [])?;
+        tx.execute("DELETE FROM consumer_blocks", [])?;
         crate::fault::point("before_purge_commit");
         tx.commit()?;
+        self.consumer_cache.get_mut().take();
         crate::fault::point("after_purge_commit");
         Ok(())
     }
@@ -933,7 +1079,7 @@ mod unsafe_ack_tests {
             headers: Bytes::new(),
             payload: Bytes::from_static(b"ack"),
         };
-        for sequence in 1..=257 {
+        for sequence in 1..=1025 {
             assert_eq!(
                 store
                     .append_consumer_state(std::slice::from_ref(&record))
@@ -941,14 +1087,17 @@ mod unsafe_ack_tests {
                 sequence
             );
             assert_eq!(store.last_sequence().unwrap(), sequence);
+            if sequence <= 1024 {
+                assert_eq!(store.last, 0);
+            }
             assert_eq!(store.get(sequence).unwrap().unwrap().payload, b"ack"[..]);
         }
-        assert_eq!(store.last, 256);
+        assert_eq!(store.last, 1024);
         assert_eq!(store.buffered_consumer.len(), 1);
         store.buffered_since =
             Some(std::time::Instant::now() - std::time::Duration::from_millis(60));
         store.flush_consumer_state(false).unwrap();
-        assert_eq!(store.last, 257);
+        assert_eq!(store.last, 1025);
         assert!(store.buffered_consumer.is_empty());
         let large = Append {
             headers: Bytes::from(vec![0; 600 * 1024]),
@@ -960,12 +1109,12 @@ mod unsafe_ack_tests {
         store
             .append_consumer_state(std::slice::from_ref(&large))
             .unwrap();
-        assert_eq!(store.last, 258);
+        assert_eq!(store.last, 1026);
         assert_eq!(store.buffered_consumer.len(), 1);
-        store.checkpoint(259, b"state").unwrap();
-        assert_eq!(store.last, 259);
+        store.checkpoint(1027, b"state").unwrap();
+        assert_eq!(store.last, 1027);
         assert!(store.buffered_consumer.is_empty());
-        assert_eq!(store.load_checkpoint().unwrap().unwrap().0, 259);
+        assert_eq!(store.load_checkpoint().unwrap().unwrap().0, 1027);
     }
     #[test]
     fn invalid_buffered_commit_does_not_change_synchronous_policy() {
@@ -982,5 +1131,143 @@ mod unsafe_ack_tests {
         );
         assert!(store.buffered_since.is_none());
         store.append("publish", b"", b"body").unwrap();
+    }
+}
+
+#[cfg(test)]
+mod consumer_block_tests {
+    use super::*;
+    fn records() -> Vec<Append> {
+        (0..3)
+            .map(|i| Append {
+                subject: format!("consumer.{i}"),
+                headers: Bytes::from(vec![i; 3]),
+                payload: Bytes::from(vec![i + 1; 7]),
+            })
+            .collect()
+    }
+    #[test]
+    fn blocks_preserve_logical_positions_across_publish_checkpoint_purge_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let rows = records();
+        let mut store = SqliteStore::open_with_unsafe_ack_durability(&path).unwrap();
+        assert_eq!(store.append_consumer_state(&rows).unwrap(), 3);
+        assert_eq!(store.append("publish", b"", b"body").unwrap(), 4);
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT version FROM meta", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM consumer_blocks", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT count(*) FROM messages", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        drop(store);
+        let mut store = SqliteStore::open_with_unsafe_ack_durability(&path).unwrap();
+        for sequence in [3, 1, 2] {
+            let got = store.get(sequence).unwrap().unwrap();
+            let expected = &rows[sequence as usize - 1];
+            assert_eq!(
+                (&got.subject, &got.headers, &got.payload),
+                (&expected.subject, &expected.headers, &expected.payload)
+            );
+        }
+        assert_eq!(store.get(4).unwrap().unwrap().payload, b"body"[..]);
+        store.checkpoint(4, b"snapshot").unwrap();
+        assert!(store.get(1).unwrap().is_none());
+        assert!(store.get(4).unwrap().is_none());
+        assert_eq!(store.append_consumer_state(&rows).unwrap(), 7);
+        store.flush_consumer_state(true).unwrap();
+        assert!(store.get(6).unwrap().is_some());
+        store.purge().unwrap();
+        assert!(store.get(6).unwrap().is_none());
+        assert_eq!(store.last_sequence().unwrap(), 7);
+        drop(store);
+        assert_eq!(SqliteStore::open(path).unwrap().last_sequence().unwrap(), 7);
+    }
+    #[test]
+    fn corrupt_or_noncanonical_blocks_fail_closed_before_allocating_unbounded_records() {
+        for mutation in 0..7 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("store");
+            let rows = records();
+            let mut store = SqliteStore::open_with_unsafe_ack_durability(&path).unwrap();
+            store.append_consumer_state(&rows).unwrap();
+            store.append("publish", b"", b"body").unwrap();
+            drop(store);
+            let db = Connection::open(&path).unwrap();
+            match mutation {
+                0 => {
+                    db.execute("UPDATE consumer_blocks SET data=zeroblob(length(data))", [])
+                        .unwrap();
+                }
+                1 => {
+                    db.execute("UPDATE consumer_blocks SET last_seq=2", [])
+                        .unwrap();
+                }
+                2 => {
+                    db.execute("UPDATE consumer_blocks SET first_seq=2", [])
+                        .unwrap();
+                }
+                3..=5 => {
+                    let mut data = match mutation {
+                        3 => postcard::to_allocvec(&rows[..1]).unwrap(),
+                        5 => postcard::to_allocvec(&usize::MAX).unwrap(),
+                        _ => postcard::to_allocvec(&rows).unwrap(),
+                    };
+                    if mutation == 4 {
+                        data.push(0);
+                    }
+                    let crc = checksum(1, "$SCREECH.consumer-block.v1", &3u64.to_le_bytes(), &data);
+                    db.execute(
+                        "UPDATE consumer_blocks SET data=?1,checksum=?2",
+                        params![data, crc],
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    db.execute("UPDATE meta SET version=1", []).unwrap();
+                }
+            }
+            drop(db);
+            assert!(SqliteStore::open(path).is_err(), "mutation {mutation}");
+        }
+    }
+    #[test]
+    fn a_block_cannot_overlap_ordinary_records_even_with_a_valid_checksum() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let mut rows = records();
+        let mut store = SqliteStore::open_with_unsafe_ack_durability(&path).unwrap();
+        store.append_consumer_state(&rows).unwrap();
+        store.append("publish", b"", b"body").unwrap();
+        drop(store);
+        rows.push(rows[0].clone());
+        let data = postcard::to_allocvec(&rows).unwrap();
+        let db = Connection::open(&path).unwrap();
+        db.execute(
+            "UPDATE consumer_blocks SET last_seq=4,data=?1,checksum=?2",
+            params![
+                data,
+                checksum(1, "$SCREECH.consumer-block.v1", &4u64.to_le_bytes(), &data)
+            ],
+        )
+        .unwrap();
+        drop(db);
+        assert!(SqliteStore::open(path).is_err());
     }
 }

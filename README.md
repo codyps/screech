@@ -163,11 +163,16 @@ storage. A process or host failure can roll back pending deliveries, ACK floors 
 retention effects; acknowledged workqueue messages can redeliver. The default keeps
 reservations and confirmed ACKs strictly durable.
 
-The opt-in mode buffers at most 256 event records / 1 MiB, with a 50 ms flush target.
+The opt-in mode buffers at most 1024 event records / 1 MiB, with a 50 ms flush target.
 A slow or stalled disk can exceed that interval. Publication ACKs, catalog changes
 and checkpoints remain FULL: they atomically persist the earlier buffered prefix
 along with their own records. Graceful shutdown attempts a final flush. A flush
-failure stops subsequent JetStream success. This mode makes consumer performance
+failure stops subsequent JetStream success. Buffered events share a checksummed
+journal block while retaining their logical sequence numbers. The first block
+commit upgrades the SQLite store metadata to version 2; current binaries read both
+versions, and unsupported versions fail closed. After a confirmed buffered ACK,
+the worker polls for at most 16 µs before sleeping, trading CPU for lower Fetch(1)
+round-trip latency. Strict mode does not poll. This mode makes consumer performance
 comparisons with NATS's buffered consumer state more useful; the guarantees are
 still not identical. Benchmark series label it **UNSAFE ACK durability** separately.
 

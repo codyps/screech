@@ -361,6 +361,24 @@ pub fn overlap(a: &str, b: &str) -> bool {
         }
     }
 }
+enum Acknowledged {
+    None,
+    Single(u64),
+    Multiple(OrdSet<u64>),
+}
+impl Acknowledged {
+    fn for_each(self, mut apply: impl FnMut(u64)) {
+        match self {
+            Self::None => (),
+            Self::Single(sequence) => apply(sequence),
+            Self::Multiple(sequences) => {
+                for sequence in sequences {
+                    apply(sequence);
+                }
+            }
+        }
+    }
+}
 impl Consumer {
     fn acknowledge(
         &mut self,
@@ -368,7 +386,7 @@ impl Consumer {
         consumer_sequence: u64,
         time: u64,
         action: AckAction,
-    ) -> OrdSet<u64> {
+    ) -> Acknowledged {
         match action {
             AckAction::Nak(delay) => {
                 if let Some(p) = self.pending.get_mut(&sequence) {
@@ -389,22 +407,23 @@ impl Consumer {
                 }
             }
             kind @ (AckAction::Ack | AckAction::Term) => {
-                let ids = if kind == AckAction::Ack && self.config.ack_policy == AckPolicy::All {
-                    self.history
+                if kind == AckAction::Ack && self.config.ack_policy == AckPolicy::All {
+                    let ids = self
+                        .history
                         .range(..=consumer_sequence)
                         .map(|(_, (s, _))| *s)
                         .chain(std::iter::once(sequence))
-                        .collect::<OrdSet<_>>()
-                } else {
-                    std::iter::once(sequence).collect()
-                };
-                for n in &ids {
-                    self.finish(*n);
+                        .collect::<OrdSet<_>>();
+                    for n in &ids {
+                        self.finish(*n);
+                    }
+                    return Acknowledged::Multiple(ids);
                 }
-                return ids;
+                self.finish(sequence);
+                return Acknowledged::Single(sequence);
             }
         }
-        OrdSet::new()
+        Acknowledged::None
     }
     fn next_delivery(&self, s: &Stream, time: u64) -> Option<Delivery> {
         self.select_delivery(s, time, true)
@@ -560,6 +579,19 @@ impl Stream {
                 }
                 c.finish(seq);
             }
+        }
+    }
+    fn reserve_delivery(
+        &mut self,
+        consumer: &str,
+        generation: u64,
+        delivery: &Delivery,
+        time: u64,
+    ) {
+        let c = self.consumers.get_mut(consumer).unwrap();
+        c.reserve(delivery, time);
+        if c.config.ack_policy == AckPolicy::None {
+            self.acknowledge(delivery.sequence, generation);
         }
     }
     fn acknowledge(&mut self, seq: u64, generation: u64) {
@@ -1351,19 +1383,18 @@ impl State {
                 time,
                 deliveries,
             } => {
-                for delivery in deliveries {
-                    self.apply(Event::Deliver {
-                        stream: stream.clone(),
-                        consumer: consumer.clone(),
-                        generation,
-                        time,
-                        delivery,
-                    })?;
+                self.time = self.time.max(time);
+                let s = self.streams.get_mut(&stream).unwrap();
+                for delivery in &deliveries {
+                    s.reserve_delivery(&consumer, generation, delivery, time);
                 }
             }
             Event::AckBatch { events } => {
+                // Validation already checked every ACK and its timestamp order.
+                // ACKs only remove history or adjust activity; they cannot replace
+                // the sequence mapping used to validate a later ACK in this batch.
                 for event in events {
-                    self.apply(event)?;
+                    self.apply_validated(event)?;
                 }
             }
             Event::ConsumerUpdate {
@@ -1618,11 +1649,7 @@ impl State {
             } => {
                 self.time = self.time.max(time);
                 let s = self.streams.get_mut(&stream).unwrap();
-                let c = s.consumers.get_mut(&consumer).unwrap();
-                c.reserve(&d, time);
-                if c.config.ack_policy == AckPolicy::None {
-                    s.acknowledge(d.sequence, generation);
-                }
+                s.reserve_delivery(&consumer, generation, &d, time);
             }
 
             Event::Ack {
@@ -1637,9 +1664,8 @@ impl State {
                 self.time = self.time.max(time);
                 let s = self.streams.get_mut(&stream).unwrap();
                 let c = s.consumers.get_mut(&consumer).unwrap();
-                for n in c.acknowledge(sequence, consumer_sequence, time, action) {
-                    s.acknowledge(n, generation);
-                }
+                c.acknowledge(sequence, consumer_sequence, time, action)
+                    .for_each(|n| s.acknowledge(n, generation));
             }
 
             Event::Expire { time } => {
@@ -1722,6 +1748,9 @@ impl<S: Store> Engine<S> {
     }
     pub fn is_poisoned(&self) -> bool {
         self.poisoned.get()
+    }
+    pub(crate) fn buffers_consumer_state(&self) -> bool {
+        self.store.buffers_consumer_state()
     }
     pub fn flush_consumer_state(&mut self, force: bool) -> Result<(), Error> {
         if self.poisoned.get() {
@@ -2224,7 +2253,9 @@ fn encode_event(event: &Event) -> Result<crate::storage::Append, Error> {
             message.payload.clone(),
         )
     } else {
-        (serde_json::to_vec(&event)?, Bytes::new())
+        let mut bytes = Vec::with_capacity(256);
+        serde_json::to_writer(&mut bytes, &event)?;
+        (bytes, Bytes::new())
     };
     Ok(crate::storage::Append {
         subject: "$SCREECH.event.v2".into(),

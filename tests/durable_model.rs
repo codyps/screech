@@ -1264,3 +1264,87 @@ fn checkpoint_byte_budget_includes_replayed_records() {
         engine.state().check_invariants().unwrap();
     }
 }
+
+proptest! {
+    #[test]
+    fn mixed_ack_batches_refine_serial_with_deleted_history(
+        actions in prop::collection::vec((0usize..8,0u8..4,any::<bool>()),2..65),
+        ack_all in any::<bool>(), interest in any::<bool>()
+    ) {
+        let mut engine = Engine::recover(MemoryStore::default()).unwrap();
+        create(&mut engine,stream(if interest { Retention::Interest } else { Retention::Limits }));
+        let mut config=consumer("D");
+        config.ack_policy=if ack_all { AckPolicy::All } else { AckPolicy::Explicit };
+        add(&mut engine,config);
+        for _ in 0..8 { publish(&mut engine,"events.a",Bytes::new(),0); }
+        let mut attempts=Vec::new();
+        for time in [0,10] {
+            let event=engine.state().prepare_delivery_batch("S","D",time,8,0).unwrap().unwrap();
+            let Event::DeliverBatch { deliveries,.. }=&event else { unreachable!() };
+            attempts.push(deliveries.clone()); engine.commit(event).unwrap();
+        }
+        let mut serial=engine.state().clone();
+        let mut batched=serial.clone();
+        let generation=serial.streams["S"].consumers["D"].generation;
+        let events:Vec<_>=actions.into_iter().enumerate().map(|(i,(index,kind,old))| {
+            let d=&attempts[usize::from(!old)][index];
+            let action=match kind {0=>AckAction::Ack,1=>AckAction::Term,2=>AckAction::Progress,_=>AckAction::Nak(3)};
+            batched.prepare_ack("S","D",AckToken {generation,sequence:d.sequence,consumer_sequence:d.consumer_sequence},action,20+i as u64).unwrap()
+        }).collect();
+        for event in &events { serial.apply(event.clone()).unwrap(); }
+        batched.apply(Event::AckBatch { events }).unwrap();
+        prop_assert_eq!(&batched,&serial);
+        batched.check_invariants().unwrap();
+    }
+}
+
+#[test]
+fn forged_late_ack_in_batch_cannot_apply_an_earlier_valid_ack() {
+    let mut engine = Engine::recover(MemoryStore::default()).unwrap();
+    create(&mut engine, stream(Retention::Workqueue));
+    add(&mut engine, consumer("D"));
+    for _ in 0..2 {
+        publish(&mut engine, "events.a", Bytes::new(), 0);
+    }
+    let event = engine
+        .state()
+        .prepare_delivery_batch("S", "D", 0, 2, 0)
+        .unwrap()
+        .unwrap();
+    let Event::DeliverBatch { deliveries, .. } = &event else {
+        unreachable!()
+    };
+    let deliveries = deliveries.clone();
+    engine.commit(event).unwrap();
+    let before = engine.state().clone();
+    let generation = before.streams["S"].consumers["D"].generation;
+    let mut events: Vec<_> = deliveries
+        .iter()
+        .map(|d| {
+            before
+                .prepare_ack(
+                    "S",
+                    "D",
+                    AckToken {
+                        generation,
+                        sequence: d.sequence,
+                        consumer_sequence: d.consumer_sequence,
+                    },
+                    AckAction::Ack,
+                    1,
+                )
+                .unwrap()
+        })
+        .collect();
+    let Event::Ack {
+        consumer_sequence, ..
+    } = &mut events[1]
+    else {
+        unreachable!()
+    };
+    *consumer_sequence = deliveries[0].consumer_sequence;
+    assert!(engine.commit(Event::AckBatch { events }).is_err());
+    assert_eq!(engine.state(), &before);
+    assert!(!engine.is_poisoned());
+    assert_eq!(engine.into_store().last_sequence().unwrap(), 5);
+}
