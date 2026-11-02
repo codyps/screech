@@ -40,6 +40,20 @@ class BenchmarkSiteTests(unittest.TestCase):
                 config=(Path(tmp)/'nats.conf').read_text()
                 if expected:self.assertIn(expected,config)
                 else:self.assertNotIn('sync_interval',config)
+    def test_scaling_case_topology_is_required_before_publication(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p,value=self.fixture(tmp)
+            for scenario,expected in site.CORE_TOPOLOGIES.items():
+                row=value['rows'][0]
+                row.update(scenario=scenario,core_subjects=expected[0],unused_wildcards=expected[1],core_window=1024)
+                p.write_text(json.dumps(value));site.read_campaign(p,'valid')
+                for key in ['core_subjects','unused_wildcards','core_window']:
+                    broken=json.loads(json.dumps(value));broken['rows'][0].pop(key);p.write_text(json.dumps(broken))
+                    with self.assertRaisesRegex(ValueError,'topology'):site.read_campaign(p,'invalid')
+                row['core_subjects']=1 if expected[0]!=1 else 8192
+                p.write_text(json.dumps(value))
+                with self.assertRaisesRegex(ValueError,'topology'):site.read_campaign(p,'mislabeled')
+
     def test_invalid_sync_interval_is_rejected_before_launch(self):
         for interval in ['"\nmalicious', '-1s', '1ms;bad', 'always', '0', 'bad']:
             with self.assertRaises(ValueError):benchmark.main(types.SimpleNamespace(trials=3,nats_sync_interval=[interval]))

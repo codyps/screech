@@ -147,3 +147,13 @@ Checkpoint-budget tests cross the record threshold in individual and grouped
 appends, restart just below it, and verify group overshoot and checkpoint replay.
 Byte-budget tests restart with an uncheckpointed prefix and require its encoded
 bytes to count toward the next automatic checkpoint.
+
+Core wildcard routes and interest checks use an iterative subject-token index. The
+scan-based model independently checks matching, exact-first direct delivery order,
+queue cursors, queue-restricted routing, echo changes, duplicate SIDs, disconnects
+and automatic unsubscribe through cached routes. Additional cases cross the route
+cache limit, exercise Unicode and deep filters, and check index pruning/slot reuse.
+
+```sh
+PROPTEST_CASES=1024 cargo test --locked --all-features --test core_model token_index_refines
+```

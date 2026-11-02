@@ -95,3 +95,27 @@ subscriber flushes follow their queued deliveries before the next window starts.
 This keeps the workload within bounded pending queues, applies identical pacing to
 both servers and is included in throughput timing. Raw rows record core_window.
 Driver errors and per-server logs are preserved in the benchmark-results artifact.
+
+## Core subject and subscription scaling
+
+Core cases run with JetStream disabled. In addition to the single-subject fanout,
+wildcard and queue cases, CI includes these 128-byte, one-subscriber cases with
+1,000,000 publications per trial:
+
+| Case | Rotating subjects | Nonmatching wildcard subscriptions |
+| --- | ---: | ---: |
+| Subject churn | 8,192 | 0 |
+| Many subscriptions | 1 | 512 |
+| Subject churn and many subscriptions | 8,192 | 512 |
+
+Each subscriber also has one active wildcard subscription. Subjects rotate in
+publication order; the unused filters have a separate literal prefix. This separates
+cache-hit behavior from lookup work when the subject set exceeds route-cache capacity.
+Raw rows record core_subjects, unused_wildcards and core_window. The dashboard shows
+these counts and supports searching for them. Core modes carry no storage-sync label.
+
+Every delivery is checked for subject, sequence, length and ordering. Queue cases
+also check exactly-once selection across subscribers. Subscriber connections drain
+after timing ends so late callbacks and unexpected deliveries to unused subscriptions
+cannot escape validation. Subscription setup and drain are outside throughput timing;
+CPU deltas include them, and RSS is final rather than peak.

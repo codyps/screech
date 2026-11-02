@@ -9,6 +9,12 @@ import shutil
 
 REQUIRED = ('server', 'scenario', 'payload_bytes', 'subscribers', 'publishes', 'deliveries', 'seconds', 'deliveries_per_second', 'trial')
 
+CORE_TOPOLOGIES = {
+    'core-subject-churn': (8192, 0),
+    'core-many-subscriptions': (1, 512),
+    'core-churn-many-subscriptions': (8192, 512),
+}
+
 def read_campaign(path, label):
     value = json.loads(path.read_text())
     if not isinstance(value.get('environment'), dict) or not value.get('rows'):
@@ -17,6 +23,10 @@ def read_campaign(path, label):
     for row in value['rows']:
         if row.get('checked') is not True or any(key not in row for key in REQUIRED):
             raise ValueError(f'{path}: incomplete or unchecked trial')
+        if row.get('scenario') in CORE_TOPOLOGIES:
+            actual = (row.get('core_subjects'), row.get('unused_wildcards'))
+            if actual != CORE_TOPOLOGIES[row['scenario']] or row.get('core_window') != 1024:
+                raise ValueError(f'{path}: invalid Core scaling topology')
         for key, number in row.items():
             if isinstance(number, (float, int)) and (not math.isfinite(number) or number < 0):
                 raise ValueError(f'{path}: invalid {key}')

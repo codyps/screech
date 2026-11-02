@@ -46,3 +46,13 @@ test('Fetch and cycle metrics preserve missing data and their timing boundaries'
   assert.equal(scope(rows[0], 'cycle_p50_us'), 'Fetch(1) through confirmed ACK');
   assert.match(scope(rows[0], 'p50_us'), /Fetch excluded/);
 });
+
+test('Core scaling cases retain topology and Core server labels', () => {
+  const rows = ['core-subject-churn','core-many-subscriptions','core-churn-many-subscriptions'].map((scenario,i) => trial('screech', 1, {scenario,deliveries_per_second:100+i,core_subjects:i===1?1:8192,unused_wildcards:i===0?0:512}));
+  assert.equal(summarize(rows,'deliveries_per_second').length,3);
+  for(const row of rows){
+    assert.equal(seriesName('nats-main',row.scenario),'NATS · Core');
+    assert.equal(seriesName('screech',row.scenario),'Screech · Core');
+    assert.match(scope(row),/no latency samples/);
+  }
+});

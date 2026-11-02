@@ -54,7 +54,7 @@ def main(args):
         if not re.fullmatch(r'(?:[0-9]+(?:\.[0-9]+)?(?:ns|us|ms|s|m|h))+',interval): raise ValueError('invalid NATS sync interval')
     if len(set(args.nats_sync_interval)) != len(args.nats_sync_interval): raise ValueError('duplicate sync intervals')
     args.output.with_suffix('.jsonl').write_text('')
-    core=[('fanout',8,1,2000000),('wildcard',128,1,2000000),('fanout',128,1,2000000),('fanout',1024,1,1000000),('fanout',128,4,1000000),('queue',128,4,2000000),('request',128,1,50000)]
+    core=[('fanout',8,1,2000000),('wildcard',128,1,2000000),('fanout',128,1,2000000),('fanout',1024,1,1000000),('fanout',128,4,1000000),('queue',128,4,2000000),('request',128,1,50000),('core-subject-churn',128,1,1000000),('core-many-subscriptions',128,1,1000000),('core-churn-many-subscriptions',128,1,1000000)]
     for durable in (False,True):
         cases=[('core-stream',128,1,5000),('durable',128,1,5000),('consume',128,1,1000),('consume-limits',128,1,1000),('consume-one',128,1,1000),('consume-one',1024,1,1000),('consume-next',128,1,1000),('consume-parallel',128,1,5000),('consume-ack-window',128,1,5000),('dedup',128,1,5000),('durable-parallel',128,1,5000),('consume-one-parallel',128,1,5000),('mixed-parallel',128,1,5000),('mixed-streams',128,1,5000)] if durable else core
         if args.scale_only:

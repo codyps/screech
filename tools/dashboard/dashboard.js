@@ -18,14 +18,15 @@
     'nats-sync-10ms': ['NATS · 10 ms', '#376dae']
   };
   const CASES = {
-    fanout: 'Core fanout', wildcard: 'Core wildcard', queue: 'Core queue', request: 'Core request / reply',
+    fanout: 'Core fanout', wildcard: 'Core wildcard · one subject', queue: 'Core queue', request: 'Core request / reply',
+    'core-subject-churn': 'Core subject churn', 'core-many-subscriptions': 'Core many subscriptions', 'core-churn-many-subscriptions': 'Core churn + many subscriptions',
     'core-stream': 'Core on a durable stream', durable: 'Durable publish', dedup: 'Publish deduplication',
     'consume-ack-window': 'Fetch(1000) + 16 ACK clients', consume: 'Fetch(128) + ACK', 'consume-limits': 'Fetch(128) + ACK · limits',
     'consume-one': 'Fetch(1) + ACK', 'consume-next': 'ACK + next', 'consume-parallel': 'Fetch(128) + 16 ACK clients',
     'durable-parallel': '16 durable publishers', 'consume-one-parallel': '16 Fetch(1) + ACK clients',
     'mixed-parallel': '8 publishers + 8 consumers', 'mixed-streams': 'Mixed · four streams'
   };
-  const coreOnly = scenario => ['fanout', 'wildcard', 'queue', 'request'].includes(scenario);
+  const coreOnly = scenario => ['fanout', 'wildcard', 'queue', 'request', 'core-subject-churn', 'core-many-subscriptions', 'core-churn-many-subscriptions'].includes(scenario);
   function seriesName(id, scenario) {
     if (coreOnly(scenario)) return id.startsWith('nats-') ? 'NATS · Core' : id === 'screech' ? 'Screech · Core' : 'Screech · prior Core';
     return (SERIES[id] || [id.replace('nats-sync-', 'NATS · ')])[0];
@@ -112,7 +113,7 @@
   function render() {
     const c = campaign(), meta = METRICS[state.metric];
     const groups = summarize(c.rows, state.metric).filter(g => {
-      const text = `${g.title} ${g.row.scenario} ${g.row.payload_bytes} ${g.row.publishes}`.toLowerCase();
+      const text = `${g.title} ${g.row.scenario} ${g.row.payload_bytes} ${g.row.publishes} ${g.row.core_subjects ?? ''} ${g.row.unused_wildcards ?? ''}`.toLowerCase();
       return text.includes(state.search.toLowerCase()) && [...g.series].some(([id,v]) => state.visible.has(id) && v.median !== null);
     });
     $('charts').replaceChildren(); $('table-body').replaceChildren();
@@ -128,7 +129,8 @@
         const badge = el('span', cmp.text, `badge${cmp.better ? '' : ' slower'}`); badge.title = `Screech vs ${seriesName(state.baseline,r.scenario)}`; top.append(badge);
       }
       const clients = r.consumer_connections !== undefined ? ` · ${r.publishers} publishers · ${r.consumer_connections} consumers · ${r.streams || 1} stream(s)` : coreOnly(r.scenario) || r.scenario === 'core-stream' ? ` · ${r.subscribers} subscriber(s)` : '';
-      const details = `${nf.format(r.payload_bytes)} B · ${nf.format(r.publishes)} publishes${clients}`;
+      const topology = r.core_subjects !== undefined ? ` · ${nf.format(r.core_subjects)} subject(s) · ${nf.format(r.unused_wildcards)} nonmatching wildcard subscriptions per subscriber` : '';
+      const details = `${nf.format(r.payload_bytes)} B · ${nf.format(r.publishes)} publishes${clients}${topology}`;
       card.append(top, el('p', details, 'case-details'));
       const max = Math.max(...selected.map(([,s]) => s.median || 0), 1);
       for (const [id, s] of selected) {

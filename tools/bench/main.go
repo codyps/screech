@@ -22,7 +22,7 @@ func main() {
 }
 func run() error {
 	url := flag.String("url", "nats://127.0.0.1:4222", "server URL")
-	scenario := flag.String("scenario", "fanout", "fanout, wildcard, queue, request, durable, consume, consume-one, consume-parallel, consume-ack-window, consume-limits, consume-next, dedup, durable-parallel, consume-one-parallel, mixed-parallel, mixed-streams, core-stream")
+	scenario := flag.String("scenario", "fanout", "fanout, wildcard, queue, core-subject-churn, core-many-subscriptions, core-churn-many-subscriptions, request, durable, consume, consume-one, consume-parallel, consume-ack-window, consume-limits, consume-next, dedup, durable-parallel, consume-one-parallel, mixed-parallel, mixed-streams, core-stream")
 	n := flag.Int("n", 100000, "publishes")
 	size := flag.Int("size", 128, "payload bytes, at least 8")
 	subscribers := flag.Int("subscribers", 1, "subscribers")
@@ -308,11 +308,19 @@ func run() error {
 			}
 		}
 	} else {
-		if *scenario != "fanout" && *scenario != "queue" && *scenario != "wildcard" {
+		if !coreBulkScenario(*scenario) {
 			return fmt.Errorf("unknown scenario")
 		}
+		subjectCount, unusedWildcards := coreTopology(*scenario)
+		subjects := make([]string, subjectCount)
+		for i := range subjects {
+			subjects[i] = subject
+			if subjectCount > 1 {
+				subjects[i] = fmt.Sprintf("%s.s%d", subject, i)
+			}
+		}
 		target := int64(*n)
-		if *scenario == "fanout" || *scenario == "wildcard" {
+		if *scenario != "queue" {
 			target *= int64(*subscribers)
 		}
 		done := make(chan struct{})
@@ -320,13 +328,18 @@ func run() error {
 		var total atomic.Int64
 		seen := make([]atomic.Uint32, *n)
 		var readers []*nats.Conn
+		var readerClosed []chan struct{}
 		for s := 0; s < *subscribers; s++ {
-			conn, e := nats.Connect(*url, options...)
+			closed := make(chan struct{})
+			readerOptions := append([]nats.Option{}, options...)
+			readerOptions = append(readerOptions, nats.ClosedHandler(func(_ *nats.Conn) { close(closed) }))
+			conn, e := nats.Connect(*url, readerOptions...)
 			if e != nil {
 				return e
 			}
 			defer conn.Close()
 			readers = append(readers, conn)
+			readerClosed = append(readerClosed, closed)
 			expected := uint64(0)
 			callback := func(m *nats.Msg) {
 				if len(m.Data) != *size {
@@ -338,7 +351,11 @@ func run() error {
 					asyncError.Store("invalid message sequence")
 					return
 				}
-				if *scenario == "fanout" || *scenario == "wildcard" {
+				if m.Subject != subjects[seq%uint64(len(subjects))] {
+					asyncError.Store("incorrect delivery subject")
+					return
+				}
+				if *scenario != "queue" {
 					if seq != expected {
 						asyncError.Store(fmt.Sprintf("gap or duplicate: expected %d got %d", expected, seq))
 					}
@@ -357,7 +374,7 @@ func run() error {
 				sub, e = conn.QueueSubscribe(subject, "workers", callback)
 			} else {
 				filter := subject
-				if *scenario == "wildcard" {
+				if *scenario != "fanout" {
 					filter = "bench.>"
 				}
 				sub, e = conn.Subscribe(filter, callback)
@@ -367,6 +384,11 @@ func run() error {
 			}
 			if e = sub.SetPendingLimits(*n+1, (*n+1)*(*size+128)); e != nil {
 				return e
+			}
+			for i := 0; i < unusedWildcards; i++ {
+				if _, e = conn.Subscribe(fmt.Sprintf("unused.%d.*", i), func(_ *nats.Msg) { asyncError.Store("unexpected wildcard delivery") }); e != nil {
+					return e
+				}
 			}
 			if e = conn.Flush(); e != nil {
 				return e
@@ -388,7 +410,7 @@ func run() error {
 		start := time.Now()
 		for i := 0; i < *n; i++ {
 			binary.LittleEndian.PutUint64(payload, uint64(i))
-			if e = pub.Publish(subject, payload); e != nil {
+			if e = pub.Publish(subjects[i%len(subjects)], payload); e != nil {
 				return e
 			}
 			if i%1024 == 1023 {
@@ -414,6 +436,20 @@ func run() error {
 				}
 			}
 		}
+		// Drain outside throughput timing so late/unused callbacks are checked too.
+		for i, reader := range readers {
+			if e := reader.Drain(); e != nil {
+				return e
+			}
+			select {
+			case <-readerClosed[i]:
+				if e := reader.LastError(); e != nil {
+					return e
+				}
+			case <-time.After(10 * time.Second):
+				return fmt.Errorf("Core subscriber drain timeout")
+			}
+		}
 	}
 	if e := asyncError.Load(); e != nil {
 		return fmt.Errorf("asynchronous error: %v", e)
@@ -431,8 +467,9 @@ func run() error {
 	default:
 		result["latency_scope"] = "throughput only; no latency samples"
 	}
-	if *scenario == "fanout" || *scenario == "wildcard" || *scenario == "queue" {
+	if coreBulkScenario(*scenario) {
 		result["core_window"] = 1024
+		result["core_subjects"], result["unused_wildcards"] = coreTopology(*scenario)
 	}
 	if *scenario == "consume-ack-window" {
 		result["fetch_batch"] = 1000
@@ -479,4 +516,23 @@ func run() error {
 		}
 	}
 	return json.NewEncoder(os.Stdout).Encode(result)
+}
+
+func coreBulkScenario(s string) bool {
+	switch s {
+	case "fanout", "wildcard", "queue", "core-subject-churn", "core-many-subscriptions", "core-churn-many-subscriptions":
+		return true
+	}
+	return false
+}
+func coreTopology(s string) (int, int) {
+	switch s {
+	case "core-subject-churn":
+		return 8192, 0
+	case "core-many-subscriptions":
+		return 1, 512
+	case "core-churn-many-subscriptions":
+		return 8192, 512
+	}
+	return 1, 0
 }
