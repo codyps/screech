@@ -396,9 +396,6 @@ impl Hub {
             let mut first = None;
             let mut shared = None;
             core.route_with(publisher, &target[..target_len], None, |client, sid| {
-                if !outboxes.peers.contains_key(&client) {
-                    return;
-                }
                 if shared.is_none() {
                     let Some((first_client, first_sid)) = first.take() else {
                         first = Some((client, sid.clone()));

@@ -570,7 +570,9 @@ fn burst_hub(
             headers,
         };
         hub.core.connect(client as u64, echo || client != 0);
-        hub.peers.insert(client as u64, peer.clone());
+        if budget != 4 || !closed {
+            hub.peers.insert(client as u64, peer.clone());
+        }
         peers.push(peer);
     }
     for (n, &code) in subscriptions.iter().enumerate() {
