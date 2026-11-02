@@ -157,14 +157,14 @@ fn reused_wal_shrinks_to_limit_and_preserves_snapshot_and_highwater() {
     let path = directory.path().join("log.db");
     let mut store = SqliteStore::open(&path).unwrap();
     store.append("a", b"", b"first").unwrap();
-    let snapshot = vec![0x3a; 9 * 1024 * 1024];
+    let snapshot = vec![0x3a; 33 * 1024 * 1024];
     store.checkpoint(1, &snapshot).unwrap();
     assert_eq!(store.append("a", b"", b"second").unwrap(), 2);
     assert!(
         std::fs::metadata(directory.path().join("log.db-wal"))
             .unwrap()
             .len()
-            <= 8 * 1024 * 1024
+            <= 32 * 1024 * 1024
     );
     drop(store);
     let store = SqliteStore::open(path).unwrap();

@@ -285,3 +285,16 @@ CI also captures sequential confirmed ACK CPU profiles (Fetch(128), then one
 ACK round trip per message) for unsafe Screech and NATS `always`. The checked Go driver pauses after prefill until perf acknowledges event
 enablement, and holds post-workload validation until recording stops. These are
 diagnostic profiles; the performance gate uses the unprofiled benchmark trials.
+
+Storage layout tests reopen an existing retained-content index, verify content and
+log recovery after its removal, and exercise checkpoint collection. WAL tests force
+a snapshot larger than the reuse limit, restart the log, and verify the snapshot,
+high-water mark and later records. Connection tests hold a commit while continuous
+Core ingress runs and check that the storage deadline still closes that connection
+without a publication ACK.
+
+Publication I/O profiles trace both servers through a checked durable workload,
+including setup and cleanup. The profiler waits for every server thread to attach,
+requires at least one synchronization call per publication, and saves syscall
+summaries plus storage checkpoint diagnostics. These profiled timings do not feed
+the performance gate; syscall wall times across threads can overlap.

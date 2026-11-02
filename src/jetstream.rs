@@ -128,14 +128,14 @@ impl Handle {
             };
             let mut deferred = None;
             let mut idle_wait = Duration::from_millis(10);
-            let mut spin_after_ack = false;
+            let mut poll_after_reply = false;
             loop {
                 if worker_stop.load(std::sync::atomic::Ordering::Acquire) {
                     break;
                 }
                 let next = deferred.take().map(Ok).unwrap_or_else(|| {
-                    if spin_after_ack {
-                        // A confirmed buffered ACK often precedes the next Fetch(1).
+                    if poll_after_reply {
+                        // Reply-driven clients often issue their next request at once.
                         // Briefly poll to avoid a sleep/wakeup on that round trip;
                         // idle connections and strictly durable stores still sleep.
                         let until = std::time::Instant::now() + Duration::from_micros(64);
@@ -155,7 +155,7 @@ impl Handle {
                     }
                     rx.recv_timeout(idle_wait)
                 });
-                spin_after_ack = false;
+                poll_after_reply = false;
                 match next {
                     Ok(req) if worker.groupable(&req.message) => {
                         crate::fault::group_gate();
@@ -184,7 +184,7 @@ impl Handle {
                         let active_consumers = !worker.pulls.is_empty() || worker.has_push();
                         if requests.iter().all(|req| simple_ack(&req.message)) && !active_consumers
                         {
-                            spin_after_ack = worker.ack_requests(requests)
+                            poll_after_reply = worker.ack_requests(requests)
                                 && worker.engine.buffers_consumer_state();
                         } else if worker.engine.supports_groups()
                             && (requests.len() > 1 || active_consumers)
@@ -192,7 +192,13 @@ impl Handle {
                             worker.group_requests(requests, &rx, &mut deferred);
                         } else {
                             let req = requests.pop().unwrap();
+                            let has_reply = req.message.reply.is_some();
                             let result = worker.handle(req.message);
+                            // Keep grouped and active-consumer scheduling unchanged.
+                            // Publication success still follows the FULL store commit.
+                            poll_after_reply = has_reply
+                                && result.as_ref().is_ok_and(|handled| *handled)
+                                && worker.engine.buffers_consumer_state();
                             let _ = req.response.send(result);
                         }
                     }

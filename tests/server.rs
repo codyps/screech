@@ -1239,3 +1239,62 @@ async fn large_disk_backed_batch_survives_ack_none_interest_removal() {
     drop(client);
     server.stop().await;
 }
+
+#[tokio::test]
+async fn storage_deadline_expires_while_same_connection_continuously_forwards_core() {
+    let gate = StorageGate::default();
+    let _release = ReleaseStorage(gate.clone());
+    let handle = screech::jetstream::Handle::start(GatedStore {
+        inner: Default::default(),
+        gate: gate.clone(),
+    })
+    .unwrap();
+    let server = Running::start(Config {
+        jetstream: Some(handle),
+        storage_deadline: Duration::from_millis(500),
+        ..Default::default()
+    })
+    .await;
+    let client = async_nats::connect(server.addr.to_string()).await.unwrap();
+    let js = async_nats::jetstream::new(client.clone());
+    js.create_stream(async_nats::jetstream::stream::Config {
+        name: "S".into(),
+        subjects: vec!["events.>".into()],
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let mut publisher = server.raw().await;
+    gate.arm();
+    publisher
+        .get_mut()
+        .write_all(b"SUB _ACK 9\r\nPUB events.a _ACK 1\r\na\r\nPING\r\n")
+        .await
+        .unwrap();
+    gate.blocked().await;
+    assert_eq!(line(&mut publisher).await, "PONG\r\n");
+    let (read, mut write) = publisher.into_inner().into_split();
+    let flood = tokio::spawn(async move {
+        let packet = b"PUB plain.x 1\r\nx\r\n".repeat(1024);
+        while write.write_all(&packet).await.is_ok() {
+            tokio::task::yield_now().await;
+        }
+    });
+    let mut reader = BufReader::new(read);
+    let mut unexpected = String::new();
+    let result = timeout(Duration::from_secs(3), reader.read_line(&mut unexpected)).await;
+    flood.abort();
+    let _ = flood.await;
+    gate.release();
+    match result.expect("busy Core ingress prevented the storage deadline") {
+        Ok(0) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => (),
+        other => panic!("expected deadline disconnect, got {other:?}: {unexpected}"),
+    }
+    assert!(
+        unexpected.is_empty(),
+        "durable ACK escaped stalled storage: {unexpected}"
+    );
+    drop(client);
+    server.stop().await;
+}

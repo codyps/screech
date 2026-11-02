@@ -95,7 +95,9 @@ delivery load only selected bodies. Content and publish transitions commit toget
 in one FULL transaction. Checkpoints contain metadata and atomically reclaim bodies
 that retention, purge or deletion removed. Recovery imports older inline checkpoints
 before serving. SQLite uses an 8 MiB page-cache target, file-backed temporary tables
-and no database mmap. Delivery selection loads at most 64 messages / 8 MiB per batch;
+and no database mmap. SQLite's VFS receives a best-effort 32 MiB WAL allocation
+hint, and WAL reuse retains up to 32 MiB after a restart. This is disk allocation;
+commits still use FULL synchronization. Delivery selection loads at most 64 messages / 8 MiB per batch;
 individual messages, staged groups and output queues can add bounded transient memory.
 
 Memory still scales with message count: subjects, sequence indexes, consumer pending
@@ -170,8 +172,8 @@ along with their own records. Graceful shutdown attempts a final flush. A flush
 failure stops subsequent JetStream success. Buffered events share a checksummed
 journal block while retaining their logical sequence numbers. The first block
 commit upgrades the SQLite store metadata to version 2; current binaries read both
-versions, and unsupported versions fail closed. After a confirmed buffered ACK,
-the worker polls for at most 64 µs before sleeping, trading CPU for lower consumer
+versions, and unsupported versions fail closed. After a confirmed consumer ACK or a
+single-publication reply in unsafe mode, the worker polls for at most 64 µs before sleeping, trading CPU for lower consumer
 round-trip latency. Strict mode does not poll. This mode makes consumer performance
 comparisons with NATS's buffered consumer state more useful; the guarantees are
 still not identical. Benchmark series label it **UNSAFE ACK durability** separately.

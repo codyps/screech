@@ -1,7 +1,8 @@
 # Enable SQLite's supported data-sync syscall on Linux. FULL still synchronizes
-# every commit, including data and file size. Other targets retain their defaults.
+# every commit, including data and file size. Native allocation avoids the VFS
+# fallback that writes a byte in every block. Other targets retain their defaults.
 [env]
-CFLAGS_x86_64_unknown_linux_gnu = "-DHAVE_FDATASYNC=1"
-CFLAGS_aarch64_unknown_linux_gnu = "-DHAVE_FDATASYNC=1"
-CFLAGS_x86_64_unknown_linux_musl = "-DHAVE_FDATASYNC=1"
-CFLAGS_aarch64_unknown_linux_musl = "-DHAVE_FDATASYNC=1"
+CFLAGS_x86_64_unknown_linux_gnu = "-DHAVE_FDATASYNC=1 -DHAVE_POSIX_FALLOCATE=1"
+CFLAGS_aarch64_unknown_linux_gnu = "-DHAVE_FDATASYNC=1 -DHAVE_POSIX_FALLOCATE=1"
+CFLAGS_x86_64_unknown_linux_musl = "-DHAVE_FDATASYNC=1 -DHAVE_POSIX_FALLOCATE=1"
+CFLAGS_aarch64_unknown_linux_musl = "-DHAVE_FDATASYNC=1 -DHAVE_POSIX_FALLOCATE=1"

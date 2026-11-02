@@ -142,7 +142,7 @@ jobs:
       - name: Profile Core forwarding and confirmed consumer ACKs
         run: |
           sudo apt-get update
-          sudo apt-get install -y linux-tools-generic
+          sudo apt-get install -y linux-tools-generic strace
           sudo sysctl kernel.perf_event_paranoid=1
           perf_binary=$(find -L /usr/lib/linux-tools -type f -name perf | sort | tail -1)
           test -n "$perf_binary"
@@ -153,6 +153,9 @@ jobs:
           sudo python3 scripts/profile_jetstream.py --include-kernel --screech target/release/screech-server \
             --nats bin/nats-server --driver bin/bench-driver --perf "$perf_binary" \
             --output jetstream-profiles
+          sudo python3 scripts/profile_publication_io.py --screech target/release/screech-server \
+            --nats bin/nats-server --driver bin/bench-driver --strace "$(command -v strace)" \
+            --output publication-io-profiles
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
@@ -163,6 +166,11 @@ jobs:
         with:
           name: jetstream-profiles
           path: jetstream-profiles/
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: publication-io-profiles
+          path: publication-io-profiles/
       - name: Generate benchmark dashboard
         run: |
           python3 scripts/render_benchmarks.py \

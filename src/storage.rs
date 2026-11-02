@@ -265,6 +265,52 @@ fn checksum(sequence: u64, subject: &str, headers: &[u8], payload: &[u8]) -> u32
     }
     h.finalize()
 }
+// Allocation hint only: all commits still use SQLite's WAL FULL sync path.
+fn reserve_wal(connection: &Connection) {
+    use rusqlite::ffi;
+    // SAFETY: the connection has one owner and remains alive throughout this call.
+    // SQLite returns its current WAL file; no pointer is retained, and supported
+    // VFS controls only extend allocation beyond EOF, preserving the valid prefix.
+    unsafe {
+        let mut file: *mut ffi::sqlite3_file = std::ptr::null_mut();
+        let rc = ffi::sqlite3_file_control(
+            connection.handle(),
+            c"main".as_ptr(),
+            ffi::SQLITE_FCNTL_JOURNAL_POINTER,
+            std::ptr::addr_of_mut!(file).cast(),
+        );
+        if rc != ffi::SQLITE_OK || file.is_null() || (*file).pMethods.is_null() {
+            return;
+        }
+        let Some(control) = (*(*file).pMethods).xFileControl else {
+            return;
+        };
+        let mut chunk: i32 = 32 * 1024 * 1024;
+        if control(
+            file,
+            ffi::SQLITE_FCNTL_CHUNK_SIZE,
+            std::ptr::addr_of_mut!(chunk).cast(),
+        ) != ffi::SQLITE_OK
+        {
+            return;
+        }
+        let mut bytes: i64 = chunk.into();
+        let rc = control(
+            file,
+            ffi::SQLITE_FCNTL_SIZE_HINT,
+            std::ptr::addr_of_mut!(bytes).cast(),
+        );
+        chunk = 0;
+        control(
+            file,
+            ffi::SQLITE_FCNTL_CHUNK_SIZE,
+            std::ptr::addr_of_mut!(chunk).cast(),
+        );
+        if rc != ffi::SQLITE_OK {
+            tracing::debug!(sqlite_code = rc, "WAL allocation hint unavailable");
+        }
+    }
+}
 impl SqliteStore {
     fn append_transaction(
         &mut self,
@@ -443,14 +489,14 @@ impl SqliteStore {
         // allocation between transactions; FULL still synchronizes every commit.
         conn.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
         conn.pragma_update(None, "wal_autocheckpoint", 4096)?;
-        conn.pragma_update(None, "journal_size_limit", 8 * 1024 * 1024)?;
+        conn.pragma_update(None, "journal_size_limit", 32 * 1024 * 1024)?;
         let mode: String = conn.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
         let sync: i64 = conn.pragma_query_value(None, "synchronous", |r| r.get(0))?;
         if mode != "wal" || sync != 2 {
             return Err(StoreError::Invalid);
         }
         conn.execute_batch("CREATE TABLE IF NOT EXISTS meta (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, last_seq INTEGER NOT NULL CHECK(last_seq>=0)); INSERT OR IGNORE INTO meta VALUES(1,1,0); CREATE TABLE IF NOT EXISTS snapshot(id INTEGER PRIMARY KEY CHECK(id=1), seq INTEGER NOT NULL, data BLOB NOT NULL, checksum INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS messages(seq INTEGER PRIMARY KEY CHECK(seq>0), subject TEXT NOT NULL, headers BLOB NOT NULL, payload BLOB NOT NULL, checksum INTEGER NOT NULL);")?;
-        conn.execute_batch("CREATE TABLE IF NOT EXISTS retained_content(generation INTEGER NOT NULL CHECK(generation>0),seq INTEGER NOT NULL CHECK(seq>0),subject TEXT NOT NULL,headers BLOB NOT NULL,payload BLOB NOT NULL,checksum INTEGER NOT NULL,PRIMARY KEY(generation,seq)) WITHOUT ROWID; CREATE INDEX IF NOT EXISTS retained_content_keys ON retained_content(generation,seq);")?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS retained_content(generation INTEGER NOT NULL CHECK(generation>0),seq INTEGER NOT NULL CHECK(seq>0),subject TEXT NOT NULL,headers BLOB NOT NULL,payload BLOB NOT NULL,checksum INTEGER NOT NULL,PRIMARY KEY(generation,seq)) WITHOUT ROWID; DROP INDEX IF EXISTS retained_content_keys;")?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS consumer_blocks(first_seq INTEGER PRIMARY KEY CHECK(first_seq>0),last_seq INTEGER NOT NULL CHECK(last_seq>=first_seq),data BLOB NOT NULL CHECK(length(data)<=1048576),checksum INTEGER NOT NULL);")?;
         let version: i64 =
             conn.query_row("SELECT version FROM meta WHERE id=1", [], |r| r.get(0))?;
@@ -461,6 +507,7 @@ impl SqliteStore {
         if check != "ok" {
             return Err(StoreError::Corrupt(0));
         }
+        reserve_wal(&conn);
         lock.seek(SeekFrom::Start(0))?;
         lock.write_all(b"screech sqlite v1\n")?;
         lock.sync_all()?;
@@ -681,6 +728,8 @@ impl Store for SqliteStore {
         live: &mut dyn Iterator<Item = ContentKey>,
         imports: &[Content],
     ) -> Result<(), StoreError> {
+        let diagnostic_start =
+            tracing::enabled!(tracing::Level::DEBUG).then(std::time::Instant::now);
         self.flush_consumer_state(true)?;
         if sequence != self.last_sequence()? {
             return Err(StoreError::Invalid);
@@ -718,10 +767,19 @@ impl Store for SqliteStore {
             "DELETE FROM consumer_blocks WHERE last_seq<=?1",
             [sequence as i64],
         )?;
-        tx.execute("DELETE FROM retained_content WHERE (generation,seq) IN (SELECT c.generation,c.seq FROM retained_content c INDEXED BY retained_content_keys WHERE NOT EXISTS(SELECT 1 FROM live_content l WHERE l.generation=c.generation AND l.seq=c.seq))",[])?;
+        tx.execute("DELETE FROM retained_content WHERE (generation,seq) IN (SELECT c.generation,c.seq FROM retained_content c WHERE NOT EXISTS(SELECT 1 FROM live_content l WHERE l.generation=c.generation AND l.seq=c.seq))",[])?;
         crate::fault::point("before_checkpoint_commit");
         tx.commit()?;
         self.consumer_cache.get_mut().take();
+        if let Some(started) = diagnostic_start {
+            tracing::debug!(
+                sequence,
+                snapshot_bytes = state.len(),
+                store_checkpoint_commit_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "checkpoint committed"
+            );
+        }
+        let restart_start = diagnostic_start.map(|_| std::time::Instant::now());
         crate::fault::point("after_checkpoint_commit");
         crate::fault::point("before_wal_restart");
         let (busy, _, _): (i64, i64, i64) =
@@ -733,6 +791,13 @@ impl Store for SqliteStore {
             return Err(StoreError::Invalid);
         }
         crate::fault::point("after_wal_restart");
+        if let Some(started) = restart_start {
+            tracing::debug!(
+                sequence,
+                wal_restart_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "WAL restart completed"
+            );
+        }
         self.buffered_since = None;
         Ok(())
     }
@@ -1269,5 +1334,61 @@ mod consumer_block_tests {
         .unwrap();
         drop(db);
         assert!(SqliteStore::open(path).is_err());
+    }
+}
+
+#[cfg(test)]
+mod retained_content_layout_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_content_index_migration_preserves_content_replay_and_collection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let content = Content {
+            key: ContentKey {
+                generation: 1,
+                sequence: 1,
+            },
+            subject: "events.a".into(),
+            headers: Bytes::from_static(b"NATS/1.0\r\nX: y\r\n\r\n"),
+            payload: vec![0x5a; 600 * 1024].into(),
+        };
+        let record = Append {
+            subject: "event".into(),
+            headers: Bytes::new(),
+            payload: Bytes::from_static(b"reference"),
+        };
+        let mut store = SqliteStore::open(&path).unwrap();
+        store
+            .append_with_content(&[record], std::slice::from_ref(&content))
+            .unwrap();
+        drop(store);
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch("CREATE INDEX retained_content_keys ON retained_content(generation,seq)")
+            .unwrap();
+        drop(old);
+        let mut store = SqliteStore::open(&path).unwrap();
+        assert_eq!(store.get(1).unwrap().unwrap().payload, b"reference"[..]);
+        assert_eq!(
+            store.get_content(content.key).unwrap(),
+            Some(content.clone())
+        );
+        store
+            .checkpoint_with_content(1, b"snapshot", &mut [content.key].into_iter(), &[])
+            .unwrap();
+        drop(store);
+        let mut store = SqliteStore::open(&path).unwrap();
+        assert_eq!(
+            store.get_content(content.key).unwrap(),
+            Some(content.clone())
+        );
+        store
+            .checkpoint_with_content(1, b"empty", &mut std::iter::empty(), &[])
+            .unwrap();
+        drop(store);
+        let store = SqliteStore::open(path).unwrap();
+        assert_eq!(store.last_sequence().unwrap(), 1);
+        assert!(store.get_content(content.key).unwrap().is_none());
     }
 }
