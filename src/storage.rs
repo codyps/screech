@@ -34,6 +34,35 @@ pub struct Append {
     pub headers: Bytes,
     pub payload: Bytes,
 }
+/// Stable content identity, independent of event-log compaction.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub struct ContentKey {
+    pub generation: u64,
+    pub sequence: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Content {
+    pub key: ContentKey,
+    pub subject: String,
+    pub headers: Bytes,
+    pub payload: Bytes,
+}
+fn content_checksum(content: &Content) -> u32 {
+    let mut h = crc32fast::Hasher::new();
+    h.update(&content.key.generation.to_le_bytes());
+    h.update(
+        &checksum(
+            content.key.sequence,
+            &content.subject,
+            &content.headers,
+            &content.payload,
+        )
+        .to_le_bytes(),
+    );
+    h.finalize()
+}
 /// An atomic durable append log. Metadata and records share one transaction domain.
 pub trait Store: Send {
     fn append(&mut self, subject: &str, headers: &[u8], payload: &[u8]) -> Result<u64, StoreError>;
@@ -48,6 +77,58 @@ pub trait Store: Send {
     }
     fn supports_batch(&self) -> bool {
         false
+    }
+    fn external_content(&self) -> bool {
+        false
+    }
+    /// Content and all transitions become durable in the same transaction.
+    fn append_with_content(
+        &mut self,
+        records: &[Append],
+        content: &[Content],
+    ) -> Result<u64, StoreError> {
+        if !content.is_empty() {
+            return Err(StoreError::Invalid);
+        }
+        if let [record] = records {
+            self.append(&record.subject, &record.headers, &record.payload)
+        } else {
+            self.append_batch(records)
+        }
+    }
+    fn get_content(&self, _key: ContentKey) -> Result<Option<Content>, StoreError> {
+        Err(StoreError::Invalid)
+    }
+    /// Validate a reference without loading its body when the backend supports it.
+    fn validate_content(
+        &self,
+        key: ContentKey,
+        subject: &str,
+        headers: u64,
+        payload: u64,
+    ) -> Result<(), StoreError> {
+        match self.get_content(key)? {
+            Some(c)
+                if c.subject == subject
+                    && c.headers.len() as u64 == headers
+                    && c.payload.len() as u64 == payload =>
+            {
+                Ok(())
+            }
+            _ => Err(StoreError::Corrupt(key.sequence)),
+        }
+    }
+    fn checkpoint_with_content(
+        &mut self,
+        sequence: u64,
+        state: &[u8],
+        live: &mut dyn Iterator<Item = ContentKey>,
+        imports: &[Content],
+    ) -> Result<(), StoreError> {
+        if live.next().is_some() || !imports.is_empty() {
+            return Err(StoreError::Invalid);
+        }
+        self.checkpoint(sequence, state)
     }
     fn get(&self, sequence: u64) -> Result<Option<Record>, StoreError>;
     fn last_sequence(&self) -> Result<u64, StoreError>;
@@ -167,6 +248,9 @@ impl SqliteStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
+        conn.pragma_update(None, "cache_size", -8192)?;
+        conn.pragma_update(None, "temp_store", "FILE")?;
+        conn.pragma_update(None, "mmap_size", 0)?;
         // The store already has one exclusive owner. Retain SQLite's locks and WAL
         // allocation between transactions; FULL still synchronizes every commit.
         conn.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
@@ -178,6 +262,7 @@ impl SqliteStore {
             return Err(StoreError::Invalid);
         }
         conn.execute_batch("CREATE TABLE IF NOT EXISTS meta (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, last_seq INTEGER NOT NULL CHECK(last_seq>=0)); INSERT OR IGNORE INTO meta VALUES(1,1,0); CREATE TABLE IF NOT EXISTS snapshot(id INTEGER PRIMARY KEY CHECK(id=1), seq INTEGER NOT NULL, data BLOB NOT NULL, checksum INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS messages(seq INTEGER PRIMARY KEY CHECK(seq>0), subject TEXT NOT NULL, headers BLOB NOT NULL, payload BLOB NOT NULL, checksum INTEGER NOT NULL);")?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS retained_content(generation INTEGER NOT NULL CHECK(generation>0),seq INTEGER NOT NULL CHECK(seq>0),subject TEXT NOT NULL,headers BLOB NOT NULL,payload BLOB NOT NULL,checksum INTEGER NOT NULL,PRIMARY KEY(generation,seq)) WITHOUT ROWID;")?;
         let version: i64 =
             conn.query_row("SELECT version FROM meta WHERE id=1", [], |r| r.get(0))?;
         if version != 1 {
@@ -225,6 +310,163 @@ impl SqliteStore {
     }
 }
 impl Store for SqliteStore {
+    fn external_content(&self) -> bool {
+        true
+    }
+    fn append_with_content(
+        &mut self,
+        records: &[Append],
+        content: &[Content],
+    ) -> Result<u64, StoreError> {
+        if content.is_empty() {
+            return if let [r] = records {
+                self.append(&r.subject, &r.headers, &r.payload)
+            } else {
+                self.append_batch(records)
+            };
+        }
+        if records.is_empty() {
+            return Err(StoreError::Invalid);
+        }
+        let last = self.last;
+        let end = last
+            .checked_add(records.len() as u64)
+            .filter(|n| *n <= i64::MAX as u64)
+            .ok_or(StoreError::Invalid)?;
+        let tx = self.connection.transaction()?;
+        {
+            let mut insert =
+                tx.prepare_cached("INSERT INTO retained_content VALUES(?1,?2,?3,?4,?5,?6)")?;
+            for c in content {
+                insert.execute(params![
+                    i64::try_from(c.key.generation).map_err(|_| StoreError::Invalid)?,
+                    i64::try_from(c.key.sequence).map_err(|_| StoreError::Invalid)?,
+                    c.subject,
+                    c.headers.as_ref(),
+                    c.payload.as_ref(),
+                    content_checksum(c)
+                ])?;
+            }
+            let mut insert = tx.prepare_cached("INSERT INTO messages VALUES(?1,?2,?3,?4,?5)")?;
+            for (offset, r) in records.iter().enumerate() {
+                let seq = last + offset as u64 + 1;
+                insert.execute(params![
+                    seq as i64,
+                    r.subject,
+                    r.headers.as_ref(),
+                    r.payload.as_ref(),
+                    checksum(seq, &r.subject, &r.headers, &r.payload)
+                ])?;
+            }
+        }
+        if tx
+            .prepare_cached("UPDATE meta SET last_seq=?1 WHERE id=1 AND last_seq=?2")?
+            .execute([end as i64, last as i64])?
+            != 1
+        {
+            return Err(StoreError::Invalid);
+        }
+        if records.len() > 1 {
+            crate::fault::point("before_group_store_commit");
+        }
+        crate::fault::point("before_commit");
+        tx.commit()?;
+        crate::fault::point("after_commit");
+        if records.len() > 1 {
+            crate::fault::point("after_group_store_commit");
+        }
+        self.last = end;
+        Ok(end)
+    }
+    fn get_content(&self, key: ContentKey) -> Result<Option<Content>, StoreError> {
+        let generation = i64::try_from(key.generation).map_err(|_| StoreError::Invalid)?;
+        let seq = i64::try_from(key.sequence).map_err(|_| StoreError::Invalid)?;
+        let row = self.connection.query_row("SELECT subject,headers,payload,checksum FROM retained_content WHERE generation=?1 AND seq=?2",[generation,seq], |r| Ok((r.get::<_,String>(0)?,r.get::<_,Vec<u8>>(1)?,r.get::<_,Vec<u8>>(2)?,r.get::<_,u32>(3)?))).optional()?;
+        row.map(|(subject, headers, payload, crc)| {
+            let content = Content {
+                key,
+                subject,
+                headers: headers.into(),
+                payload: payload.into(),
+            };
+            if content_checksum(&content) != crc {
+                return Err(StoreError::Corrupt(key.sequence));
+            }
+            Ok(content)
+        })
+        .transpose()
+    }
+    fn validate_content(
+        &self,
+        key: ContentKey,
+        subject: &str,
+        headers: u64,
+        payload: u64,
+    ) -> Result<(), StoreError> {
+        let row = self.connection.query_row("SELECT subject,length(headers),length(payload) FROM retained_content WHERE generation=?1 AND seq=?2", params![i64::try_from(key.generation).map_err(|_| StoreError::Invalid)?,i64::try_from(key.sequence).map_err(|_| StoreError::Invalid)?], |r| Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?))).optional()?;
+        if row.as_ref().is_some_and(|(s, h, p)| {
+            s == subject && *h >= 0 && *p >= 0 && *h as u64 == headers && *p as u64 == payload
+        }) {
+            Ok(())
+        } else {
+            Err(StoreError::Corrupt(key.sequence))
+        }
+    }
+    fn checkpoint_with_content(
+        &mut self,
+        sequence: u64,
+        state: &[u8],
+        live: &mut dyn Iterator<Item = ContentKey>,
+        imports: &[Content],
+    ) -> Result<(), StoreError> {
+        if sequence != self.last_sequence()? {
+            return Err(StoreError::Invalid);
+        }
+        let tx = self.connection.transaction()?;
+        tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS live_content(generation INTEGER,seq INTEGER,PRIMARY KEY(generation,seq)) WITHOUT ROWID; DELETE FROM live_content;")?;
+        {
+            let mut insert =
+                tx.prepare_cached("INSERT INTO retained_content VALUES(?1,?2,?3,?4,?5,?6)")?;
+            for c in imports {
+                insert.execute(params![
+                    i64::try_from(c.key.generation).map_err(|_| StoreError::Invalid)?,
+                    i64::try_from(c.key.sequence).map_err(|_| StoreError::Invalid)?,
+                    c.subject,
+                    c.headers.as_ref(),
+                    c.payload.as_ref(),
+                    content_checksum(c)
+                ])?;
+            }
+            let mut insert = tx.prepare_cached("INSERT INTO live_content VALUES(?1,?2)")?;
+            for key in live {
+                insert.execute([
+                    i64::try_from(key.generation).map_err(|_| StoreError::Invalid)?,
+                    i64::try_from(key.sequence).map_err(|_| StoreError::Invalid)?,
+                ])?;
+            }
+        }
+        let missing:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM live_content l WHERE NOT EXISTS(SELECT 1 FROM retained_content c WHERE c.generation=l.generation AND c.seq=l.seq))",[],|r|r.get(0))?;
+        if missing {
+            return Err(StoreError::Corrupt(sequence));
+        }
+        tx.execute("INSERT INTO snapshot VALUES(1,?1,?2,?3) ON CONFLICT(id) DO UPDATE SET seq=excluded.seq,data=excluded.data,checksum=excluded.checksum",params![sequence as i64,state,checksum(sequence,"$SCREECH.snapshot.v2",&[],state)])?;
+        tx.execute("DELETE FROM messages WHERE seq<=?1", [sequence as i64])?;
+        tx.execute("DELETE FROM retained_content WHERE NOT EXISTS(SELECT 1 FROM live_content l WHERE l.generation=retained_content.generation AND l.seq=retained_content.seq)",[])?;
+        crate::fault::point("before_checkpoint_commit");
+        tx.commit()?;
+        crate::fault::point("after_checkpoint_commit");
+        crate::fault::point("before_wal_restart");
+        let (busy, _, _): (i64, i64, i64) =
+            self.connection
+                .query_row("PRAGMA wal_checkpoint(RESTART)", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?;
+        if busy != 0 {
+            return Err(StoreError::Invalid);
+        }
+        crate::fault::point("after_wal_restart");
+        Ok(())
+    }
     fn supports_batch(&self) -> bool {
         true
     }
