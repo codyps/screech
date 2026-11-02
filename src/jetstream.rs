@@ -136,6 +136,8 @@ impl Handle {
             let mut deferred = None;
             let mut idle_wait = Duration::from_millis(10);
             let mut poll_after_reply = false;
+            // ACK-only rounds return an empty vector for the next admission burst.
+            let mut request_scratch = Vec::with_capacity(32);
             loop {
                 if worker_stop.load(std::sync::atomic::Ordering::Acquire) {
                     break;
@@ -167,7 +169,8 @@ impl Handle {
                     Ok(req) if worker.groupable(&req.message) => {
                         crate::fault::group_gate();
                         let mut bytes = req.message.payload.len() + req.message.headers.len();
-                        let mut requests = Vec::with_capacity(32);
+                        let mut requests = std::mem::take(&mut request_scratch);
+                        requests.reserve(32);
                         requests.push(req);
                         while requests.len() < 32 {
                             match rx.try_recv() {
@@ -191,8 +194,9 @@ impl Handle {
                         let active_consumers = !worker.pulls.is_empty() || worker.has_push();
                         if requests.iter().all(|req| simple_ack(&req.message)) && !active_consumers
                         {
-                            poll_after_reply = worker.ack_requests(requests)
-                                && worker.engine.buffers_consumer_state();
+                            let (replied, scratch) = worker.ack_requests(requests);
+                            request_scratch = scratch;
+                            poll_after_reply = replied && worker.engine.buffers_consumer_state();
                         } else if worker.engine.supports_groups()
                             && (requests.len() > 1 || active_consumers)
                         {
@@ -1596,10 +1600,38 @@ impl<S: Store> Worker<S> {
         }
         Ok(true)
     }
-    fn ack_requests(&mut self, requests: Vec<Request>) -> bool {
+    fn finish_ack_request(&self, request: Request, committed: Result<(), String>) -> bool {
+        let has_reply = request.message.reply.is_some();
+        let result = committed.and_then(|()| {
+            self.after_commit_point("before_ack_reply");
+            if let Some(reply) = request.message.reply {
+                self.emit(Message {
+                    subject: reply,
+                    reply: None,
+                    headers: Bytes::new(),
+                    payload: Bytes::new(),
+                })?;
+            }
+            Ok(true)
+        });
+        let replied = has_reply && result.is_ok();
+        let _ = request.response.send(result);
+        replied
+    }
+    fn ack_requests(&mut self, mut requests: Vec<Request>) -> (bool, Vec<Request>) {
+        if requests.len() == 1 {
+            // A standalone ACK needs neither an event list nor a valid-request list.
+            let request = requests.pop().unwrap();
+            let Some((event, _)) = self.prepare_ack_message(&request.message) else {
+                let _ = request.response.send(Ok(true));
+                return (false, requests);
+            };
+            let result = self.commit(event);
+            return (self.finish_ack_request(request, result), requests);
+        }
         let mut events = Vec::with_capacity(requests.len());
         let mut valid = Vec::with_capacity(requests.len());
-        for request in requests {
+        for request in requests.drain(..) {
             if let Some((event, _)) = self.prepare_ack_message(&request.message) {
                 events.push(event);
                 valid.push(request);
@@ -1608,7 +1640,7 @@ impl<S: Store> Worker<S> {
             }
         }
         if events.is_empty() {
-            return false;
+            return (false, requests);
         }
         let event = if events.len() == 1 {
             events.pop().unwrap()
@@ -1618,23 +1650,9 @@ impl<S: Store> Worker<S> {
         let result = self.commit(event);
         let mut replied = false;
         for request in valid {
-            let has_reply = request.message.reply.is_some();
-            let result = result.clone().and_then(|()| {
-                self.after_commit_point("before_ack_reply");
-                if let Some(reply) = request.message.reply {
-                    self.emit(Message {
-                        subject: reply,
-                        reply: None,
-                        headers: Bytes::new(),
-                        payload: Bytes::new(),
-                    })?;
-                }
-                Ok(true)
-            });
-            replied |= has_reply && result.is_ok();
-            let _ = request.response.send(result);
+            replied |= self.finish_ack_request(request, result.clone());
         }
-        replied
+        (replied, requests)
     }
     fn maintain(&mut self) -> Result<bool, String> {
         if self.engine.is_poisoned() {
@@ -1801,6 +1819,50 @@ mod output_adapter_tests {
         assert!(handle
             .attach_output(Arc::new(|_, _| true), Arc::new(|_| Ok(())))
             .is_err());
+        handle.shutdown().await;
+    }
+    #[tokio::test]
+    async fn ignored_ack_bursts_release_admission_and_do_not_emit_confirmations() {
+        let handle = Handle::start(crate::storage::MemoryStore::default()).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = seen.clone();
+        handle
+            .attach_output(
+                Arc::new(|_, _| true),
+                Arc::new(move |out| {
+                    captured.lock().unwrap().push(out.target);
+                    Ok(())
+                }),
+            )
+            .unwrap();
+        // Exceed the entire admission budget repeatedly, with both singleton
+        // and queued ACK bursts, including an unrelated request between rounds.
+        for width in [1, 8, 32] {
+            for round in 0..32 {
+                let pending: Vec<_> = (0..width)
+                    .map(|i| {
+                        handle
+                            .try_request(Message {
+                                subject: "$JS.ACK._.1.missing.D.1.1.1.1.0.1".into(),
+                                reply: Some(format!("_INBOX.ignored.{width}.{round}.{i}")),
+                                headers: Bytes::new(),
+                                payload: Bytes::new(),
+                            })
+                            .unwrap()
+                    })
+                    .collect();
+                for request in pending {
+                    assert!(tokio::time::timeout(Duration::from_secs(2), request.wait())
+                        .await
+                        .unwrap()
+                        .unwrap());
+                }
+                if round % 8 == 0 {
+                    assert!(handle.request(info("_INBOX.info")).await.unwrap());
+                }
+            }
+        }
+        assert_eq!(*seen.lock().unwrap(), vec!["_INBOX.info"; 12]);
         handle.shutdown().await;
     }
 }
