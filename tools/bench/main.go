@@ -26,7 +26,15 @@ func run() error {
 	n := flag.Int("n", 100000, "publishes")
 	size := flag.Int("size", 128, "payload bytes, at least 8")
 	subscribers := flag.Int("subscribers", 1, "subscribers")
+	profileGate := flag.String("profile-gate", "", "consumer profiling barriers; excludes prefill and validation")
 	flag.Parse()
+	if *profileGate != "" {
+		switch *scenario {
+		case "consume", "consume-one", "consume-parallel", "consume-ack-window", "consume-limits", "consume-next":
+		default:
+			return fmt.Errorf("profile gate requires a consumer scenario")
+		}
+	}
 	if *n <= 0 || *size < 8 || *subscribers <= 0 {
 		return fmt.Errorf("invalid workload")
 	}
@@ -136,6 +144,9 @@ func run() error {
 				ackClients = append(ackClients, c)
 			}
 		}
+		if e = profileBarrier(*profileGate, ".ready", ".release"); e != nil {
+			return e
+		}
 		start := time.Now()
 		received := 0
 		var nextMessage *nats.Msg
@@ -219,6 +230,9 @@ func run() error {
 			received += len(messages)
 		}
 		elapsed = time.Since(start)
+		if e = profileBarrier(*profileGate, ".complete", ".finish"); e != nil {
+			return e
+		}
 		deliveries = int64(received)
 		ci, e := js.ConsumerInfo(name, "D")
 		if e != nil {
@@ -573,4 +587,27 @@ func coreTopology(s string) (int, int) {
 		return 8192, 512
 	}
 	return 1, 0
+}
+
+// Barriers bracket only the measured consumer phase. The profiler enables events
+// after prefill and stops them before allowing post-workload verification to run.
+func profileBarrier(path, marker, release string) error {
+	if path == "" {
+		return nil
+	}
+	if err := os.WriteFile(path+marker, []byte("ready"), 0600); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if _, err := os.Stat(path + release); err == nil {
+			return nil
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("profile gate timeout: %s", marker)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }

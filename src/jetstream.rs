@@ -138,7 +138,7 @@ impl Handle {
                         // A confirmed buffered ACK often precedes the next Fetch(1).
                         // Briefly poll to avoid a sleep/wakeup on that round trip;
                         // idle connections and strictly durable stores still sleep.
-                        let until = std::time::Instant::now() + Duration::from_micros(16);
+                        let until = std::time::Instant::now() + Duration::from_micros(64);
                         loop {
                             match rx.try_recv() {
                                 Ok(request) => return Ok(request),

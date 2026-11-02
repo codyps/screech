@@ -139,7 +139,7 @@ jobs:
         run: |
           python3 scripts/check_jetstream_targets.py --standard results/standard.json --concurrent results/concurrent.json --server screech --minimum-trials "$TRIALS" --report-only --output results/jetstream-full-targets.json
           python3 scripts/check_jetstream_targets.py --standard results/standard.json --concurrent results/concurrent.json --server screech-unsafe-ack --minimum-trials "$TRIALS" --report-only --output results/jetstream-unsafe-ack-targets.json
-      - name: Profile 1 KiB Core forwarding
+      - name: Profile Core forwarding and separate Fetch(1)/ACK
         run: |
           sudo apt-get update
           sudo apt-get install -y linux-tools-generic
@@ -150,11 +150,19 @@ jobs:
           sudo python3 scripts/profile_core.py --include-kernel --screech target/release/screech-server \
             --nats bin/nats-server --driver bin/bench-driver --perf "$perf_binary" \
             --output core-profiles
+          sudo python3 scripts/profile_jetstream.py --include-kernel --screech target/release/screech-server \
+            --nats bin/nats-server --driver bin/bench-driver --perf "$perf_binary" \
+            --output jetstream-profiles
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: core-profiles
           path: core-profiles/
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: jetstream-profiles
+          path: jetstream-profiles/
       - name: Generate benchmark dashboard
         run: |
           python3 scripts/render_benchmarks.py \
