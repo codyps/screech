@@ -1138,7 +1138,7 @@ fn recovery_rejects_inconsistent_ack_history_indexes() {
             }
             _ => (),
         }
-        let bytes = postcard::to_allocvec(&(2u8, state)).unwrap();
+        let bytes = postcard::to_allocvec(&(3u8, state)).unwrap();
         let mut store = engine.into_store();
         store
             .checkpoint(store.last_sequence().unwrap(), &bytes)
@@ -1259,7 +1259,7 @@ fn checkpoint_byte_budget_includes_replayed_records() {
         }
         assert_eq!(engine.state().streams["S"].messages.len(), 8);
         for message in engine.state().streams["S"].messages.values() {
-            assert_eq!(message.payload, body);
+            assert_eq!(engine.read_message(message).unwrap().payload, body);
         }
         engine.state().check_invariants().unwrap();
     }

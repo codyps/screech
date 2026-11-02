@@ -262,7 +262,7 @@ impl SqliteStore {
             return Err(StoreError::Invalid);
         }
         conn.execute_batch("CREATE TABLE IF NOT EXISTS meta (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, last_seq INTEGER NOT NULL CHECK(last_seq>=0)); INSERT OR IGNORE INTO meta VALUES(1,1,0); CREATE TABLE IF NOT EXISTS snapshot(id INTEGER PRIMARY KEY CHECK(id=1), seq INTEGER NOT NULL, data BLOB NOT NULL, checksum INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS messages(seq INTEGER PRIMARY KEY CHECK(seq>0), subject TEXT NOT NULL, headers BLOB NOT NULL, payload BLOB NOT NULL, checksum INTEGER NOT NULL);")?;
-        conn.execute_batch("CREATE TABLE IF NOT EXISTS retained_content(generation INTEGER NOT NULL CHECK(generation>0),seq INTEGER NOT NULL CHECK(seq>0),subject TEXT NOT NULL,headers BLOB NOT NULL,payload BLOB NOT NULL,checksum INTEGER NOT NULL,PRIMARY KEY(generation,seq)) WITHOUT ROWID;")?;
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS retained_content(generation INTEGER NOT NULL CHECK(generation>0),seq INTEGER NOT NULL CHECK(seq>0),subject TEXT NOT NULL,headers BLOB NOT NULL,payload BLOB NOT NULL,checksum INTEGER NOT NULL,PRIMARY KEY(generation,seq)) WITHOUT ROWID; CREATE INDEX IF NOT EXISTS retained_content_keys ON retained_content(generation,seq);")?;
         let version: i64 =
             conn.query_row("SELECT version FROM meta WHERE id=1", [], |r| r.get(0))?;
         if version != 1 {
@@ -451,7 +451,7 @@ impl Store for SqliteStore {
         }
         tx.execute("INSERT INTO snapshot VALUES(1,?1,?2,?3) ON CONFLICT(id) DO UPDATE SET seq=excluded.seq,data=excluded.data,checksum=excluded.checksum",params![sequence as i64,state,checksum(sequence,"$SCREECH.snapshot.v2",&[],state)])?;
         tx.execute("DELETE FROM messages WHERE seq<=?1", [sequence as i64])?;
-        tx.execute("DELETE FROM retained_content WHERE NOT EXISTS(SELECT 1 FROM live_content l WHERE l.generation=retained_content.generation AND l.seq=retained_content.seq)",[])?;
+        tx.execute("DELETE FROM retained_content WHERE (generation,seq) IN (SELECT c.generation,c.seq FROM retained_content c INDEXED BY retained_content_keys WHERE NOT EXISTS(SELECT 1 FROM live_content l WHERE l.generation=c.generation AND l.seq=c.seq))",[])?;
         crate::fault::point("before_checkpoint_commit");
         tx.commit()?;
         crate::fault::point("after_checkpoint_commit");

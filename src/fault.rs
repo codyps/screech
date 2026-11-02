@@ -111,7 +111,11 @@ pub fn group_ingress() {
 pub fn group_ingress() {}
 
 #[cfg(feature = "fault-injection")]
-pub fn group_context(base: u64, records: &[crate::storage::Append]) {
+pub fn group_context(
+    base: u64,
+    records: &[crate::storage::Append],
+    events: &[crate::durable::Event],
+) {
     if std::env::var("SCREECH_FAULT_POINT").is_err() {
         return;
     }
@@ -121,9 +125,15 @@ pub fn group_context(base: u64, records: &[crate::storage::Append]) {
         {
             return;
         }
-        let rows: Vec<_> = records.iter().map(|r| serde_json::json!({
-            "event":serde_json::from_slice::<serde_json::Value>(&r.headers).unwrap(), "payload":r.payload.as_ref()
-        })).collect();
+        let rows: Vec<_> = records.iter().zip(events).map(|(r, event)| {
+            let payload = match event {
+                crate::durable::Event::Publish { message, .. } => &message.payload,
+                _ => &r.payload,
+            };
+            serde_json::json!({
+                "event":serde_json::from_slice::<serde_json::Value>(&r.headers).unwrap(), "payload":payload.as_ref()
+            })
+        }).collect();
         std::fs::write(
             format!("{marker}.group"),
             serde_json::to_vec(&serde_json::json!({"base":base,"records":rows})).unwrap(),
@@ -131,9 +141,6 @@ pub fn group_context(base: u64, records: &[crate::storage::Append]) {
         .expect("group context");
     }
 }
-#[cfg(not(feature = "fault-injection"))]
-#[inline(always)]
-pub fn group_context(_: u64, _: &[crate::storage::Append]) {}
 
 /// Pause after the initial projection, before admitting arrivals during assembly.
 #[cfg(feature = "fault-injection")]

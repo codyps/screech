@@ -499,6 +499,19 @@ impl<S: Store> Worker<S> {
             .map(|p| p.state())
             .unwrap_or_else(|| self.engine.state())
     }
+    fn read_message(
+        &self,
+        message: &durable::StoredMessage,
+    ) -> Result<durable::StoredMessage, String> {
+        if let Some(result) = self
+            .plan
+            .as_ref()
+            .and_then(|p| p.read_staged_message(message))
+        {
+            return result.map_err(|e| e.to_string());
+        }
+        self.engine.read_message(message).map_err(|e| e.to_string())
+    }
     fn has_push(&self) -> bool {
         self.state().streams.values().any(|s| {
             s.consumers.values().any(|c| {
@@ -1012,7 +1025,8 @@ impl<S: Store> Worker<S> {
                         .and_then(Value::as_u64)
                         .and_then(|n| s.messages.get(&n))
                 };
-                Ok(m.map(raw_message).unwrap_or_else(||json!({"type":"io.nats.jetstream.api.v1.stream_msg_get_response","error":{"code":404,"err_code":10037,"description":"Message not found"}})))
+                let m = m.map(|m| self.read_message(m)).transpose()?;
+                Ok(m.as_ref().map(raw_message).unwrap_or_else(||json!({"type":"io.nats.jetstream.api.v1.stream_msg_get_response","error":{"code":404,"err_code":10037,"description":"Message not found"}})))
             }
             ["CONSUMER", "CREATE", stream]
             | ["CONSUMER", "CREATE", stream, _]
@@ -1252,7 +1266,7 @@ impl<S: Store> Worker<S> {
                 unreachable!()
             };
             let stream = &self.state().streams[&p.stream];
-            let message = stream.messages[&delivery.sequence].clone();
+            let message = self.read_message(&stream.messages[&delivery.sequence])?;
             let size = message.size() as usize;
             if p.max_bytes > 0 && size > p.max_bytes.saturating_sub(p.bytes) {
                 self.status(&p.inbox, 409, "Batch Completed", p.remaining)?;
@@ -1280,7 +1294,11 @@ impl<S: Store> Worker<S> {
                     &p.consumer,
                     self.time(),
                     limit,
-                    if p.max_bytes == 0 { 0 } else { available },
+                    if p.max_bytes == 0 {
+                        8 * 1024 * 1024
+                    } else {
+                        available.min(8 * 1024 * 1024)
+                    },
                 )
                 .map_err(|e| e.to_string())?
         };
@@ -1308,9 +1326,13 @@ impl<S: Store> Worker<S> {
                 if d.attempt == 1 {
                     ready = ready.saturating_sub(1);
                 }
-                (stream.messages[&d.sequence].clone(), d.clone(), ready)
+                Ok((
+                    self.read_message(&stream.messages[&d.sequence])?,
+                    d.clone(),
+                    ready,
+                ))
             })
-            .collect();
+            .collect::<Result<_, String>>()?;
         self.commit(event)?;
         for (message, delivery, ready) in messages {
             let size = message.size() as usize;
@@ -1451,7 +1473,7 @@ impl<S: Store> Worker<S> {
                                 unreachable!()
                             };
                             let state = &self.state().streams[stream];
-                            let message = state.messages[&delivery.sequence].clone();
+                            let message = self.read_message(&state.messages[&delivery.sequence])?;
                             if pull.max_bytes == 0 || message.size() as usize <= pull.max_bytes {
                                 let delivery = delivery.clone();
                                 self.commit(combined)?;

@@ -77,9 +77,9 @@ stream/consumer generations fence stale ACKs after delete/recreate. The determin
 model accepts explicit time; the adapter uses monotonic elapsed time anchored to
 persisted/system time. Ambiguous storage errors poison the engine until recovery.
 
-Atomic binary checkpoints cover the entire live state, sequence high-water marks,
+Atomic binary checkpoints cover live message metadata, sequence high-water marks,
 consumer floors/pending sets and deduplication windows. They replace covered log
-entries in one FULL transaction, automatically after 2048 events or an 8 MiB tail.
+entries in one FULL transaction, automatically after 8192 events or an 8 MiB tail.
 Startup validates snapshot/record checksums, versions, continuity and model invariants.
 Known missing/empty databases fail closed. Recovery rejects unsupported record
 and snapshot versions.
@@ -87,11 +87,24 @@ and snapshot versions.
 Keep the `.db`, `-wal`, `-shm` (when present) and `.db.lock` files together. Use local storage with
 working locks and flushes. Removing a live WAL or copying only the database is not
 a backup. Checkpoints reclaim log rows; SQLite reuses free pages and its file retains
-a high-water size. This is not secure deletion. Live messages remain in memory;
-configure limits because unbounded streams/windows have no global resource quota.
-Online backup/restore, disk-read paging and arbitrary I/O/power-fault simulation are
-still needed. Detected corruption blocks startup; losing a valid WAL suffix is not
-guaranteed detectable without an external witness.
+a high-water size. This is not secure deletion.
+
+File-backed JetStream keeps retained headers and payloads in SQLite, separate from
+the event log. The model holds content references and byte lengths; GET and consumer
+delivery load only selected bodies. Content and publish transitions commit together
+in one FULL transaction. Checkpoints contain metadata and atomically reclaim bodies
+that retention, purge or deletion removed. Recovery imports older inline checkpoints
+before serving. SQLite uses an 8 MiB page-cache target, file-backed temporary tables
+and no database mmap. Delivery selection loads at most 64 messages / 8 MiB per batch;
+individual messages, staged groups and output queues can add bounded transient memory.
+
+Memory still scales with message count: subjects, sequence indexes, consumer pending
+sets, deduplication windows and checkpoint metadata remain resident. Large populations
+of tiny messages or unique subjects need configured limits. Paging those indexes and
+online backup/restore remain future work. Startup validates content references without
+loading all bodies; body checksums are verified on read and a failure stops JetStream
+processing. Losing a valid WAL suffix is not guaranteed detectable without an external
+witness.
 
 ## Validation and further work
 
@@ -121,7 +134,7 @@ SQLite RESTART checkpoints synchronize the database before the WAL can be reused
 
 Automatic WAL checkpointing is set to 4096 pages. An 8 MiB journal-size target limits
 retained allocation at WAL reuse; it is not a hard peak quota. Large transactions or
-snapshots can exceed it. Application checkpoints remain at 2048 events / 8 MiB of
+snapshots can exceed it. Application checkpoints remain at 8192 events / 8 MiB of
 logical tail. Inspect or copy the database only with the server stopped or through a
 future supported backup interface; SQLite ownership is exclusive while serving.
 See docs/testing.md for real write/sync failure injection and recovery coverage.

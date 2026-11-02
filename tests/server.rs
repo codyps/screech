@@ -1179,3 +1179,63 @@ async fn core_subjects_and_replies_are_opaque_bytes() {
         server.stop().await;
     }
 }
+
+#[tokio::test]
+async fn large_disk_backed_batch_survives_ack_none_interest_removal() {
+    use async_nats::jetstream::{
+        consumer::{pull, AckPolicy},
+        stream::RetentionPolicy,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let handle = screech::jetstream::Handle::start(
+        screech::storage::SqliteStore::open(dir.path().join("db")).unwrap(),
+    )
+    .unwrap();
+    let server = Running::start(Config {
+        jetstream: Some(handle),
+        ..Default::default()
+    })
+    .await;
+    let client = async_nats::connect(server.addr.to_string()).await.unwrap();
+    let js = async_nats::jetstream::new(client.clone());
+    let mut stream = js
+        .create_stream(async_nats::jetstream::stream::Config {
+            name: "S".into(),
+            subjects: vec!["large".into()],
+            retention: RetentionPolicy::Interest,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let consumer = stream
+        .create_consumer(pull::Config {
+            durable_name: Some("D".into()),
+            ack_policy: AckPolicy::None,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    for i in 0..40u8 {
+        js.publish("large", vec![i; 256 * 1024].into())
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+    }
+    let mut batch = consumer.fetch().max_messages(40).messages().await.unwrap();
+    for i in 0..40u8 {
+        let m = timeout(Duration::from_secs(5), batch.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.payload, vec![i; 256 * 1024]);
+    }
+    assert!(timeout(Duration::from_secs(3), batch.next())
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(stream.info().await.unwrap().state.messages, 0);
+    drop(client);
+    server.stop().await;
+}

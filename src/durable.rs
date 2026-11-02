@@ -2,7 +2,7 @@
 use crate::{
     core::matches,
     parser::subject,
-    storage::{Store, StoreError},
+    storage::{Content, ContentKey, Store, StoreError},
 };
 use bytes::Bytes;
 use imbl::{OrdMap, OrdSet};
@@ -151,20 +151,29 @@ impl ConsumerConfig {
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContentRef {
+    pub key: ContentKey,
+    pub headers_len: u64,
+    pub payload_len: u64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StoredMessage {
     pub sequence: u64,
     pub subject: String,
     pub headers: Bytes,
     pub payload: Bytes,
     pub time: u64,
+    #[serde(default)]
+    pub content: Option<ContentRef>,
 }
 impl StoredMessage {
     pub fn size(&self) -> u64 {
-        (self.subject.len()
-            + self.headers.len()
-            + self.payload.len()
-            + 30
-            + if self.headers.is_empty() { 0 } else { 4 }) as u64
+        let (headers, payload) = self
+            .content
+            .as_ref()
+            .map(|r| (r.headers_len, r.payload_len))
+            .unwrap_or((self.headers.len() as u64, self.payload.len() as u64));
+        self.subject.len() as u64 + headers + payload + 30 + if headers == 0 { 0 } else { 4 }
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -786,6 +795,7 @@ impl State {
                 headers,
                 payload,
                 time,
+                content: None,
             },
         })
     }
@@ -1095,6 +1105,15 @@ impl State {
                     || m.time > self.time
                 {
                     return Err(invalid("Invalid message snapshot"));
+                }
+                if let Some(r) = &m.content {
+                    if r.key.generation != s.generation
+                        || r.key.sequence != seq
+                        || !m.headers.is_empty()
+                        || !m.payload.is_empty()
+                    {
+                        return Err(invalid("Invalid content reference"));
+                    }
                 }
                 subjects.entry(m.subject.clone()).or_default().insert(seq);
             }
@@ -1646,7 +1665,7 @@ const CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
 pub struct Engine<S> {
     state: State,
     store: S,
-    poisoned: bool,
+    poisoned: std::cell::Cell<bool>,
     log_sequence: u64,
     since_checkpoint: usize,
     log_bytes: usize,
@@ -1658,8 +1677,19 @@ impl<S: Store> Engine<S> {
     pub fn state(&self) -> &State {
         &self.state
     }
+    /// Resolve a selected message without retaining its body in the model.
+    pub fn read_message(&self, message: &StoredMessage) -> Result<StoredMessage, Error> {
+        if self.poisoned.get() {
+            return Err(invalid("Storage failed: restart required"));
+        }
+        let result = hydrate_message(&self.store, message);
+        if result.is_err() {
+            self.poisoned.set(true);
+        }
+        result
+    }
     pub fn is_poisoned(&self) -> bool {
-        self.poisoned
+        self.poisoned.get()
     }
     pub fn into_store(self) -> S {
         self.store
@@ -1667,8 +1697,8 @@ impl<S: Store> Engine<S> {
     pub fn recover(store: S) -> Result<Self, Error> {
         let last = store.last_sequence()?;
         let (base, mut state) = if let Some((seq, bytes)) = store.load_checkpoint()? {
-            let snapshot: Snapshot = postcard::from_bytes(&bytes)?;
-            if snapshot.version != 2 || seq > last {
+            let snapshot = decode_snapshot(&bytes)?;
+            if snapshot.version != 3 || seq > last {
                 return Err(invalid("Invalid snapshot version or position"));
             }
             snapshot.state.check_invariants()?;
@@ -1686,7 +1716,7 @@ impl<S: Store> Engine<S> {
                 .saturating_add(record.payload.len());
             let event = match record.subject.as_str() {
                 "$SCREECH.event.v1" => serde_json::from_slice(&record.payload)?,
-                "$SCREECH.event.v2" => {
+                "$SCREECH.event.v2" | "$SCREECH.event.v3" => {
                     let mut event: Event = serde_json::from_slice(&record.headers)?;
                     if let Event::Publish { message, .. } = &mut event {
                         message.payload = record.payload;
@@ -1697,30 +1727,101 @@ impl<S: Store> Engine<S> {
                 }
                 _ => return Err(invalid("Unknown event version")),
             };
+            let mut event = event;
+            let detached = if let Event::Publish { stream, message } = &mut event {
+                if let Some(reference) = message.content.clone() {
+                    if state
+                        .streams
+                        .get(stream)
+                        .is_none_or(|s| s.generation != reference.key.generation)
+                    {
+                        return Err(invalid("Invalid content generation"));
+                    }
+                    log_bytes = log_bytes
+                        .saturating_add(reference.headers_len as usize)
+                        .saturating_add(reference.payload_len as usize);
+                    *message = hydrate_message(&store, message)?;
+                    Some((stream.clone(), message.sequence, reference))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             state.apply(event)?;
+            if let Some((stream, sequence, reference)) = detached {
+                detach_message(&mut state, &stream, sequence, reference);
+            }
         }
-        Ok(Self {
+        for message in state.streams.values().flat_map(|s| s.messages.values()) {
+            if let Some(reference) = &message.content {
+                store.validate_content(
+                    reference.key,
+                    &message.subject,
+                    reference.headers_len,
+                    reference.payload_len,
+                )?;
+            }
+        }
+        let migrate = store.external_content()
+            && state
+                .streams
+                .values()
+                .any(|s| s.messages.values().any(|m| m.content.is_none()));
+        let mut engine = Self {
             state,
             store,
-            poisoned: false,
+            poisoned: std::cell::Cell::new(false),
             log_sequence: last,
             since_checkpoint: (last - base) as usize,
             log_bytes,
             identity: std::sync::Arc::new(()),
             #[cfg(feature = "fault-injection")]
             committed_groups: 0,
-        })
+        };
+        if migrate {
+            engine.checkpoint()?;
+        }
+        Ok(engine)
     }
     pub fn checkpoint(&mut self) -> Result<(), Error> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(invalid("Storage failed: restart required"));
         }
+        let mut imports = Vec::new();
+        if self.store.external_content() {
+            for stream in self.state.streams.values_mut() {
+                let sequences: Vec<_> = stream.messages.keys().copied().collect();
+                for sequence in sequences {
+                    let message = stream.messages.get_mut(&sequence).unwrap();
+                    if message.content.is_none() {
+                        let (reference, content) = content_parts(stream.generation, message);
+                        imports.push(content);
+                        message.headers = Bytes::new();
+                        message.payload = Bytes::new();
+                        message.content = Some(reference);
+                    }
+                }
+            }
+        }
         let data = postcard::to_allocvec(&SnapshotRef {
-            version: 2,
+            version: 3,
             state: &self.state,
         })?;
-        if let Err(e) = self.store.checkpoint(self.log_sequence, &data) {
-            self.poisoned = true;
+        let result = if self.store.external_content() {
+            let mut live = self
+                .state
+                .streams
+                .values()
+                .flat_map(|s| s.messages.values())
+                .filter_map(|m| m.content.as_ref().map(|r| r.key));
+            self.store
+                .checkpoint_with_content(self.log_sequence, &data, &mut live, &imports)
+        } else {
+            self.store.checkpoint(self.log_sequence, &data)
+        };
+        if let Err(e) = result {
+            self.poisoned.set(true);
             return Err(e.into());
         }
         self.since_checkpoint = 0;
@@ -1735,7 +1836,7 @@ impl<S: Store> Engine<S> {
         self.store.supports_batch()
     }
     pub fn begin_group(&self) -> Result<GroupPlan, Error> {
-        if self.poisoned || !self.store.supports_batch() {
+        if self.poisoned.get() || !self.store.supports_batch() {
             return Err(invalid("Storage cannot plan a group"));
         }
         Ok(GroupPlan {
@@ -1745,12 +1846,14 @@ impl<S: Store> Engine<S> {
             #[cfg(feature = "fault-injection")]
             events: Vec::with_capacity(32),
             records: Vec::with_capacity(32),
+            contents: Vec::new(),
+            external_content: self.store.external_content(),
             bytes: 0,
             failed: false,
         })
     }
     pub fn commit_group(&mut self, plan: GroupPlan) -> Result<(), Error> {
-        if self.poisoned
+        if self.poisoned.get()
             || plan.failed
             || !std::sync::Arc::ptr_eq(&self.identity, &plan.identity)
             || plan.base != self.log_sequence
@@ -1761,14 +1864,18 @@ impl<S: Store> Engine<S> {
             return Ok(());
         }
         if plan.records.len() > 1 {
-            crate::fault::group_context(self.log_sequence, &plan.records);
+            #[cfg(feature = "fault-injection")]
+            crate::fault::group_context(self.log_sequence, &plan.records, &plan.events);
             crate::fault::point("before_group_commit");
         }
         let expected = self
             .log_sequence
             .checked_add(plan.records.len() as u64)
             .ok_or(invalid("Log exhausted"))?;
-        let result = if plan.records.len() == 1 {
+        let result = if !plan.contents.is_empty() {
+            self.store
+                .append_with_content(&plan.records, &plan.contents)
+        } else if plan.records.len() == 1 {
             let r = &plan.records[0];
             self.store.append(&r.subject, &r.headers, &r.payload)
         } else {
@@ -1777,11 +1884,11 @@ impl<S: Store> Engine<S> {
         match result {
             Ok(end) if end == expected => self.log_sequence = end,
             Ok(_) => {
-                self.poisoned = true;
+                self.poisoned.set(true);
                 return Err(invalid("Invalid grouped append position"));
             }
             Err(error) => {
-                self.poisoned = true;
+                self.poisoned.set(true);
                 return Err(error.into());
             }
         }
@@ -1808,31 +1915,46 @@ impl<S: Store> Engine<S> {
         Ok(())
     }
     pub fn commit(&mut self, event: Event) -> Result<(), Error> {
-        if self.poisoned {
+        if self.poisoned.get() {
             return Err(invalid("Storage failed: restart required"));
         }
         self.state.validate(&event)?;
         let operation = operation(&event);
         crate::fault::operation("before", operation);
         crate::fault::batch_point("before", &event);
-        let record = encode_event(&event)?;
-        let bytes = record.headers;
-        let payload = record.payload;
-        match self.store.append("$SCREECH.event.v2", &bytes, &payload) {
+        let (record, content, detached) =
+            encode_transition(&self.state, &event, self.store.external_content())?;
+        let encoded_bytes = record.headers.len()
+            + record.payload.len()
+            + content
+                .as_ref()
+                .map(|c| c.headers.len() + c.payload.len())
+                .unwrap_or(0);
+        let result = if let Some(content) = content {
+            self.store
+                .append_with_content(std::slice::from_ref(&record), &[content])
+        } else {
+            self.store
+                .append(&record.subject, &record.headers, &record.payload)
+        };
+        match result {
             Ok(seq) => self.log_sequence = seq,
             Err(e) => {
-                self.poisoned = true;
+                self.poisoned.set(true);
                 return Err(e.into());
             }
         }
         crate::fault::operation("after", operation);
         crate::fault::batch_point("after", &event);
         if let Err(e) = self.state.apply_validated(event) {
-            self.poisoned = true;
+            self.poisoned.set(true);
             return Err(e);
         }
+        if let Some((stream, sequence, reference)) = detached {
+            detach_message(&mut self.state, &stream, sequence, reference);
+        }
         self.since_checkpoint += 1;
-        self.log_bytes += bytes.len() + payload.len();
+        self.log_bytes += encoded_bytes;
         if self.store.supports_checkpoint()
             && (self.since_checkpoint >= CHECKPOINT_RECORDS || self.log_bytes >= CHECKPOINT_BYTES)
         {
@@ -1850,6 +1972,8 @@ pub struct GroupPlan {
     #[cfg(feature = "fault-injection")]
     events: Vec<Event>,
     records: Vec<crate::storage::Append>,
+    contents: Vec<Content>,
+    external_content: bool,
     bytes: usize,
     failed: bool,
 }
@@ -1863,13 +1987,34 @@ impl GroupPlan {
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
+    pub fn read_staged_message(
+        &self,
+        message: &StoredMessage,
+    ) -> Option<Result<StoredMessage, Error>> {
+        let key = message.content.as_ref()?.key;
+        self.contents
+            .iter()
+            .rev()
+            .find(|c| c.key == key)
+            .map(|c| hydrate_content(message, c.clone()))
+    }
     pub fn commit(&mut self, event: Event) -> Result<(), Error> {
         if self.failed {
             return Err(invalid("Failed group"));
         }
         self.state.validate(&event)?;
-        let record = encode_event(&event)?;
-        let bytes = record.headers.len().saturating_add(record.payload.len());
+        let (record, content, detached) =
+            encode_transition(&self.state, &event, self.external_content)?;
+        let bytes = record
+            .headers
+            .len()
+            .saturating_add(record.payload.len())
+            .saturating_add(
+                content
+                    .as_ref()
+                    .map(|c| c.headers.len() + c.payload.len())
+                    .unwrap_or(0),
+            );
         if self.records.len() >= 8192 || bytes > (32 * 1024 * 1024usize).saturating_sub(self.bytes)
         {
             self.failed = true;
@@ -1882,6 +2027,12 @@ impl GroupPlan {
         if let Err(error) = self.state.apply_validated(event) {
             self.failed = true;
             return Err(error);
+        }
+        if let Some((stream, sequence, reference)) = detached {
+            detach_message(&mut self.state, &stream, sequence, reference);
+        }
+        if let Some(content) = content {
+            self.contents.push(content);
         }
         self.bytes += bytes;
         self.records.push(record);
@@ -1899,6 +2050,100 @@ fn operation(event: &Event) -> &'static str {
         Event::Expire { .. } => "expiration",
         _ => "publish",
     }
+}
+fn content_parts(generation: u64, message: &StoredMessage) -> (ContentRef, Content) {
+    let key = ContentKey {
+        generation,
+        sequence: message.sequence,
+    };
+    (
+        ContentRef {
+            key,
+            headers_len: message.headers.len() as u64,
+            payload_len: message.payload.len() as u64,
+        },
+        Content {
+            key,
+            subject: message.subject.clone(),
+            headers: message.headers.clone(),
+            payload: message.payload.clone(),
+        },
+    )
+}
+fn detach_message(state: &mut State, stream: &str, sequence: u64, reference: ContentRef) {
+    if let Some(message) = state
+        .streams
+        .get_mut(stream)
+        .and_then(|s| s.messages.get_mut(&sequence))
+    {
+        message.headers = Bytes::new();
+        message.payload = Bytes::new();
+        message.content = Some(reference);
+    }
+}
+fn hydrate_content(message: &StoredMessage, content: Content) -> Result<StoredMessage, Error> {
+    let reference = message
+        .content
+        .as_ref()
+        .ok_or(invalid("Missing content reference"))?;
+    if content.key != reference.key
+        || content.subject != message.subject
+        || content.headers.len() as u64 != reference.headers_len
+        || content.payload.len() as u64 != reference.payload_len
+    {
+        return Err(StoreError::Corrupt(reference.key.sequence).into());
+    }
+    let mut message = message.clone();
+    message.headers = content.headers;
+    message.payload = content.payload;
+    message.content = None;
+    Ok(message)
+}
+fn hydrate_message(store: &impl Store, message: &StoredMessage) -> Result<StoredMessage, Error> {
+    let Some(reference) = &message.content else {
+        return Ok(message.clone());
+    };
+    let content = store
+        .get_content(reference.key)?
+        .ok_or(StoreError::Corrupt(reference.key.sequence))?;
+    hydrate_content(message, content)
+}
+type DetachedMessage = (String, u64, ContentRef);
+fn encode_transition(
+    state: &State,
+    event: &Event,
+    external: bool,
+) -> Result<
+    (
+        crate::storage::Append,
+        Option<Content>,
+        Option<DetachedMessage>,
+    ),
+    Error,
+> {
+    if external {
+        if let Event::Publish { stream, message } = event {
+            let (reference, content) = content_parts(state.streams[stream].generation, message);
+            let mut metadata = message.clone();
+            metadata.headers = Bytes::new();
+            metadata.payload = Bytes::new();
+            metadata.content = Some(reference.clone());
+            return Ok((
+                crate::storage::Append {
+                    subject: "$SCREECH.event.v3".into(),
+                    headers: serde_json::to_vec(&Event::Publish {
+                        stream: stream.clone(),
+                        message: metadata,
+                    })?
+                    .into(),
+                    payload: Bytes::new(),
+                },
+                Some(content),
+                Some((stream.clone(), message.sequence, reference)),
+            ));
+        }
+    }
+    Ok((encode_event(event)?, None, None))
 }
 fn encode_event(event: &Event) -> Result<crate::storage::Append, Error> {
     let (bytes, payload) = if let Event::Publish { stream, message } = event {
@@ -1929,4 +2174,23 @@ struct SnapshotRef<'a> {
 struct Snapshot {
     version: u8,
     state: State,
+}
+
+#[path = "durable_legacy.rs"]
+mod legacy;
+fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot, Error> {
+    match bytes.first() {
+        Some(3) => Ok(postcard::from_bytes(bytes)?),
+        Some(2) => {
+            let old: legacy::LegacySnapshot = postcard::from_bytes(bytes)?;
+            if old.version != 2 {
+                return Err(invalid("Invalid snapshot version"));
+            }
+            Ok(Snapshot {
+                version: 3,
+                state: old.state.into_current(),
+            })
+        }
+        _ => Err(invalid("Invalid snapshot version")),
+    }
 }

@@ -231,3 +231,19 @@ pending-byte/count or write-deadline limits. Multi-vector framing tests cross th
 vector limit for both header-capable and legacy receivers. Publication framing
 can inline independently of the cold control-command decoder; both retain the
 same incremental framing and validation rules.
+
+## Retained JetStream content
+
+`cargo test --all-features --test durable_content` compares the file-backed model
+with inline MemoryStore histories through publish, reservation, ACK, checkpoint and
+restart. It also checks staged group reads, missing references and corrupt content.
+A version-2 checkpoint migration test verifies content import and reopening.
+`storage_content` checks atomic content/event writes and checkpoint garbage collection.
+
+On Linux, run `python3 scripts/content_memory_tests.py target/debug/screech-server`.
+It retains 256 MiB in 1024 distinct bodies, requires sampled server RSS below 96 MiB,
+SIGKILLs twice, checks random GETs, redelivery and a confirmed ACK, then purges and
+checks that checkpoint garbage collection removed the content rows. RSS excludes
+reclaimable kernel file cache. This tests payload paging; it does not establish a
+constant-memory bound for metadata or all possible concurrent workloads. CI saves
+its measurements alongside the failure-test results.
