@@ -175,7 +175,7 @@ PROPTEST_CASES=1024 cargo test --locked --all-features --lib partial_output_refi
 ```
 
 CI publishes `core-profiles` separately from benchmark results. It runs checked
-1 KiB Core forwarding workloads against both servers with a user-space CPU-clock
+1 KiB Core forwarding workloads against both servers with a user/kernel CPU-clock
 sample profile, keeping profiling overhead outside the benchmark measurements.
 The artifact includes raw perf samples, symbol reports, CPU time, RSS and runner
 CPU/kernel metadata. Download it from the CI run; it is not part of the website.
@@ -210,4 +210,6 @@ Single-recipient Core forwarding transfers the immutable input buffer directly
 into a compact descriptor. Multiple recipients share the general message, and
 large control offsets use its full-width representation without truncation or
 new protocol limits. Output properties mix compact, shared-wire and owned frames;
-large-offset tests verify exact fallback framing under short writes. 
+large-offset tests verify exact fallback framing under short writes. The Core
+profiling CI diagnostic includes kernel samples; local profiling defaults to user
+samples and accepts `--include-kernel` when permissions permit it.

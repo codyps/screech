@@ -137,7 +137,7 @@ jobs:
           perf_binary=$(find -L /usr/lib/linux-tools -type f -name perf | sort | tail -1)
           test -n "$perf_binary"
           test -x "$perf_binary"
-          python3 scripts/profile_core.py --screech target/release/screech-server \
+          sudo python3 scripts/profile_core.py --include-kernel --screech target/release/screech-server \
             --nats bin/nats-server --driver bin/bench-driver --perf "$perf_binary" \
             --output core-profiles
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
