@@ -213,3 +213,14 @@ new protocol limits. Output properties mix compact, shared-wire and owned frames
 large-offset tests verify exact fallback framing under short writes. The Core
 profiling CI diagnostic includes kernel samples; local profiling defaults to user
 samples and accepts `--include-kernel` when permissions permit it.
+
+Core input bursts route at most 256 non-reply publications before yielding, with
+a conservative output budget based on pending bytes and maximum control-line
+size. Routing and outbox guards are released before notification/yield; pending-byte
+or frame pressure ends a routing chunk early. Every
+publication retains admission and slow-consumer removal, so subsequent queue
+members see the same handover as serial routing. Generated transport histories
+compare buffered output, credits, cancellation, future queue cursors and delivery
+limits with serial publications, including closed/full receivers and in-flight
+frame credits. Collector tests preserve control/reply boundaries and leave
+partial or malformed input for the normal parser.

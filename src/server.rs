@@ -6,11 +6,11 @@ use crate::{
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::{self, IoSlice},
     net::SocketAddr,
     ops::Range,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 use tokio::{
@@ -234,11 +234,16 @@ struct Peer {
 // early return still wakes every accepted delivery before connection cleanup.
 #[derive(Default)]
 struct DeliveryWakes(Vec<Arc<Notify>>);
-impl Drop for DeliveryWakes {
-    fn drop(&mut self) {
+impl DeliveryWakes {
+    fn flush(&mut self) {
         for ready in self.0.drain(..) {
             ready.notify_one();
         }
+    }
+}
+impl Drop for DeliveryWakes {
+    fn drop(&mut self) {
+        self.flush();
     }
 }
 struct WriterGuard {
@@ -268,39 +273,10 @@ impl Peer {
         sid: Arc<str>,
         wakes: Option<&mut DeliveryWakes>,
     ) -> bool {
-        let size = wire_size(&message, &sid, self.headers);
-        self.enqueue_with_wakes(
-            Queued {
-                size,
-                data: FrameData::Delivery {
-                    message,
-                    sid,
-                    headers: self.headers,
-                },
-            },
-            wakes,
-        )
+        self.enqueue_with_wakes(queued_delivery(message, sid, self.headers), wakes)
     }
     fn send_wire(&self, wire: WireMessage, sid: Arc<str>, wakes: &mut DeliveryWakes) -> bool {
-        match CompactWire::new(wire) {
-            Ok(message) => {
-                let size = wire_size_parts(&message.parts(), &sid, self.headers);
-                self.enqueue_with_wakes(
-                    Queued {
-                        size,
-                        data: FrameData::Wire {
-                            message,
-                            sid,
-                            headers: self.headers,
-                        },
-                    },
-                    Some(wakes),
-                )
-            }
-            Err(wire) => {
-                self.send_delivery(Arc::new(OutboundMessage::Wire(wire)), sid, Some(wakes))
-            }
-        }
+        self.enqueue_with_wakes(queued_wire(wire, sid, self.headers), Some(wakes))
     }
     fn enqueue(&self, frame: Queued) -> bool {
         self.enqueue_with_wakes(frame, None)
@@ -396,6 +372,73 @@ impl Hub {
         }
         (count, pending)
     }
+    fn forward_wire_burst(
+        &mut self,
+        publisher: u64,
+        wires: &mut VecDeque<WireMessage>,
+        wakes: &mut DeliveryWakes,
+    ) {
+        let Hub { core, peers } = self;
+        let mut outboxes = BurstOutboxes {
+            peers,
+            held: None,
+            wakes,
+            failed: HashSet::new(),
+            pressure: false,
+        };
+        let mut dead = Vec::new();
+        while let Some(wire) = wires.pop_front() {
+            debug_assert!(wire.reply.is_none() && wire.subject.len() <= 64);
+            let mut target = [0u8; 64];
+            let target_len = wire.subject.len();
+            target[..target_len].copy_from_slice(&wire.frame[wire.subject.clone()]);
+            let mut pending = Some(wire);
+            let mut first = None;
+            let mut shared = None;
+            core.route_with(publisher, &target[..target_len], None, |client, sid| {
+                if !outboxes.peers.contains_key(&client) {
+                    return;
+                }
+                if shared.is_none() {
+                    let Some((first_client, first_sid)) = first.take() else {
+                        first = Some((client, sid.clone()));
+                        return;
+                    };
+                    let message =
+                        Arc::new(OutboundMessage::Wire(pending.take().expect("pending wire")));
+                    outboxes.send(first_client, |headers| {
+                        queued_delivery(message.clone(), first_sid, headers)
+                    });
+                    shared = Some(message);
+                }
+                outboxes.send(client, |headers| {
+                    queued_delivery(
+                        shared.as_ref().expect("shared wire").clone(),
+                        sid.clone(),
+                        headers,
+                    )
+                });
+            });
+            if let Some((client, sid)) = first {
+                outboxes.send(client, |headers| {
+                    queued_wire(pending.take().expect("single wire"), sid, headers)
+                });
+            }
+            // Preserve per-publication slow-consumer removal and queue handover.
+            // The peer map stays borrowed until its outbox guard is released.
+            for client in outboxes.failed.drain() {
+                core.disconnect(client);
+                dead.push(client);
+            }
+            if outboxes.pressure {
+                break;
+            }
+        }
+        drop(outboxes);
+        for client in dead {
+            peers.remove(&client);
+        }
+    }
     fn route(
         &mut self,
         publisher: u64,
@@ -418,6 +461,112 @@ impl Hub {
             self.peers.remove(&id);
         }
         count
+    }
+}
+// Hub is held throughout this bounded CPU-only burst. Writers acquire only
+// outboxes, so retaining one outbox guard cannot invert the routing lock order.
+struct BurstOutboxes<'a, 'w> {
+    peers: &'a HashMap<u64, Peer>,
+    held: Option<(u64, MutexGuard<'a, Outbox>)>,
+    wakes: &'w mut DeliveryWakes,
+    failed: HashSet<u64>,
+    pressure: bool,
+}
+impl BurstOutboxes<'_, '_> {
+    fn send(&mut self, client: u64, make: impl FnOnce(bool) -> Queued) {
+        let Some(peer) = self.peers.get(&client) else {
+            return;
+        };
+        let frame = make(peer.headers);
+        if self.held.as_ref().map(|(id, _)| *id) != Some(client) {
+            self.held = None;
+            self.held = Some((client, peer.out.lock().unwrap()));
+        }
+        let out = &mut self.held.as_mut().expect("outbox guard").1;
+        if out.closed {
+            self.failed.insert(client);
+            return;
+        }
+        if out.bytes.saturating_add(frame.size) > peer.max_pending || out.count >= 4096 {
+            peer.cancel.send_replace(true);
+            self.failed.insert(client);
+            return;
+        }
+        let wake = out.frames.is_empty();
+        out.bytes += frame.size;
+        out.count += 1;
+        out.frames.push_back(frame);
+        self.pressure |= out.bytes >= peer.max_pending / 4 || out.count >= 1024;
+        if wake {
+            self.wakes.0.push(peer.ready.clone());
+        }
+    }
+}
+fn queued_delivery(message: Arc<OutboundMessage>, sid: Arc<str>, headers: bool) -> Queued {
+    Queued {
+        size: wire_size(&message, &sid, headers),
+        data: FrameData::Delivery {
+            message,
+            sid,
+            headers,
+        },
+    }
+}
+fn queued_wire(wire: WireMessage, sid: Arc<str>, headers: bool) -> Queued {
+    match CompactWire::new(wire) {
+        Ok(message) => Queued {
+            size: wire_size_parts(&message.parts(), &sid, headers),
+            data: FrameData::Wire {
+                message,
+                sid,
+                headers,
+            },
+        },
+        Err(wire) => queued_delivery(Arc::new(OutboundMessage::Wire(wire)), sid, headers),
+    }
+}
+// No I/O or routing occurs here. Stop before controls, reply-bearing messages,
+// partial/malformed frames or the caller's count/conservative pending budget.
+fn collect_core_burst(
+    buf: &mut BytesMut,
+    limits: Limits,
+    maximum: usize,
+    budget: usize,
+    wires: &mut VecDeque<WireMessage>,
+) {
+    let overhead = limits.control_line.saturating_add(16);
+    let mut used = wires[0].frame.len().saturating_add(overhead);
+    while wires.len() < maximum {
+        let Ok(Some((cmd, remaining))) = parse(buf, limits) else {
+            break;
+        };
+        let consumed = buf.len() - remaining.len();
+        let (subject, plen, hlen) = match cmd {
+            NatsMessage::Pub(p) if p.reply_to.is_none() => {
+                (field_range(buf, &p.subject), p.payload.len(), 0)
+            }
+            NatsMessage::HPub(p) if p.reply_to.is_none() => (
+                field_range(buf, &p.subject),
+                p.payload.len(),
+                p.headers.len(),
+            ),
+            _ => break,
+        };
+        if subject.len() > 64 {
+            break;
+        }
+        let cost = consumed.saturating_add(overhead);
+        if used.saturating_add(cost) > budget {
+            break;
+        }
+        used += cost;
+        wires.push_back(WireMessage {
+            frame: buf.split_to(consumed).freeze(),
+            subject,
+            reply: None,
+            body: consumed - plen - hlen - 2,
+            header_len: hlen,
+        });
     }
 }
 fn digits(n: usize) -> usize {
@@ -838,6 +987,7 @@ async fn connection(
     let mut next_ping = Instant::now() + config.ping_interval;
     let auth_deadline = Instant::now() + Duration::from_secs(5);
     let mut durable = JoinSet::<DurableCompletion>::new();
+    let mut wire_burst = VecDeque::new();
     let result=async {
         loop {
             while let Some(result) = durable.try_join_next() { finish_durable(result)?; }
@@ -871,12 +1021,40 @@ async fn connection(
                     NatsMessage::Pub(p)=>{
                         let subject=field_range(&buf,&p.subject);let reply=p.reply_to.as_deref().map(|v|field_range(&buf,v));let plen=p.payload.len();drop(p);
                         let frame=buf.split_to(consumed).freeze();advanced=true;
-                        let msg=WireMessage{frame,subject,reply,body:consumed-plen-2,header_len:0};publish(&hub,id,msg,&mut wakes,no_responders,&config,&mut durable)?;
+                        let msg=WireMessage{frame,subject,reply,body:consumed-plen-2,header_len:0};if !verbose && config.jetstream.is_none() && msg.reply.is_none() && msg.subject.len() <= 64 {
+                            wire_burst.push_back(msg);
+                            collect_core_burst(&mut buf, config.limits, 256 - processed, config.max_pending / 4, &mut wire_burst);
+                            let count = wire_burst.len();
+                            if count > 1 {
+                                while !wire_burst.is_empty() {
+                                    hub.lock().unwrap().forward_wire_burst(id, &mut wire_burst, &mut wakes);
+                                    wakes.flush();
+                                    tokio::task::yield_now().await;
+                                }
+                            } else {
+                                publish(&hub,id,wire_burst.pop_front().expect("single publication"),&mut wakes,no_responders,&config,&mut durable)?;
+                            }
+                            processed += count - 1;
+                        } else {publish(&hub,id,msg,&mut wakes,no_responders,&config,&mut durable)?;}
                         if verbose{peer.send(Bytes::from_static(b"+OK\r\n"));}}
                     NatsMessage::HPub(p)=>{
                         let subject=field_range(&buf,&p.subject);let reply=p.reply_to.as_deref().map(|v|field_range(&buf,v));let plen=p.payload.len();let hlen=p.headers.len();drop(p);
                         let frame=buf.split_to(consumed).freeze();advanced=true;
-                        let msg=WireMessage{frame,subject,reply,body:consumed-plen-hlen-2,header_len:hlen};publish(&hub,id,msg,&mut wakes,no_responders,&config,&mut durable)?;
+                        let msg=WireMessage{frame,subject,reply,body:consumed-plen-hlen-2,header_len:hlen};if !verbose && config.jetstream.is_none() && msg.reply.is_none() && msg.subject.len() <= 64 {
+                            wire_burst.push_back(msg);
+                            collect_core_burst(&mut buf, config.limits, 256 - processed, config.max_pending / 4, &mut wire_burst);
+                            let count = wire_burst.len();
+                            if count > 1 {
+                                while !wire_burst.is_empty() {
+                                    hub.lock().unwrap().forward_wire_burst(id, &mut wire_burst, &mut wakes);
+                                    wakes.flush();
+                                    tokio::task::yield_now().await;
+                                }
+                            } else {
+                                publish(&hub,id,wire_burst.pop_front().expect("single publication"),&mut wakes,no_responders,&config,&mut durable)?;
+                            }
+                            processed += count - 1;
+                        } else {publish(&hub,id,msg,&mut wakes,no_responders,&config,&mut durable)?;}
                         if verbose{peer.send(Bytes::from_static(b"+OK\r\n"));}}
                     _=>{protocol_error(&peer,"Unexpected server operation");return Ok(());}
                 }

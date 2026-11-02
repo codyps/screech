@@ -286,7 +286,13 @@ async fn borrowed_body_keeps_inflight_budget_until_write_completes() {
         cancel,
         headers: true,
     };
-    assert!(peer.send_delivery(msg, Arc::from("1"), None));
+    let wire = match Arc::try_unwrap(msg) {
+        Ok(OutboundMessage::Wire(wire)) => wire,
+        _ => panic!("exclusive wire"),
+    };
+    let mut wakes = DeliveryWakes::default();
+    assert!(peer.send_wire(wire, Arc::from("1"), &mut wakes));
+    drop(wakes);
     let (write, mut read) = tokio::io::duplex(17);
     let task = tokio::spawn(writer_loop(write, peer.clone(), Duration::from_secs(5)));
     timeout(Duration::from_secs(1), async {
@@ -326,7 +332,13 @@ async fn stalled_partial_write_closes_without_releasing_inflight_credit() {
         cancel,
         headers: true,
     };
-    assert!(peer.send_delivery(msg, Arc::from("1"), None));
+    let wire = match Arc::try_unwrap(msg) {
+        Ok(OutboundMessage::Wire(wire)) => wire,
+        _ => panic!("exclusive wire"),
+    };
+    let mut wakes = DeliveryWakes::default();
+    assert!(peer.send_wire(wire, Arc::from("1"), &mut wakes));
+    drop(wakes);
     let (write, _unread) = tokio::io::duplex(17);
     writer_loop(write, peer.clone(), Duration::from_millis(20)).await;
     canceled.changed().await.unwrap();
@@ -482,4 +494,170 @@ async fn oversized_compact_offsets_fall_back_without_truncating_fields() {
             expected(&subject, Some(&reply), b"", b"", "1", true)
         );
     }
+}
+
+fn test_wire(subject: &str, headers: &[u8], payload: &[u8]) -> WireMessage {
+    match Arc::try_unwrap(message(subject, None, headers, payload, true)) {
+        Ok(OutboundMessage::Wire(wire)) => wire,
+        _ => panic!("exclusive wire message"),
+    }
+}
+#[derive(Debug, PartialEq, Eq)]
+struct PeerSnapshot {
+    bytes: usize,
+    count: usize,
+    closed: bool,
+    canceled: bool,
+    frames: Vec<Vec<u8>>,
+}
+fn peer_snapshots(peers: &[Peer]) -> Vec<PeerSnapshot> {
+    peers
+        .iter()
+        .map(|peer| {
+            let out = peer.out.lock().unwrap();
+            let frames = out
+                .frames
+                .iter()
+                .map(|frame| {
+                    let mut bytes = Vec::new();
+                    match &frame.data {
+                        FrameData::Raw(raw) => bytes.extend_from_slice(raw),
+                        FrameData::Wire { sid, headers, .. }
+                        | FrameData::Delivery { sid, headers, .. } => {
+                            encode_into(&mut bytes, &frame.data.parts(), sid, *headers)
+                        }
+                    }
+                    bytes
+                })
+                .collect();
+            PeerSnapshot {
+                bytes: out.bytes,
+                count: out.count,
+                closed: out.closed,
+                canceled: *peer.cancel.borrow(),
+                frames,
+            }
+        })
+        .collect()
+}
+fn burst_hub(
+    specs: &[(bool, bool, u8, bool)],
+    subscriptions: &[u8],
+    echo: bool,
+) -> (Hub, Vec<Peer>) {
+    let mut hub = Hub {
+        core: Core::default(),
+        peers: HashMap::new(),
+    };
+    let mut peers = Vec::new();
+    for (client, &(headers, closed, budget, inflight)) in specs.iter().enumerate() {
+        let (cancel, _) = watch::channel(false);
+        let count = if inflight { 4095 } else { 0 };
+        let peer = Peer {
+            out: Arc::new(Mutex::new(Outbox {
+                count,
+                bytes: count * 6,
+                closed,
+                ..Outbox::default()
+            })),
+            ready: Arc::new(Notify::new()),
+            max_pending: if inflight {
+                65536
+            } else {
+                [0, 1024, 4096, 65536, 262144][usize::from(budget) % 5]
+            },
+            cancel,
+            headers,
+        };
+        hub.core.connect(client as u64, echo || client != 0);
+        hub.peers.insert(client as u64, peer.clone());
+        peers.push(peer);
+    }
+    for (n, &code) in subscriptions.iter().enumerate() {
+        let client = (n / 2) as u64;
+        let sid = (n % 2).to_string();
+        let filter =
+            ["a", "a.*", "a.>", ">", "*.*", "b.>", "café.*", "消息.>"][usize::from(code) % 8];
+        let queue = (code & 8 != 0).then_some(if code & 16 != 0 { "q" } else { "other" });
+        hub.core
+            .subscribe(client, sid.clone(), filter.into(), queue.map(str::to_owned))
+            .unwrap();
+        if code & 32 != 0 {
+            hub.core
+                .unsubscribe(client, &sid, Some(u64::from(code % 7 + 1)));
+        }
+    }
+    (hub, peers)
+}
+proptest! {
+    #[test]
+    fn core_burst_refines_serial_publications_through_admission_and_handover(
+        peers in prop::collection::vec((any::<bool>(),any::<bool>(),0u8..5,any::<bool>()),4),
+        subscriptions in prop::collection::vec(any::<u8>(),8),
+        specs in prop::collection::vec((0usize..6,prop::collection::vec(any::<u8>(),0..4096),any::<bool>()),0..80),
+        echo in any::<bool>(),
+    ) {
+        let (mut serial, serial_peers) = burst_hub(&peers, &subscriptions, echo);
+        let (mut batched, batch_peers) = burst_hub(&peers, &subscriptions, echo);
+        let mut wires = VecDeque::new();
+        let mut serial_wakes = DeliveryWakes::default();
+        for (subject, payload, headers) in specs {
+            let subject = ["a","a.x","a.x.y","b.y","café.x","消息.x"][subject];
+            let headers = if headers {b"NATS/1.0\r\n\r\n".as_slice()} else {b""};
+            let wire = test_wire(subject, headers, &payload);
+            serial.forward_wire(0, subject.as_bytes(), wire.clone(), &mut serial_wakes);
+            wires.push_back(wire);
+        }
+        let mut batch_wakes = DeliveryWakes::default();
+        while !wires.is_empty() { batched.forward_wire_burst(0, &mut wires, &mut batch_wakes); }
+        prop_assert!(wires.is_empty());
+        prop_assert_eq!(peer_snapshots(&serial_peers), peer_snapshots(&batch_peers));
+        for client in 0..4 {
+            prop_assert_eq!(serial.core.subscription_count(client), batched.core.subscription_count(client));
+        }
+        // Future routes expose cursor and auto-unsubscribe differences as well.
+        for subject in ["a", "a.x", "a.x.y", "b.y", "café.x", "消息.x"] {
+            prop_assert_eq!(serial.core.publish(0, subject), batched.core.publish(0, subject));
+        }
+    }
+}
+
+#[test]
+fn collector_preserves_control_boundaries_partial_frames_and_budget() {
+    let first = test_wire("a", b"", b"x");
+    let following = b"PUB a 1\r\ny\r\nHPUB a 12 13\r\nNATS/1.0\r\n\r\nz\r\n";
+    for boundary in [
+        b"PING\r\n".as_slice(),
+        b"PUB a reply 0\r\n\r\n",
+        b"PUB a 2\r\nx",
+        b"PUB a..b 0\r\n\r\n",
+        b"INVALID\r\n",
+    ] {
+        let mut input = BytesMut::from([following.as_slice(), boundary].concat().as_slice());
+        let mut wires = VecDeque::from([first.clone()]);
+        collect_core_burst(&mut input, Limits::default(), 256, usize::MAX, &mut wires);
+        assert_eq!(wires.len(), 3);
+        assert_eq!(&input[..], boundary);
+        assert_eq!(
+            &wires[1].frame[wires[1].body..wires[1].frame.len() - 2],
+            b"y"
+        );
+        assert_eq!(wires[2].header_len, 12);
+    }
+    let mut input = BytesMut::from(following.as_slice());
+    let mut wires = VecDeque::from([first.clone()]);
+    collect_core_burst(&mut input, Limits::default(), 2, usize::MAX, &mut wires);
+    assert_eq!(wires.len(), 2);
+    assert!(input.starts_with(b"HPUB"));
+    let mut input = BytesMut::from(following.as_slice());
+    let mut wires = VecDeque::from([first]);
+    collect_core_burst(&mut input, Limits::default(), 256, 4096, &mut wires);
+    assert_eq!(wires.len(), 1);
+    assert_eq!(&input[..], following);
+    let mut input = BytesMut::from(b"PUB a.\xff 0\r\n\r\n".as_slice());
+    let mut wires = VecDeque::from([test_wire("a", b"", b"")]);
+    collect_core_burst(&mut input, Limits::default(), 256, usize::MAX, &mut wires);
+    assert_eq!(wires.len(), 2);
+    assert!(input.is_empty());
+    assert_eq!(&wires[1].frame[wires[1].subject.clone()], b"a.\xff");
 }
