@@ -120,7 +120,7 @@ pub struct HPub<'a> {
 }
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Sub<'a> {
-    pub subject: Cow<'a, str>,
+    pub subject: Cow<'a, [u8]>,
     pub queue_group: Option<Cow<'a, str>>,
     pub sid: Cow<'a, str>,
 }

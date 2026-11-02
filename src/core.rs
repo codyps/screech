@@ -21,7 +21,7 @@ pub struct Delivery {
 }
 #[derive(Default)]
 struct Subscription {
-    subject: String,
+    subject: Bytes,
     queue: Option<Arc<str>>,
     delivered: u64,
     maximum: Option<u64>,
@@ -34,7 +34,7 @@ struct Routes {
 // Arena edges are indices: matching, pruning and dropping deep filters never recurse.
 #[derive(Default)]
 struct TokenNode {
-    literals: HashMap<String, usize>,
+    literals: HashMap<Bytes, usize>,
     star: Option<usize>,
     terminal: BTreeSet<Key>,
     tail: BTreeSet<Key>,
@@ -74,15 +74,15 @@ impl WildcardIndex {
             self.nodes.len() - 1
         }
     }
-    fn insert(&mut self, filter: &str, key: Key) {
+    fn insert(&mut self, filter: &[u8], key: Key) {
         let mut at = 0;
-        for token in filter.split('.') {
-            if token == ">" {
+        for token in filter.split(|b| *b == b'.') {
+            if token == b">" {
                 self.count += usize::from(self.nodes[at].as_mut().unwrap().tail.insert(key));
                 return;
             }
             let node = self.nodes[at].as_ref().unwrap();
-            let next = if token == "*" {
+            let next = if token == b"*" {
                 node.star
             } else {
                 node.literals.get(token).copied()
@@ -92,10 +92,10 @@ impl WildcardIndex {
                 None => {
                     let next = self.allocate();
                     let node = self.nodes[at].as_mut().unwrap();
-                    if token == "*" {
+                    if token == b"*" {
                         node.star = Some(next);
                     } else {
-                        node.literals.insert(token.into(), next);
+                        node.literals.insert(Bytes::copy_from_slice(token), next);
                     }
                     next
                 }
@@ -103,17 +103,17 @@ impl WildcardIndex {
         }
         self.count += usize::from(self.nodes[at].as_mut().unwrap().terminal.insert(key));
     }
-    fn remove(&mut self, filter: &str, key: &Key) {
+    fn remove(&mut self, filter: &[u8], key: &Key) {
         let mut at = 0;
         let mut path = Vec::new();
         let mut tail = false;
-        for token in filter.split('.') {
-            if token == ">" {
+        for token in filter.split(|b| *b == b'.') {
+            if token == b">" {
                 tail = true;
                 break;
             }
             let node = self.nodes[at].as_ref().unwrap();
-            let next = if token == "*" {
+            let next = if token == b"*" {
                 node.star
             } else {
                 node.literals.get(token).copied()
@@ -139,7 +139,7 @@ impl WildcardIndex {
                 break;
             }
             let node = self.nodes[parent].as_mut().unwrap();
-            if token == "*" {
+            if token == b"*" {
                 node.star = None;
             } else {
                 node.literals.remove(token);
@@ -150,12 +150,12 @@ impl WildcardIndex {
     }
     // Early-exit interest checks need no result vector. The branch stack allocates
     // only when both a literal and '*' edge match the same subject token.
-    fn any_matching(&self, subject: &str, mut test: impl FnMut(&Key) -> bool) -> bool {
+    fn any_matching(&self, subject: &[u8], mut test: impl FnMut(&Key) -> bool) -> bool {
         if self.is_empty() {
             return false;
         }
         let mut pending = Vec::new();
-        let mut branch = (0, subject.split('.'));
+        let mut branch = (0, subject.split(|b| *b == b'.'));
         loop {
             let (at, mut tokens) = branch;
             let node = self.nodes[at].as_ref().unwrap();
@@ -187,25 +187,27 @@ impl WildcardIndex {
         }
     }
 }
-fn wildcard(filter: &str) -> bool {
-    filter.split('.').any(|t| t == "*" || t == ">")
+fn wildcard(filter: &[u8]) -> bool {
+    filter.split(|b| *b == b'.').any(|t| t == b"*" || t == b">")
 }
 
 #[derive(Default)]
 pub struct Core {
     clients: BTreeMap<ClientId, bool>,
     subs: BTreeMap<Key, Subscription>,
-    exact: HashMap<String, BTreeSet<Key>>,
+    exact: HashMap<Bytes, BTreeSet<Key>>,
     wild: WildcardIndex,
     queues: HashMap<Arc<str>, usize>,
-    cache: HashMap<String, Arc<Routes>>,
+    cache: HashMap<Bytes, Arc<Routes>>,
+    last_route: Option<(Bytes, Arc<Routes>)>,
     cache_bytes: usize,
 }
 impl Core {
-    pub fn has_interest(&self, subject: &str) -> bool {
+    pub fn has_interest(&self, subject: impl AsRef<[u8]>) -> bool {
         self.has_interest_in_queue(subject, None)
     }
-    pub fn has_interest_in_queue(&self, subject: &str, queue: Option<&str>) -> bool {
+    pub fn has_interest_in_queue(&self, subject: impl AsRef<[u8]>, queue: Option<&str>) -> bool {
+        let subject = subject.as_ref();
         let eligible = |k: &Key| queue.is_none_or(|q| self.subs[k].queue.as_deref() == Some(q));
         self.exact
             .get(subject)
@@ -240,6 +242,15 @@ impl Core {
         filter: String,
         queue: Option<String>,
     ) -> Result<(), &'static str> {
+        self.subscribe_bytes(client, sid, filter.into(), queue)
+    }
+    pub fn subscribe_bytes(
+        &mut self,
+        client: ClientId,
+        sid: String,
+        filter: Bytes,
+        queue: Option<String>,
+    ) -> Result<(), &'static str> {
         if !self.clients.contains_key(&client)
             || !token(&sid)
             || !subject(&filter, true)
@@ -253,6 +264,7 @@ impl Core {
             return Ok(());
         }
         self.cache.clear();
+        self.last_route = None;
         self.cache_bytes = 0;
         if wildcard(&filter) {
             self.wild.insert(&filter, key.clone());
@@ -275,6 +287,7 @@ impl Core {
     fn remove(&mut self, key: &Key) {
         if let Some(sub) = self.subs.remove(key) {
             self.cache.clear();
+            self.last_route = None;
             self.cache_bytes = 0;
             if wildcard(&sub.subject) {
                 self.wild.remove(&sub.subject, key);
@@ -301,13 +314,13 @@ impl Core {
         }
         self.remove(&key);
     }
-    pub fn publish(&mut self, publisher: ClientId, subject: &str) -> Vec<Delivery> {
+    pub fn publish(&mut self, publisher: ClientId, subject: impl AsRef<[u8]>) -> Vec<Delivery> {
         self.publish_in_queue(publisher, subject, None)
     }
     pub fn publish_in_queue(
         &mut self,
         publisher: ClientId,
-        subject: &str,
+        subject: impl AsRef<[u8]>,
         queue: Option<&str>,
     ) -> Vec<Delivery> {
         let mut result = Vec::new();
@@ -319,8 +332,14 @@ impl Core {
         });
         result
     }
-    fn routes(&mut self, subject: &str) -> Option<Arc<Routes>> {
-        if let Some(routes) = self.cache.get(subject) {
+    fn routes(&mut self, subject: &[u8]) -> Option<Arc<Routes>> {
+        if let Some((cached, routes)) = &self.last_route {
+            if cached.as_ref() == subject {
+                return Some(routes.clone());
+            }
+        }
+        if let Some((cached, routes)) = self.cache.get_key_value(subject) {
+            self.last_route = Some((cached.clone(), routes.clone()));
             return Some(routes.clone());
         }
         if self.wild.is_empty() && !self.exact.contains_key(subject) {
@@ -364,20 +383,24 @@ impl Core {
         if size <= 4 * 1024 * 1024 {
             if self.cache.len() >= 4096 || self.cache_bytes + size > 4 * 1024 * 1024 {
                 self.cache.clear();
+                self.last_route = None;
                 self.cache_bytes = 0;
             }
             self.cache_bytes += size;
-            self.cache.insert(subject.into(), routes.clone());
+            let subject = Bytes::copy_from_slice(subject);
+            self.cache.insert(subject.clone(), routes.clone());
+            self.last_route = Some((subject, routes.clone()));
         }
         Some(routes)
     }
     pub fn route_with(
         &mut self,
         publisher: ClientId,
-        subject: &str,
+        subject: impl AsRef<[u8]>,
         queue: Option<&str>,
         mut deliver: impl FnMut(ClientId, &Arc<str>),
     ) -> usize {
+        let subject = subject.as_ref();
         let Some(routes) = self.routes(subject) else {
             return 0;
         };
@@ -428,12 +451,12 @@ impl Core {
     }
 }
 /// `>` consumes at least one token; wildcards are whole tokens.
-pub fn matches(filter: &str, subject: &str) -> bool {
-    let mut input = subject.split('.');
-    for token in filter.split('.') {
+pub fn matches(filter: impl AsRef<[u8]>, subject: impl AsRef<[u8]>) -> bool {
+    let mut input = subject.as_ref().split(|b| *b == b'.');
+    for token in filter.as_ref().split(|b| *b == b'.') {
         match (token, input.next()) {
-            (">", Some(_)) => return true,
-            ("*", Some(_)) => (),
+            (b">", Some(_)) => return true,
+            (b"*", Some(_)) => (),
             (a, Some(b)) if a == b => (),
             _ => return false,
         }
@@ -450,9 +473,9 @@ mod index_tests {
         let key = (1, Arc::from("s"));
         for n in 0..10000 {
             let filter = format!("root.{n}.*.>");
-            index.insert(&filter, key.clone());
-            assert!(index.any_matching(&format!("root.{n}.a.b"), |_| true));
-            index.remove(&filter, &key);
+            index.insert(filter.as_bytes(), key.clone());
+            assert!(index.any_matching(format!("root.{n}.a.b").as_bytes(), |_| true));
+            index.remove(filter.as_bytes(), &key);
             assert!(index.is_empty());
             assert!(index.nodes[0].as_ref().unwrap().is_empty());
             assert_eq!(index.nodes.len(), 4);

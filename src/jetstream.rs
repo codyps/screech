@@ -222,12 +222,13 @@ impl Handle {
             let _ = tokio::time::timeout(Duration::from_secs(2), done).await;
         }
     }
-    pub fn captures(&self, subject: &str) -> bool {
+    pub fn captures(&self, subject: impl AsRef<[u8]>) -> bool {
+        let subject = subject.as_ref();
         self.catalog_pending
             .load(std::sync::atomic::Ordering::Acquire)
             > 0
-            || subject.starts_with("$JS.API.")
-            || subject.starts_with("$JS.ACK.")
+            || subject.starts_with(b"$JS.API.")
+            || subject.starts_with(b"$JS.ACK.")
             || self
                 .interests
                 .read()

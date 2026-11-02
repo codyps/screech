@@ -1117,3 +1117,65 @@ async fn core_burst_wakes_receivers_when_publisher_fails_or_closes() {
     }
     server.stop().await;
 }
+
+#[tokio::test]
+async fn core_subjects_and_replies_are_opaque_bytes() {
+    for jetstream in [false, true] {
+        let handle = jetstream.then(|| {
+            screech::jetstream::Handle::start(screech::storage::MemoryStore::default()).unwrap()
+        });
+        let server = Running::start(Config {
+            jetstream: handle,
+            ..Config::default()
+        })
+        .await;
+        let mut sub = server.raw().await;
+        sub.get_mut()
+            .write_all(b"SUB raw.\xff.* 1\r\nSUB raw.\xff.* workers 2\r\nPING\r\n")
+            .await
+            .unwrap();
+        assert_eq!(line(&mut sub).await, "PONG\r\n");
+        let mut publisher = server.raw().await;
+        let payload = vec![0x80; 1024];
+        let mut wire = b"PUB raw.\xff.x reply.\xfe 1024\r\n".to_vec();
+        wire.extend_from_slice(&payload);
+        wire.extend_from_slice(
+            b"\r\nHPUB raw.\xff.y reply.\xfe 12 12\r\nNATS/1.0\r\n\r\n\r\nPING\r\n",
+        );
+        // Split within non-UTF-8 fields as well as within the large body.
+        for chunk in wire.chunks(13) {
+            publisher.get_mut().write_all(chunk).await.unwrap();
+        }
+        assert_eq!(line(&mut publisher).await, "PONG\r\n");
+        let mut want = Vec::new();
+        for sid in *b"12" {
+            want.extend_from_slice(b"MSG raw.\xff.x ");
+            want.push(sid);
+            want.extend_from_slice(b" reply.\xfe 1024\r\n");
+            want.extend_from_slice(&payload);
+            want.extend_from_slice(b"\r\n");
+        }
+        for sid in *b"12" {
+            want.extend_from_slice(b"HMSG raw.\xff.y ");
+            want.push(sid);
+            want.extend_from_slice(b" reply.\xfe 12 12\r\nNATS/1.0\r\n\r\n\r\n");
+        }
+        let mut got = vec![0; want.len()];
+        timeout(Duration::from_secs(3), sub.read_exact(&mut got))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, want);
+        let mut request = BufReader::new(TcpStream::connect(server.addr).await.unwrap());
+        assert!(line(&mut request).await.starts_with("INFO "));
+        request.get_mut().write_all(b"CONNECT {\"verbose\":false,\"headers\":true,\"no_responders\":true}\r\nSUB reply.\xfe 3\r\nPUB absent reply.\xfe 0\r\n\r\nPING\r\n").await.unwrap();
+        let want = b"HMSG reply.\xfe 3 16 16\r\nNATS/1.0 503\r\n\r\n\r\nPONG\r\n";
+        let mut got = vec![0; want.len()];
+        timeout(Duration::from_secs(3), request.read_exact(&mut got))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, want);
+        server.stop().await;
+    }
+}

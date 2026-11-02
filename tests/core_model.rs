@@ -129,9 +129,29 @@ fn subject() -> impl Strategy<Value = String> {
             .prop_map(|tokens| tokens.join("."))
     ]
 }
+fn wire_subject(subject: &str, binary: bool) -> Vec<u8> {
+    subject
+        .bytes()
+        .map(|b| {
+            if binary {
+                match b {
+                    b'a' => 0xff,
+                    b'b' => 0xfe,
+                    b'c' => 0xfd,
+                    b'z' => 0xfc,
+                    b'x' => 0xfb,
+                    _ => b,
+                }
+            } else {
+                b
+            }
+        })
+        .collect()
+}
 proptest! {
     #[test]
     fn token_index_refines_scan_model_through_mutations(
+        binary in any::<bool>(),
         ops in prop::collection::vec((0u8..10, 0u64..6, 0u8..8, filter(), subject(), 0u8..4, 0u64..8, any::<bool>()), 0..500)
     ) {
         let mut core = Core::default(); let mut reference = Reference::default();
@@ -141,7 +161,7 @@ proptest! {
             let q = match queue { 0 => None, 1 => Some("q"), 2 => Some("other"), _ => Some("absent") };
             match op {
                 0..=2 => {
-                    let result = core.subscribe(client, key.1.clone(), filter.clone(), q.map(str::to_owned));
+                    let result = core.subscribe_bytes(client, key.1.clone(), wire_subject(&filter, binary).into(), q.map(str::to_owned));
                     prop_assert_eq!(result.is_ok(), reference.clients.contains_key(&client));
                     if result.is_ok() { reference.subs.entry(key.clone()).or_insert(Sub { filter, queue: q.map(str::to_owned), delivered: 0, maximum: None }); }
                 }
@@ -154,17 +174,17 @@ proptest! {
                 5 => { core.connect(client, echo); reference.clients.insert(client, echo); }
                 _ => {
                     let expected = reference.publish(client, &subject, q);
-                    let actual: Vec<_> = core.publish_in_queue(client, &subject, q).into_iter().map(|d| (d.client,d.sid)).collect();
+                    let actual: Vec<_> = core.publish_in_queue(client, wire_subject(&subject, binary), q).into_iter().map(|d| (d.client,d.sid)).collect();
                     prop_assert_eq!(actual, expected);
                     // Reuse the cached route after auto-unsubscribe and cursor changes.
                     let expected = reference.publish(client, &subject, q);
-                    let actual: Vec<_> = core.publish_in_queue(client, &subject, q).into_iter().map(|d| (d.client,d.sid)).collect();
+                    let actual: Vec<_> = core.publish_in_queue(client, wire_subject(&subject, binary), q).into_iter().map(|d| (d.client,d.sid)).collect();
                     prop_assert_eq!(actual, expected);
                 }
             }
             for probe in [&*subject, "a.b", "消息.x"] {
                 for q in [None, Some("q"), Some("other"), Some("absent")] {
-                    prop_assert_eq!(core.has_interest_in_queue(probe, q), reference.interested(probe, q));
+                    prop_assert_eq!(core.has_interest_in_queue(wire_subject(probe, binary), q), reference.interested(probe, q));
                 }
             }
             for id in 0..6 {
@@ -217,7 +237,7 @@ fn cache_eviction_and_subscription_churn_preserve_interest() {
             .unwrap();
     }
     for n in 0..512 {
-        assert!(core.has_interest(&format!("unused.{n}.probe")));
+        assert!(core.has_interest(format!("unused.{n}.probe")));
     }
     core.subscribe(1, "active".into(), "a.>".into(), Some("q".into()))
         .unwrap();
@@ -252,7 +272,7 @@ fn deeply_nested_filters_match_prune_and_drop_iteratively() {
         .unwrap();
     assert!(core.has_interest(&subject));
     assert_eq!(core.publish(9, &subject).len(), 1);
-    assert!(!core.has_interest(&format!("{prefix}.b")));
+    assert!(!core.has_interest(format!("{prefix}.b")));
     core.unsubscribe(1, "deep", None);
     assert!(!core.has_interest(&subject));
     core.subscribe(1, "deep".into(), filter, None).unwrap();

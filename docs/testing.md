@@ -196,3 +196,12 @@ been routed (at most 256 commands), before any wait/yield. A drop guard wakes
 accepted deliveries on early errors and EOF as well. Tests verify pending
 byte/count limits during deferred notification and ordered 1 KiB delivery across
 the command budget followed by publisher EOF or a malformed command.
+
+Core subject and reply routing uses opaque bytes. PUB/HPUB control fields and
+subscription subjects are tokenized without UTF-8 decoding; `.` and whole-token
+wildcards retain their existing byte semantics. Routing histories also replace
+literal bytes with non-UTF-8 values before comparison with the independent scan
+model. Network tests cover binary subjects/replies, queue/wildcard delivery,
+headers and no-responder statuses. JSON and the existing JetStream text model
+still validate text at their boundary; unsupported non-UTF-8 durable subjects or
+replies return an error rather than using lossy conversion or panicking.

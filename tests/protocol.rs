@@ -86,3 +86,42 @@ fn boxed_handshakes_preserve_fields_and_pipelined_binary_publications() {
     assert_eq!(p.reply_to.as_deref(), Some(b"reply".as_slice()));
     assert_eq!(tail, b"PING\r\n");
 }
+
+proptest::proptest! {
+    #[test]
+    fn subject_validation_refines_token_oracle(
+        chars in proptest::collection::vec(proptest::prop_oneof![
+            proptest::prelude::any::<char>(),
+            proptest::sample::select(vec!['.', '*', '>', ' ', '\t', '\r', '\n', '\0', '\u{7f}', 'a']),
+        ], 0..128),
+        wildcard in proptest::prelude::any::<bool>(),
+    ) {
+        let text: String = chars.into_iter().collect();
+        let tokens: Vec<_> = text.split('.').collect();
+        let expected = !text.is_empty()
+            && !text.bytes().any(|b| b <= b' ' || b == 127)
+            && tokens.iter().enumerate().all(|(i, t)| !t.is_empty() && match *t {
+                ">" => wildcard && i + 1 == tokens.len(),
+                "*" => wildcard,
+                _ => true,
+            });
+        proptest::prop_assert_eq!(screech::parser::subject(&text, wildcard), expected);
+    }
+}
+
+proptest::proptest! {
+    #[test]
+    fn byte_subject_validation_refines_token_oracle(
+        input in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256),
+        wildcard in proptest::prelude::any::<bool>(),
+    ) {
+        let tokens: Vec<_> = input.split(|b| *b == b'.').collect();
+        let expected = !input.is_empty() && !input.iter().any(|b| *b <= b' ' || *b == 127)
+            && tokens.iter().enumerate().all(|(i, t)| !t.is_empty() && match *t {
+                b">" => wildcard && i + 1 == tokens.len(),
+                b"*" => wildcard,
+                _ => true,
+            });
+        proptest::prop_assert_eq!(screech::parser::subject(&input, wildcard), expected);
+    }
+}

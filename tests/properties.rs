@@ -112,7 +112,7 @@ fn routing_cache_is_bounded_and_invalidated_on_subscription_changes() {
     core.connect(1, true);
     core.subscribe(1, "old".into(), ">".into(), None).unwrap();
     for n in 0..10000 {
-        assert_eq!(core.publish(2, &format!("subject.{n}"))[0].sid, "old");
+        assert_eq!(core.publish(2, format!("subject.{n}"))[0].sid, "old");
         let (entries, bytes) = core.routing_cache_usage();
         assert!(entries <= 4096 && bytes <= 4 * 1024 * 1024);
     }

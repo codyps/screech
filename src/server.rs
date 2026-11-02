@@ -71,6 +71,7 @@ enum OutboundMessage {
     Wire(WireMessage),
 }
 impl OutboundMessage {
+    #[inline(always)]
     fn parts(&self) -> MessageParts<'_> {
         match self {
             Self::Owned(m) => MessageParts {
@@ -89,21 +90,35 @@ impl OutboundMessage {
     }
 }
 impl WireMessage {
-    fn to_owned_message(&self) -> Message {
-        Message {
+    fn to_owned_message(&self) -> io::Result<Message> {
+        Ok(Message {
             subject: std::str::from_utf8(&self.frame[self.subject.clone()])
-                .expect("validated subject")
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "JetStream subjects require UTF-8",
+                    )
+                })?
                 .into(),
-            reply: self.reply.as_ref().map(|r| {
-                std::str::from_utf8(&self.frame[r.clone()])
-                    .expect("validated reply")
-                    .into()
-            }),
+            reply: self
+                .reply
+                .as_ref()
+                .map(|r| {
+                    std::str::from_utf8(&self.frame[r.clone()])
+                        .map(str::to_owned)
+                        .map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "JetStream replies require UTF-8",
+                            )
+                        })
+                })
+                .transpose()?,
             headers: self.frame.slice(self.body..self.body + self.header_len),
             payload: self
                 .frame
                 .slice(self.body + self.header_len..self.frame.len() - 2),
-        }
+        })
     }
 }
 // parse() returns borrowed PUB/HPUB arguments within this receive buffer.
@@ -233,12 +248,6 @@ impl Peer {
     }
 }
 impl Hub {
-    fn publish(&mut self, publisher: u64, msg: &Message) -> usize {
-        self.publish_to(publisher, &msg.subject, msg)
-    }
-    fn publish_to(&mut self, publisher: u64, target: &str, msg: &Message) -> usize {
-        self.publish_to_queue(publisher, target, None, msg)
-    }
     fn publish_to_queue(
         &mut self,
         publisher: u64,
@@ -247,7 +256,7 @@ impl Hub {
         msg: &Message,
     ) -> usize {
         let mut shared = None;
-        self.route(publisher, target, queue, None, || {
+        self.route(publisher, target.as_bytes(), queue, None, || {
             shared
                 .get_or_insert_with(|| Arc::new(OutboundMessage::Owned(msg.clone())))
                 .clone()
@@ -256,7 +265,7 @@ impl Hub {
     fn route(
         &mut self,
         publisher: u64,
-        target: &str,
+        target: &[u8],
         queue: Option<&str>,
         mut wakes: Option<&mut DeliveryWakes>,
         mut message: impl FnMut() -> Arc<OutboundMessage>,
@@ -341,6 +350,7 @@ enum WritePart {
     Payload(usize),
 }
 impl WritePart {
+    #[inline(always)]
     fn bytes<'a>(&self, data: &'a [u8], frames: &'a [Queued]) -> &'a [u8] {
         match self {
             Self::Buffered(range) => &data[range.clone()],
@@ -725,7 +735,7 @@ async fn connection(
                     NatsMessage::Sub(s)=>{
                         let mut h=hub.lock().unwrap();
                         if h.core.subscription_count(id)>=config.max_subscriptions && !h.core.has_subscription(id,&s.sid) {protocol_error(&peer,"Maximum Subscriptions Exceeded");return Ok(());}
-                        if let Err(e)=h.core.subscribe(id,s.sid.into_owned(),s.subject.into_owned(),s.queue_group.map(|s|s.into_owned())){protocol_error(&peer,e);return Ok(());}
+                        if let Err(e)=h.core.subscribe_bytes(id,s.sid.into_owned(),s.subject.into_owned().into(),s.queue_group.map(|s|s.into_owned())){protocol_error(&peer,e);return Ok(());}
                         if verbose{peer.send(Bytes::from_static(b"+OK\r\n"));}
                     }
                     NatsMessage::Unsub(s)=>{hub.lock().unwrap().core.unsubscribe(id,&s.sid,s.max_msgs);if verbose{peer.send(Bytes::from_static(b"+OK\r\n"));}}
@@ -797,26 +807,21 @@ fn publish(
     // Storage admission/completion never holds the routing lock or read loop.
     let shared = Arc::new(OutboundMessage::Wire(wire));
     let parts = shared.parts();
-    let subject = std::str::from_utf8(parts.subject).expect("validated subject");
+    let subject = parts.subject;
     let recipients = hub
         .lock()
         .unwrap()
         .route(id, subject, None, Some(wakes), || shared.clone());
     let Some(js) = config.jetstream.as_ref().filter(|js| js.captures(subject)) else {
         if recipients == 0 && no_responders {
-            no_response(
-                hub,
-                parts
-                    .reply
-                    .map(|r| std::str::from_utf8(r).expect("validated reply")),
-            );
+            no_response(hub, parts.reply);
         }
         return Ok(());
     };
     let OutboundMessage::Wire(wire) = shared.as_ref() else {
         unreachable!()
     };
-    let msg = wire.to_owned_message();
+    let msg = wire.to_owned_message()?;
     while let Some(result) = durable.try_join_next() {
         finish_durable(result)?;
     }
@@ -836,7 +841,7 @@ fn publish(
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Storage deadline exceeded"))?
                 .map_err(io::Error::other)?;
             if !handled {
-                no_response(&hub, reply.as_deref());
+                no_response(&hub, reply.as_deref().map(str::as_bytes));
             }
             Ok(())
         }
@@ -846,17 +851,23 @@ fn publish(
     });
     Ok(())
 }
-fn no_response(hub: &Arc<Mutex<Hub>>, reply: Option<&str>) {
+fn no_response(hub: &Arc<Mutex<Hub>>, reply: Option<&[u8]>) {
     if let Some(reply) = reply {
-        hub.lock().unwrap().publish(
-            0,
-            &Message {
-                subject: reply.into(),
-                reply: None,
-                headers: Bytes::from_static(b"NATS/1.0 503\r\n\r\n"),
-                payload: Bytes::new(),
-            },
-        );
+        let headers = b"NATS/1.0 503\r\n\r\n";
+        let mut frame = BytesMut::with_capacity(reply.len() + headers.len() + 2);
+        frame.extend_from_slice(reply);
+        frame.extend_from_slice(headers);
+        frame.extend_from_slice(b"\r\n");
+        let message = Arc::new(OutboundMessage::Wire(WireMessage {
+            frame: frame.freeze(),
+            subject: 0..reply.len(),
+            reply: None,
+            body: reply.len(),
+            header_len: headers.len(),
+        }));
+        hub.lock()
+            .unwrap()
+            .route(0, reply, None, None, || message.clone());
     }
 }
 

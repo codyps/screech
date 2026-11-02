@@ -368,3 +368,37 @@ async fn deferred_wakes_keep_admission_limits_and_wake_on_early_return() {
         .unwrap();
     assert_eq!(peer.out.lock().unwrap().count, 3);
 }
+
+#[test]
+fn jetstream_text_boundary_rejects_binary_subjects_and_replies_without_panicking() {
+    for (subject, reply) in [
+        (b"bad.\xff".as_slice(), b"reply".as_slice()),
+        (b"subject", b"bad.\xfe"),
+    ] {
+        let mut input = BytesMut::new();
+        input.extend_from_slice(b"PUB ");
+        input.extend_from_slice(subject);
+        input.extend_from_slice(b" ");
+        input.extend_from_slice(reply);
+        input.extend_from_slice(b" 0\r\n\r\n");
+        let (msg, tail) = parse(&input, Limits::default()).unwrap().unwrap();
+        assert!(tail.is_empty());
+        let NatsMessage::Pub(p) = msg else {
+            panic!("PUB")
+        };
+        let subject = field_range(&input, &p.subject);
+        let reply = p.reply_to.as_deref().map(|r| field_range(&input, r));
+        let body = input.len() - 2;
+        let wire = WireMessage {
+            frame: input.freeze(),
+            subject,
+            reply,
+            body,
+            header_len: 0,
+        };
+        assert_eq!(
+            wire.to_owned_message().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+}
