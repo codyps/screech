@@ -36,6 +36,9 @@ struct Args {
     /// UNSAFE: consumer reservations/ACKs may be lost after process or host failure; flush target 50 ms.
     #[arg(long, requires = "store")]
     unsafe_ack_durability: bool,
+    /// Experimental strict fixed single-voter engine (no peer replication yet).
+    #[arg(long, requires = "store", conflicts_with = "unsafe_ack_durability")]
+    single_voter: bool,
 }
 fn main() -> std::io::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -66,7 +69,12 @@ async fn run() -> std::io::Result<()> {
             })
             .map_err(std::io::Error::other)
             .and_then(|store| {
-                screech::jetstream::Handle::start(store).map_err(std::io::Error::other)
+                (if a.single_voter {
+                    screech::jetstream::Handle::start_single_voter(store)
+                } else {
+                    screech::jetstream::Handle::start(store)
+                })
+                .map_err(std::io::Error::other)
             })
         })
         .transpose()?;
@@ -104,4 +112,32 @@ async fn run() -> std::io::Result<()> {
         stop.send_replace(true);
     });
     server.run(rx).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_voter_requires_store_and_forbids_unsafe_ack() {
+        assert!(Args::try_parse_from(["screech", "--single-voter"]).is_err());
+        assert!(Args::try_parse_from([
+            "screech",
+            "--store",
+            "db",
+            "--single-voter",
+            "--unsafe-ack-durability"
+        ])
+        .is_err());
+        let strict = Args::try_parse_from(["screech", "--store", "db", "--single-voter"]).unwrap();
+        assert!(strict.single_voter && !strict.unsafe_ack_durability);
+        let old =
+            Args::try_parse_from(["screech", "--store", "db", "--unsafe-ack-durability"]).unwrap();
+        assert!(!old.single_voter && old.unsafe_ack_durability);
+        assert!(
+            !Args::try_parse_from(["screech", "--store", "db"])
+                .unwrap()
+                .single_voter
+        );
+    }
 }

@@ -35,6 +35,7 @@ pub struct Handle {
     observer: Arc<RwLock<Option<Interest>>>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     done: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    direct_output: bool,
 }
 struct Request {
     message: Message,
@@ -63,6 +64,7 @@ impl PendingRequest {
         result
     }
 }
+#[derive(Clone)]
 struct Pull {
     stream: String,
     consumer: String,
@@ -86,6 +88,7 @@ struct Worker<S> {
     clock_base: u64,
     clock_start: std::time::Instant,
     engine: Engine<S>,
+    persistence: Option<AppendExecutor<S>>,
     plan: Option<durable::GroupPlan>,
     effects: RefCell<Vec<Effect>>,
     staged_count: Cell<usize>,
@@ -96,9 +99,47 @@ struct Worker<S> {
     observer: Arc<RwLock<Option<Interest>>>,
     interests: Arc<RwLock<Vec<String>>>,
 }
+/// The strict driver's bounded I/O adapter. Only one proposal is outstanding;
+/// transport admission remains bounded while its completion is pending. Keeping
+/// this adapter separate lets a future consensus pump consume the same completions.
+struct AppendExecutor<S> {
+    tasks: std_mpsc::SyncSender<durable::AppendTask<S>>,
+    completions: std_mpsc::Receiver<durable::AppendCompletion<S>>,
+}
+impl<S: Store + 'static> AppendExecutor<S> {
+    fn start() -> Result<Self, durable::Error> {
+        let (tasks, incoming) = std_mpsc::sync_channel::<durable::AppendTask<S>>(1);
+        let (outgoing, completions) = std_mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("screech-voter-storage".into())
+            .spawn(move || {
+                while let Ok(task) = incoming.recv() {
+                    if outgoing.send(task.run()).is_err() {
+                        break;
+                    }
+                }
+            })
+            .map_err(crate::storage::StoreError::from)?;
+        Ok(Self { tasks, completions })
+    }
+}
 impl Handle {
     pub fn start<S: Store + 'static>(store: S) -> Result<Self, durable::Error> {
-        let engine = Engine::recover(store)?;
+        Self::start_engine(Engine::recover(store)?, None)
+    }
+    /// Experimental fixed one-voter driver; unsafe buffering and volatile stores
+    /// are rejected before recovery. Existing start() keeps standalone behavior.
+    pub fn start_single_voter<S: Store + 'static>(store: S) -> Result<Self, durable::Error> {
+        Self::start_engine(
+            Engine::recover_single_voter(store)?,
+            Some(AppendExecutor::start()?),
+        )
+    }
+    fn start_engine<S: Store + 'static>(
+        engine: Engine<S>,
+        persistence: Option<AppendExecutor<S>>,
+    ) -> Result<Self, durable::Error> {
+        let direct_output = persistence.is_none();
         let interests = Arc::new(RwLock::new(
             engine
                 .state()
@@ -123,6 +164,7 @@ impl Handle {
                 clock_base,
                 clock_start: std::time::Instant::now(),
                 engine,
+                persistence,
                 plan: None,
                 effects: RefCell::new(Vec::with_capacity(64)),
                 staged_count: Cell::new(0),
@@ -245,6 +287,7 @@ impl Handle {
             observer,
             stop,
             done: Arc::new(Mutex::new(Some(done_rx))),
+            direct_output,
         })
     }
     pub fn take_output(&self, observer: Interest) -> Result<mpsc::Receiver<Outbound>, String> {
@@ -268,6 +311,19 @@ impl Handle {
             .take()
             .ok_or("Storage worker already attached")?;
         *self.observer.write().unwrap() = Some(observer);
+        if !self.direct_output {
+            // Keep routing/peer locks off the strict driver. The existing bounded
+            // channel preserves order, including startup frames, and backpressure.
+            tokio::task::spawn_blocking(move || {
+                while let Some(frame) = output.blocking_recv() {
+                    if let Err(error) = sink(frame) {
+                        tracing::error!(%error, "single-voter output adapter stopped");
+                        break;
+                    }
+                }
+            });
+            return Ok(());
+        }
         while let Ok(frame) = output.try_recv() {
             sink(frame)?;
         }
@@ -624,6 +680,9 @@ impl<S: Store> Worker<S> {
         }
     }
     fn dispatch(&self, message: Outbound) -> Result<(), String> {
+        if self.persistence.is_some() && !self.engine.can_release_output() {
+            return Err("Single-voter output is not committed or storage failed".into());
+        }
         let destination = self.sink.read().unwrap();
         if let Some(sink) = destination.as_ref() {
             sink(message)
@@ -672,6 +731,7 @@ impl<S: Store> Worker<S> {
         ingress: &std_mpsc::Receiver<Request>,
         deferred: &mut Option<Request>,
     ) {
+        let pulls_before = self.persistence.as_ref().map(|_| self.pulls.clone());
         match self.engine.begin_group() {
             Ok(plan) => self.plan = Some(plan),
             Err(error) => {
@@ -720,7 +780,12 @@ impl<S: Store> Worker<S> {
         }
         let plan = self.plan.take().unwrap();
         let multiple = plan.len() > 1;
-        let mut committed = self.engine.commit_group(plan).map_err(|e| e.to_string());
+        let mut committed = self.commit_plan(plan);
+        if committed.is_err() {
+            if let Some(pulls) = pulls_before {
+                self.pulls = pulls;
+            }
+        }
         let mut effects = std::mem::take(self.effects.get_mut());
         self.staged_count.set(0);
         self.staged_bytes.set(0);
@@ -789,9 +854,36 @@ impl<S: Store> Worker<S> {
     fn commit(&mut self, event: Event) -> Result<(), String> {
         if let Some(plan) = self.plan.as_mut() {
             plan.commit(event).map_err(|e| e.to_string())
+        } else if self.persistence.is_some() {
+            let mut plan = self.engine.begin_group().map_err(|e| e.to_string())?;
+            plan.commit(event).map_err(|e| e.to_string())?;
+            self.commit_plan(plan)
         } else {
             self.engine.commit(event).map_err(|e| e.to_string())
         }
+    }
+    fn commit_plan(&mut self, plan: durable::GroupPlan) -> Result<(), String> {
+        let Some(executor) = &self.persistence else {
+            return self.engine.commit_group(plan).map_err(|e| e.to_string());
+        };
+        if let Some(task) = self
+            .engine
+            .prepare_append(plan)
+            .map_err(|e| e.to_string())?
+        {
+            if executor.tasks.send(task).is_err() {
+                self.engine.persistence_lost();
+                return Err("Voter storage executor stopped".into());
+            }
+            let completion = executor.completions.recv().map_err(|_| {
+                self.engine.persistence_lost();
+                "Voter storage executor stopped"
+            })?;
+            self.engine
+                .complete_append(completion)
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
     fn expire(&mut self) -> Result<(), String> {
         let time = self.time();

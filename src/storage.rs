@@ -67,6 +67,11 @@ fn content_checksum(content: &Content) -> u32 {
 }
 /// An atomic durable append log. Metadata and records share one transaction domain.
 pub trait Store: Send {
+    /// Opt in only when successful appends survive process/host restart. This is
+    /// independent of batching: MemoryStore is useful for models, not a voter.
+    fn durable_appends(&self) -> bool {
+        false
+    }
     fn append(&mut self, subject: &str, headers: &[u8], payload: &[u8]) -> Result<u64, StoreError>;
     /// Implementations must append all records or none. A failure may have an
     /// unknown outcome; callers must recover before issuing further durable success.
@@ -575,6 +580,9 @@ impl SqliteStore {
     }
 }
 impl Store for SqliteStore {
+    fn durable_appends(&self) -> bool {
+        !self.unsafe_ack_durability
+    }
     fn buffers_consumer_state(&self) -> bool {
         self.unsafe_ack_durability
     }

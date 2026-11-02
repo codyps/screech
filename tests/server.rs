@@ -770,6 +770,10 @@ async fn captured_core_and_same_connection_ping_progress_before_storage_commit()
         gate: gate.clone(),
     })
     .unwrap();
+    captured_core_progress(handle, gate).await;
+}
+
+async fn captured_core_progress(handle: screech::jetstream::Handle, gate: StorageGate) {
     let server = Running::start(Config {
         jetstream: Some(handle),
         storage_deadline: Duration::from_secs(10),
@@ -1295,6 +1299,140 @@ async fn storage_deadline_expires_while_same_connection_continuously_forwards_co
         unexpected.is_empty(),
         "durable ACK escaped stalled storage: {unexpected}"
     );
+    drop(client);
+    server.stop().await;
+}
+
+struct VoterGatedStore {
+    inner: screech::storage::SqliteStore,
+    gate: StorageGate,
+}
+impl screech::storage::Store for VoterGatedStore {
+    fn durable_appends(&self) -> bool {
+        true
+    }
+    fn supports_batch(&self) -> bool {
+        true
+    }
+    fn append(&mut self, s: &str, h: &[u8], p: &[u8]) -> Result<u64, screech::storage::StoreError> {
+        self.gate.block();
+        self.inner.append(s, h, p)
+    }
+    fn append_batch(
+        &mut self,
+        records: &[screech::storage::Append],
+    ) -> Result<u64, screech::storage::StoreError> {
+        self.gate.block();
+        self.inner.append_batch(records)
+    }
+    fn get(
+        &self,
+        n: u64,
+    ) -> Result<Option<screech::storage::Record>, screech::storage::StoreError> {
+        self.inner.get(n)
+    }
+    fn last_sequence(&self) -> Result<u64, screech::storage::StoreError> {
+        self.inner.last_sequence()
+    }
+    fn purge(&mut self) -> Result<(), screech::storage::StoreError> {
+        self.inner.purge()
+    }
+}
+
+#[tokio::test]
+async fn single_voter_delayed_persistence_keeps_core_live_and_replies_ordered() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = StorageGate::default();
+    let _release = ReleaseStorage(gate.clone());
+    let handle = screech::jetstream::Handle::start_single_voter(VoterGatedStore {
+        inner: screech::storage::SqliteStore::open(dir.path().join("db")).unwrap(),
+        gate: gate.clone(),
+    })
+    .unwrap();
+    captured_core_progress(handle, gate).await;
+}
+
+#[tokio::test]
+async fn single_voter_confirmed_ack_and_content_survive_server_restart() {
+    use async_nats::jetstream::{
+        consumer::{pull, AckPolicy},
+        stream::RetentionPolicy,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let handle = screech::jetstream::Handle::start_single_voter(
+        screech::storage::SqliteStore::open(&path).unwrap(),
+    )
+    .unwrap();
+    let server = Running::start(Config {
+        jetstream: Some(handle),
+        ..Default::default()
+    })
+    .await;
+    let client = async_nats::connect(server.addr.to_string()).await.unwrap();
+    let js = async_nats::jetstream::new(client.clone());
+    let stream = js
+        .create_stream(async_nats::jetstream::stream::Config {
+            name: "S".into(),
+            subjects: vec!["events.>".into()],
+            retention: RetentionPolicy::WorkQueue,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let consumer = stream
+        .create_consumer(pull::Config {
+            durable_name: Some("D".into()),
+            ack_policy: AckPolicy::Explicit,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    for data in ["one", "two"] {
+        js.publish("events.a", data.into())
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+    }
+    let mut messages = consumer.fetch().max_messages(1).messages().await.unwrap();
+    let first = timeout(Duration::from_secs(3), messages.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.payload, "one");
+    first.double_ack().await.unwrap();
+    drop(client);
+    server.stop().await;
+
+    let handle = screech::jetstream::Handle::start_single_voter(
+        screech::storage::SqliteStore::open(&path).unwrap(),
+    )
+    .unwrap();
+    let server = Running::start(Config {
+        jetstream: Some(handle),
+        ..Default::default()
+    })
+    .await;
+    let client = async_nats::connect(server.addr.to_string()).await.unwrap();
+    let js = async_nats::jetstream::new(client.clone());
+    let stream = js.get_stream("S").await.unwrap();
+    assert!(stream.get_raw_message(1).await.is_err());
+    assert_eq!(stream.get_raw_message(2).await.unwrap().payload, "two");
+    let mut consumer: async_nats::jetstream::consumer::PullConsumer =
+        stream.get_consumer("D").await.unwrap();
+    let info = consumer.info().await.unwrap();
+    assert_eq!(info.ack_floor.consumer_sequence, 1);
+    assert_eq!(info.num_ack_pending, 0);
+    let mut messages = consumer.fetch().max_messages(1).messages().await.unwrap();
+    let next = timeout(Duration::from_secs(3), messages.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(next.payload, "two");
+    next.double_ack().await.unwrap();
     drop(client);
     server.stop().await;
 }

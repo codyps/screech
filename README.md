@@ -15,6 +15,21 @@ mkdir -p data
 ./target/release/screech-server --store data/screech.db
 ```
 
+Use `--store data/screech.db --single-voter` to opt into the experimental strict
+single-voter driver. It separates proposal preparation, durable append completion
+and model installation, with one outstanding proposal and bounded storage/output
+adapters. Publications, delivery reservations and ACKs all require durable success;
+`--unsafe-ack-durability` is rejected in this mode. Omitting `--single-voter` keeps
+the existing standalone behavior, including its opt-in unsafe ACK mode.
+
+This is the first step of the [clustering plan](docs/clustering.md), with one fixed
+voter and no peer replication, elections or membership changes. It uses the existing
+committed-only store format: existing stores can be opened, and standalone mode
+can reopen its writes. Every complete durable append is committed by the sole
+voter, even if it crashes before applying or replying. Do not interpret this log
+as a multi-voter accepted log. Content reads and checkpoints still run serially;
+there is no cluster availability or performance claim.
+
 The binary prints `LISTEN host:port` after binding; `--port 0` selects an available
 port. SIGINT/SIGTERM cancel connection waits and bound output/runtime shutdown,
 including a wedged storage worker. `--storage-deadline-ms` bounds client storage

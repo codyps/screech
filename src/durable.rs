@@ -1688,9 +1688,50 @@ pub fn time_parse(s: &str) -> Result<u64, Error> {
 const CHECKPOINT_RECORDS: usize = 8192;
 const CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
 
+/// Positions in the strict single-voter event log (not future Raft indexes).
+/// Accepted work is private until its complete durable append has finished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VoterProgress {
+    pub accepted: u64,
+    pub durable: u64,
+    pub committed: u64,
+    pub applied: u64,
+    pub checkpoint: u64,
+}
+
+/// Owned persistence effect. It can run on a blocking I/O executor while the
+/// engine retains its old committed projection. Dropping it leaves the engine
+/// unavailable; an unknown write outcome must be recovered, never cancelled.
+pub struct AppendTask<S> {
+    store: S,
+    plan: GroupPlan,
+    token: std::sync::Arc<()>,
+    expected: u64,
+}
+
+/// Only executing an AppendTask can construct this completion. Both successful
+/// and failed completions return ownership of the same storage instance.
+pub struct AppendCompletion<S> {
+    task: AppendTask<S>,
+    result: Result<u64, crate::storage::StoreError>,
+}
+
+impl<S: Store> AppendTask<S> {
+    pub fn run(mut self) -> AppendCompletion<S> {
+        // Strict mode never calls append_consumer_state, even for ACK-only work.
+        let result = self
+            .store
+            .append_with_content(&self.plan.records, &self.plan.contents);
+        AppendCompletion { task: self, result }
+    }
+}
+
 pub struct Engine<S> {
     state: State,
-    store: S,
+    store: Option<S>,
+    voter: Option<VoterProgress>,
+    pending: Option<std::sync::Arc<()>>,
+    checkpoint_sequence: u64,
     poisoned: std::cell::Cell<bool>,
     log_sequence: u64,
     since_checkpoint: usize,
@@ -1700,15 +1741,53 @@ pub struct Engine<S> {
     committed_groups: u64,
 }
 impl<S: Store> Engine<S> {
+    fn ensure_ready(&self) -> Result<(), Error> {
+        if self.poisoned.get() {
+            Err(invalid("Storage failed: restart required"))
+        } else if self.pending.is_some() {
+            Err(invalid("Persistence in flight"))
+        } else {
+            Ok(())
+        }
+    }
+    fn storage(&self) -> Result<&S, Error> {
+        self.store.as_ref().ok_or(invalid("Persistence in flight"))
+    }
+    pub fn voter_progress(&self) -> Option<VoterProgress> {
+        self.voter
+    }
+    pub(crate) fn persistence_lost(&self) {
+        self.poisoned.set(true);
+    }
+    pub(crate) fn can_release_output(&self) -> bool {
+        !self.poisoned.get()
+            && self.pending.is_none()
+            && self.voter.is_none_or(|p| p.applied == p.committed)
+    }
+    /// Strict, fixed one-voter mode. Every durable append is committed by the
+    /// sole voter. This format must not be opened as a multi-voter accepted log.
+    pub fn recover_single_voter(store: S) -> Result<Self, Error> {
+        if store.buffers_consumer_state() || !store.durable_appends() || !store.supports_batch() {
+            return Err(invalid("Single-voter mode requires durable atomic appends and forbids unsafe ACK buffering"));
+        }
+        let mut engine = Self::recover(store)?;
+        let end = engine.log_sequence;
+        engine.voter = Some(VoterProgress {
+            accepted: end,
+            durable: end,
+            committed: end,
+            applied: end,
+            checkpoint: engine.checkpoint_sequence,
+        });
+        Ok(engine)
+    }
     pub fn state(&self) -> &State {
         &self.state
     }
     /// Resolve a selected message without retaining its body in the model.
     pub fn read_message(&self, message: &StoredMessage) -> Result<StoredMessage, Error> {
-        if self.poisoned.get() {
-            return Err(invalid("Storage failed: restart required"));
-        }
-        let result = hydrate_message(&self.store, message);
+        self.ensure_ready()?;
+        let result = hydrate_message(self.storage()?, message);
         if result.is_err() {
             self.poisoned.set(true);
         }
@@ -1716,16 +1795,14 @@ impl<S: Store> Engine<S> {
     }
     /// Resolve a bounded selection before committing its reservation/retention effects.
     pub fn read_messages(&self, messages: &[&StoredMessage]) -> Result<Vec<StoredMessage>, Error> {
-        if self.poisoned.get() {
-            return Err(invalid("Storage failed: restart required"));
-        }
+        self.ensure_ready()?;
         let result = (|| {
             if let Some(keys) = messages
                 .iter()
                 .map(|m| m.content.as_ref().map(|r| r.key))
                 .collect::<Option<Vec<_>>>()
             {
-                let contents = self.store.get_contents(&keys)?;
+                let contents = self.storage()?.get_contents(&keys)?;
                 if contents.len() != messages.len() {
                     return Err(invalid("Invalid content batch length"));
                 }
@@ -1737,7 +1814,7 @@ impl<S: Store> Engine<S> {
             } else {
                 messages
                     .iter()
-                    .map(|m| hydrate_message(&self.store, m))
+                    .map(|m| hydrate_message(self.storage()?, m))
                     .collect()
             }
         })();
@@ -1750,20 +1827,30 @@ impl<S: Store> Engine<S> {
         self.poisoned.get()
     }
     pub(crate) fn buffers_consumer_state(&self) -> bool {
-        self.store.buffers_consumer_state()
+        self.store
+            .as_ref()
+            .is_some_and(Store::buffers_consumer_state)
     }
     pub fn flush_consumer_state(&mut self, force: bool) -> Result<(), Error> {
-        if self.poisoned.get() {
-            return Err(invalid("Storage failed: restart required"));
-        }
-        if let Err(error) = self.store.flush_consumer_state(force) {
+        self.ensure_ready()?;
+        if let Err(error) = self
+            .store
+            .as_mut()
+            .expect("storage available")
+            .flush_consumer_state(force)
+        {
             self.poisoned.set(true);
             return Err(error.into());
         }
         Ok(())
     }
+    /// Return storage after completing any outstanding append.
+    ///
+    /// # Panics
+    /// Panics if an AppendTask or its completion still owns the storage.
     pub fn into_store(self) -> S {
         self.store
+            .expect("append in flight: complete it before taking storage")
     }
     pub fn recover(store: S) -> Result<Self, Error> {
         let last = store.last_sequence()?;
@@ -1838,7 +1925,10 @@ impl<S: Store> Engine<S> {
                 .any(|s| s.messages.values().any(|m| m.content.is_none()));
         let mut engine = Self {
             state,
-            store,
+            store: Some(store),
+            voter: None,
+            pending: None,
+            checkpoint_sequence: base,
             poisoned: std::cell::Cell::new(false),
             log_sequence: last,
             since_checkpoint: (last - base) as usize,
@@ -1853,11 +1943,9 @@ impl<S: Store> Engine<S> {
         Ok(engine)
     }
     pub fn checkpoint(&mut self) -> Result<(), Error> {
-        if self.poisoned.get() {
-            return Err(invalid("Storage failed: restart required"));
-        }
+        self.ensure_ready()?;
         let mut imports = Vec::new();
-        if self.store.external_content() {
+        if self.storage()?.external_content() {
             for stream in self.state.streams.values_mut() {
                 let sequences: Vec<_> = stream
                     .messages
@@ -1882,7 +1970,7 @@ impl<S: Store> Engine<S> {
             version: 3,
             state: &self.state,
         })?;
-        let result = if self.store.external_content() {
+        let result = if self.storage()?.external_content() {
             let mut live = self
                 .state
                 .streams
@@ -1890,13 +1978,22 @@ impl<S: Store> Engine<S> {
                 .flat_map(|s| s.messages.values())
                 .filter_map(|m| m.content.as_ref().map(|r| r.key));
             self.store
+                .as_mut()
+                .expect("storage available")
                 .checkpoint_with_content(self.log_sequence, &data, &mut live, &imports)
         } else {
-            self.store.checkpoint(self.log_sequence, &data)
+            self.store
+                .as_mut()
+                .expect("storage available")
+                .checkpoint(self.log_sequence, &data)
         };
         if let Err(e) = result {
             self.poisoned.set(true);
             return Err(e.into());
+        }
+        self.checkpoint_sequence = self.log_sequence;
+        if let Some(voter) = &mut self.voter {
+            voter.checkpoint = self.log_sequence;
         }
         self.since_checkpoint = 0;
         self.log_bytes = 0;
@@ -1907,10 +2004,10 @@ impl<S: Store> Engine<S> {
         self.committed_groups
     }
     pub fn supports_groups(&self) -> bool {
-        self.store.supports_batch()
+        self.store.as_ref().is_some_and(Store::supports_batch)
     }
     pub fn begin_group(&self) -> Result<GroupPlan, Error> {
-        if self.poisoned.get() || !self.store.supports_batch() {
+        if self.poisoned.get() || self.pending.is_some() || !self.storage()?.supports_batch() {
             return Err(invalid("Storage cannot plan a group"));
         }
         Ok(GroupPlan {
@@ -1921,15 +2018,93 @@ impl<S: Store> Engine<S> {
             events: Vec::with_capacity(32),
             records: Vec::with_capacity(32),
             contents: Vec::new(),
-            external_content: self.store.external_content(),
+            external_content: self.storage()?.external_content(),
             bytes: 0,
             log_bytes: 0,
             consumer_only: true,
             failed: false,
         })
     }
+    /// Admit one prepared proposal and hand storage ownership to the executor.
+    /// No model changes or outputs are published here. Empty read-only groups
+    /// need no persistence and are observed against the current committed state.
+    pub fn prepare_append(&mut self, plan: GroupPlan) -> Result<Option<AppendTask<S>>, Error> {
+        if self.voter.is_none()
+            || self.poisoned.get()
+            || self.pending.is_some()
+            || plan.failed
+            || !std::sync::Arc::ptr_eq(&self.identity, &plan.identity)
+            || plan.base != self.log_sequence
+        {
+            return Err(invalid("Stale, foreign or failed single-voter proposal"));
+        }
+        if plan.is_empty() {
+            return Ok(None);
+        }
+        let expected = self
+            .log_sequence
+            .checked_add(plan.len() as u64)
+            .ok_or(invalid("Log exhausted"))?;
+        if plan.len() > 1 {
+            #[cfg(feature = "fault-injection")]
+            crate::fault::group_context(self.log_sequence, &plan.records, &plan.events);
+            crate::fault::point("before_group_commit");
+        }
+        let token = std::sync::Arc::new(());
+        self.pending = Some(token.clone());
+        self.voter.as_mut().unwrap().accepted = expected;
+        Ok(Some(AppendTask {
+            store: self.store.take().expect("no other persistence in flight"),
+            plan,
+            token,
+            expected,
+        }))
+    }
+
+    /// Release a proposal only after its matching durable completion. A failed
+    /// append is ambiguous: retain the old projection and require recovery.
+    pub fn complete_append(&mut self, completion: AppendCompletion<S>) -> Result<(), Error> {
+        let AppendCompletion { task, result } = completion;
+        if !self
+            .pending
+            .as_ref()
+            .is_some_and(|t| std::sync::Arc::ptr_eq(t, &task.token))
+        {
+            return Err(invalid("Foreign persistence completion"));
+        }
+        self.store = Some(task.store);
+        self.pending = None;
+        if self.poisoned.get() {
+            return Err(invalid("Storage failed: restart required"));
+        }
+        match result {
+            Ok(end) if end == task.expected => {
+                self.log_sequence = end;
+                let voter = self.voter.as_mut().unwrap();
+                voter.durable = end;
+                voter.committed = end;
+            }
+            Ok(_) => {
+                self.poisoned.set(true);
+                return Err(invalid("Invalid single-voter append position"));
+            }
+            Err(error) => {
+                self.poisoned.set(true);
+                return Err(error.into());
+            }
+        }
+        self.install_group(task.plan)
+    }
+
     pub fn commit_group(&mut self, plan: GroupPlan) -> Result<(), Error> {
+        if self.voter.is_some() {
+            if let Some(task) = self.prepare_append(plan)? {
+                self.complete_append(task.run())?;
+            }
+            return Ok(());
+        }
         if self.poisoned.get()
+            || self.pending.is_some()
             || plan.failed
             || !std::sync::Arc::ptr_eq(&self.identity, &plan.identity)
             || plan.base != self.log_sequence
@@ -1948,16 +2123,19 @@ impl<S: Store> Engine<S> {
             .log_sequence
             .checked_add(plan.records.len() as u64)
             .ok_or(invalid("Log exhausted"))?;
+        let store = self
+            .store
+            .as_mut()
+            .ok_or(invalid("Persistence in flight"))?;
         let result = if plan.consumer_only {
-            self.store.append_consumer_state(&plan.records)
+            store.append_consumer_state(&plan.records)
         } else if !plan.contents.is_empty() {
-            self.store
-                .append_with_content(&plan.records, &plan.contents)
+            store.append_with_content(&plan.records, &plan.contents)
         } else if plan.records.len() == 1 {
             let r = &plan.records[0];
-            self.store.append(&r.subject, &r.headers, &r.payload)
+            store.append(&r.subject, &r.headers, &r.payload)
         } else {
-            self.store.append_batch(&plan.records)
+            store.append_batch(&plan.records)
         };
         match result {
             Ok(end) if end == expected => self.log_sequence = end,
@@ -1970,6 +2148,9 @@ impl<S: Store> Engine<S> {
                 return Err(error.into());
             }
         }
+        self.install_group(plan)
+    }
+    fn install_group(&mut self, plan: GroupPlan) -> Result<(), Error> {
         if plan.records.len() > 1 {
             #[cfg(feature = "fault-injection")]
             {
@@ -1983,9 +2164,12 @@ impl<S: Store> Engine<S> {
             crate::fault::batch_point("after", event);
         }
         self.state = plan.state;
+        if let Some(voter) = &mut self.voter {
+            voter.applied = self.log_sequence;
+        }
         self.since_checkpoint += plan.records.len();
         self.log_bytes += plan.log_bytes;
-        if self.store.supports_checkpoint()
+        if self.storage()?.supports_checkpoint()
             && (self.since_checkpoint >= CHECKPOINT_RECORDS || self.log_bytes >= CHECKPOINT_BYTES)
         {
             self.checkpoint()?;
@@ -1993,25 +2177,29 @@ impl<S: Store> Engine<S> {
         Ok(())
     }
     pub fn commit(&mut self, event: Event) -> Result<(), Error> {
-        if self.poisoned.get() {
-            return Err(invalid("Storage failed: restart required"));
+        if self.voter.is_some() {
+            let mut plan = self.begin_group()?;
+            plan.commit(event)?;
+            return self.commit_group(plan);
         }
+        self.ensure_ready()?;
         self.state.validate(&event)?;
         let operation = operation(&event);
         crate::fault::operation("before", operation);
         crate::fault::batch_point("before", &event);
         let (record, content, detached) =
-            encode_transition(&self.state, &event, self.store.external_content())?;
+            encode_transition(&self.state, &event, self.storage()?.external_content())?;
         let encoded_bytes = record.headers.len() + record.payload.len();
+        let store = self
+            .store
+            .as_mut()
+            .ok_or(invalid("Persistence in flight"))?;
         let result = if consumer_state_event(&event) {
-            self.store
-                .append_consumer_state(std::slice::from_ref(&record))
+            store.append_consumer_state(std::slice::from_ref(&record))
         } else if let Some(content) = content {
-            self.store
-                .append_with_content(std::slice::from_ref(&record), &[content])
+            store.append_with_content(std::slice::from_ref(&record), &[content])
         } else {
-            self.store
-                .append(&record.subject, &record.headers, &record.payload)
+            store.append(&record.subject, &record.headers, &record.payload)
         };
         match result {
             Ok(seq) => self.log_sequence = seq,
@@ -2031,7 +2219,7 @@ impl<S: Store> Engine<S> {
         }
         self.since_checkpoint += 1;
         self.log_bytes += encoded_bytes;
-        if self.store.supports_checkpoint()
+        if self.storage()?.supports_checkpoint()
             && (self.since_checkpoint >= CHECKPOINT_RECORDS || self.log_bytes >= CHECKPOINT_BYTES)
         {
             self.checkpoint()?;
