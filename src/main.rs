@@ -33,6 +33,9 @@ struct Args {
     /// Enable the experimental stream API with a SQLite event log.
     #[arg(long)]
     store: Option<std::path::PathBuf>,
+    /// UNSAFE: consumer reservations/ACKs may be lost after process or host failure; flush target 50 ms.
+    #[arg(long, requires = "store")]
+    unsafe_ack_durability: bool,
 }
 fn main() -> std::io::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -50,14 +53,21 @@ async fn run() -> std::io::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let a = Args::parse();
+    if a.unsafe_ack_durability {
+        eprintln!("UNSAFE ACK DURABILITY ENABLED: consumer reservations and confirmed ACKs may be lost after process or host failure. Consumer-state flush target: 50 ms. Publication ACKs remain durable.");
+    }
     let jetstream = a
         .store
         .map(|path| {
-            screech::storage::SqliteStore::open(path)
-                .map_err(std::io::Error::other)
-                .and_then(|store| {
-                    screech::jetstream::Handle::start(store).map_err(std::io::Error::other)
-                })
+            (if a.unsafe_ack_durability {
+                screech::storage::SqliteStore::open_with_unsafe_ack_durability(path)
+            } else {
+                screech::storage::SqliteStore::open(path)
+            })
+            .map_err(std::io::Error::other)
+            .and_then(|store| {
+                screech::jetstream::Handle::start(store).map_err(std::io::Error::other)
+            })
         })
         .transpose()?;
     let server = Server::bind(Config {

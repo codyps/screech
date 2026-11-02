@@ -1,4 +1,5 @@
-//! Storage contracts. `commit` returning success means durable, not merely buffered.
+//! Storage contracts. Publication appends and checkpoints return durable success.
+//! Consumer transitions are durable by default; an explicit unsafe mode may buffer them.
 //! Operations on one store are serialized by its owner, independently of transport.
 use bytes::Bytes;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -77,6 +78,17 @@ pub trait Store: Send {
     }
     fn supports_batch(&self) -> bool {
         false
+    }
+    /// Consumer-only transitions. Backends remain strictly durable by default.
+    fn append_consumer_state(&mut self, records: &[Append]) -> Result<u64, StoreError> {
+        if let [record] = records {
+            self.append(&record.subject, &record.headers, &record.payload)
+        } else {
+            self.append_batch(records)
+        }
+    }
+    fn flush_consumer_state(&mut self, _force: bool) -> Result<(), StoreError> {
+        Ok(())
     }
     fn external_content(&self) -> bool {
         false
@@ -208,6 +220,10 @@ pub struct SqliteStore {
     connection: Connection,
     _lock: File,
     last: u64,
+    unsafe_ack_durability: bool,
+    buffered_since: Option<std::time::Instant>,
+    buffered_consumer: Vec<Append>,
+    buffered_bytes: usize,
 }
 fn checksum(sequence: u64, subject: &str, headers: &[u8], payload: &[u8]) -> u32 {
     let mut h = crc32fast::Hasher::new();
@@ -219,6 +235,75 @@ fn checksum(sequence: u64, subject: &str, headers: &[u8], payload: &[u8]) -> u32
     h.finalize()
 }
 impl SqliteStore {
+    fn append_transaction(
+        &mut self,
+        records: &[Append],
+        content: &[Content],
+    ) -> Result<u64, StoreError> {
+        if records.is_empty() && self.buffered_consumer.is_empty() {
+            return Err(StoreError::Invalid);
+        }
+        let last = self.last;
+        let end = last
+            .checked_add((self.buffered_consumer.len() + records.len()) as u64)
+            .filter(|n| *n <= i64::MAX as u64)
+            .ok_or(StoreError::Invalid)?;
+        let tx = self.connection.transaction()?;
+        {
+            let mut insert =
+                tx.prepare_cached("INSERT INTO retained_content VALUES(?1,?2,?3,?4,?5,?6)")?;
+            for c in content {
+                insert.execute(params![
+                    i64::try_from(c.key.generation).map_err(|_| StoreError::Invalid)?,
+                    i64::try_from(c.key.sequence).map_err(|_| StoreError::Invalid)?,
+                    c.subject,
+                    c.headers.as_ref(),
+                    c.payload.as_ref(),
+                    content_checksum(c)
+                ])?;
+            }
+            let mut insert = tx.prepare_cached("INSERT INTO messages VALUES(?1,?2,?3,?4,?5)")?;
+            for (offset, r) in self.buffered_consumer.iter().chain(records).enumerate() {
+                let seq = last + offset as u64 + 1;
+                insert.execute(params![
+                    seq as i64,
+                    r.subject,
+                    r.headers.as_ref(),
+                    r.payload.as_ref(),
+                    checksum(seq, &r.subject, &r.headers, &r.payload)
+                ])?;
+            }
+        }
+        if tx
+            .prepare_cached("UPDATE meta SET last_seq=?1 WHERE id=1 AND last_seq=?2")?
+            .execute([end as i64, last as i64])?
+            != 1
+        {
+            return Err(StoreError::Invalid);
+        }
+        if self.buffered_consumer.len() + records.len() > 1 {
+            crate::fault::point("before_group_store_commit");
+        }
+        crate::fault::point("before_commit");
+        tx.commit()?;
+        crate::fault::point("after_commit");
+        if self.buffered_consumer.len() + records.len() > 1 {
+            crate::fault::point("after_group_store_commit");
+        }
+        self.last = end;
+        self.buffered_since = None;
+        self.buffered_consumer.clear();
+        self.buffered_bytes = 0;
+        Ok(end)
+    }
+    /// Opt in to acknowledging consumer state before a durable flush.
+    /// Publication/content appends and checkpoints still use FULL synchronization.
+    pub fn open_with_unsafe_ack_durability(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let mut store = Self::open(path)?;
+        store.unsafe_ack_durability = true;
+        store.buffered_consumer = Vec::with_capacity(256);
+        Ok(store)
+    }
     /// Use a pre-existing data directory. Lock prevents two servers owning one log.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
@@ -292,6 +377,10 @@ impl SqliteStore {
             connection: conn,
             _lock: lock,
             last,
+            unsafe_ack_durability: false,
+            buffered_since: None,
+            buffered_consumer: Vec::new(),
+            buffered_bytes: 0,
         };
         let last = store.last_sequence()?;
         let mut stmt = store
@@ -310,6 +399,54 @@ impl SqliteStore {
     }
 }
 impl Store for SqliteStore {
+    fn append_consumer_state(&mut self, records: &[Append]) -> Result<u64, StoreError> {
+        if records.is_empty() {
+            return Err(StoreError::Invalid);
+        }
+        if !self.unsafe_ack_durability {
+            return self.append_transaction(records, &[]);
+        }
+        let bytes = records.iter().fold(0usize, |n, r| {
+            n.saturating_add(r.subject.len())
+                .saturating_add(r.headers.len())
+                .saturating_add(r.payload.len())
+                .saturating_add(std::mem::size_of::<Append>())
+        });
+        if records.len() > 256 || bytes > 1024 * 1024 {
+            return self.append_transaction(records, &[]);
+        }
+        if self.buffered_consumer.len() + records.len() > 256
+            || self.buffered_bytes.saturating_add(bytes) > 1024 * 1024
+        {
+            self.flush_consumer_state(true)?;
+        }
+        let end = self
+            .last
+            .checked_add(self.buffered_consumer.len() as u64)
+            .and_then(|n| n.checked_add(records.len() as u64))
+            .filter(|n| *n <= i64::MAX as u64)
+            .ok_or(StoreError::Invalid)?;
+        self.buffered_consumer.extend_from_slice(records);
+        self.buffered_bytes += bytes;
+        self.buffered_since
+            .get_or_insert_with(std::time::Instant::now);
+        Ok(end)
+    }
+    fn flush_consumer_state(&mut self, force: bool) -> Result<(), StoreError> {
+        let Some(since) = self.buffered_since else {
+            return Ok(());
+        };
+        if !force
+            && (!crate::fault::periodic_consumer_flush_ready()
+                || since.elapsed() < std::time::Duration::from_millis(50))
+        {
+            return Ok(());
+        }
+        crate::fault::point("before_unsafe_ack_flush");
+        self.append_transaction(&[], &[])?;
+        crate::fault::point("after_unsafe_ack_flush");
+        Ok(())
+    }
     fn external_content(&self) -> bool {
         true
     }
@@ -318,65 +455,10 @@ impl Store for SqliteStore {
         records: &[Append],
         content: &[Content],
     ) -> Result<u64, StoreError> {
-        if content.is_empty() {
-            return if let [r] = records {
-                self.append(&r.subject, &r.headers, &r.payload)
-            } else {
-                self.append_batch(records)
-            };
-        }
         if records.is_empty() {
             return Err(StoreError::Invalid);
         }
-        let last = self.last;
-        let end = last
-            .checked_add(records.len() as u64)
-            .filter(|n| *n <= i64::MAX as u64)
-            .ok_or(StoreError::Invalid)?;
-        let tx = self.connection.transaction()?;
-        {
-            let mut insert =
-                tx.prepare_cached("INSERT INTO retained_content VALUES(?1,?2,?3,?4,?5,?6)")?;
-            for c in content {
-                insert.execute(params![
-                    i64::try_from(c.key.generation).map_err(|_| StoreError::Invalid)?,
-                    i64::try_from(c.key.sequence).map_err(|_| StoreError::Invalid)?,
-                    c.subject,
-                    c.headers.as_ref(),
-                    c.payload.as_ref(),
-                    content_checksum(c)
-                ])?;
-            }
-            let mut insert = tx.prepare_cached("INSERT INTO messages VALUES(?1,?2,?3,?4,?5)")?;
-            for (offset, r) in records.iter().enumerate() {
-                let seq = last + offset as u64 + 1;
-                insert.execute(params![
-                    seq as i64,
-                    r.subject,
-                    r.headers.as_ref(),
-                    r.payload.as_ref(),
-                    checksum(seq, &r.subject, &r.headers, &r.payload)
-                ])?;
-            }
-        }
-        if tx
-            .prepare_cached("UPDATE meta SET last_seq=?1 WHERE id=1 AND last_seq=?2")?
-            .execute([end as i64, last as i64])?
-            != 1
-        {
-            return Err(StoreError::Invalid);
-        }
-        if records.len() > 1 {
-            crate::fault::point("before_group_store_commit");
-        }
-        crate::fault::point("before_commit");
-        tx.commit()?;
-        crate::fault::point("after_commit");
-        if records.len() > 1 {
-            crate::fault::point("after_group_store_commit");
-        }
-        self.last = end;
-        Ok(end)
+        self.append_transaction(records, content)
     }
     fn get_content(&self, key: ContentKey) -> Result<Option<Content>, StoreError> {
         let generation = i64::try_from(key.generation).map_err(|_| StoreError::Invalid)?;
@@ -419,6 +501,7 @@ impl Store for SqliteStore {
         live: &mut dyn Iterator<Item = ContentKey>,
         imports: &[Content],
     ) -> Result<(), StoreError> {
+        self.flush_consumer_state(true)?;
         if sequence != self.last_sequence()? {
             return Err(StoreError::Invalid);
         }
@@ -465,6 +548,7 @@ impl Store for SqliteStore {
             return Err(StoreError::Invalid);
         }
         crate::fault::point("after_wal_restart");
+        self.buffered_since = None;
         Ok(())
     }
     fn supports_batch(&self) -> bool {
@@ -474,38 +558,7 @@ impl Store for SqliteStore {
         if records.is_empty() {
             return Err(StoreError::Invalid);
         }
-        let last = self.last;
-        let end = last
-            .checked_add(records.len() as u64)
-            .filter(|n| *n <= i64::MAX as u64)
-            .ok_or(StoreError::Invalid)?;
-        let tx = self.connection.transaction()?;
-        {
-            let mut insert = tx.prepare_cached("INSERT INTO messages VALUES(?1,?2,?3,?4,?5)")?;
-            for (offset, record) in records.iter().enumerate() {
-                let sequence = last + offset as u64 + 1;
-                insert.execute(params![
-                    sequence as i64,
-                    record.subject,
-                    record.headers.as_ref(),
-                    record.payload.as_ref(),
-                    checksum(sequence, &record.subject, &record.headers, &record.payload)
-                ])?;
-            }
-        }
-        let updated = tx
-            .prepare_cached("UPDATE meta SET last_seq=?1 WHERE id=1 AND last_seq=?2")?
-            .execute([end as i64, last as i64])?;
-        if updated != 1 {
-            return Err(StoreError::Invalid);
-        }
-        crate::fault::point("before_group_store_commit");
-        crate::fault::point("before_commit");
-        tx.commit()?;
-        crate::fault::point("after_commit");
-        crate::fault::point("after_group_store_commit");
-        self.last = end;
-        Ok(end)
+        self.append_transaction(records, &[])
     }
     fn supports_checkpoint(&self) -> bool {
         true
@@ -537,6 +590,7 @@ impl Store for SqliteStore {
         .transpose()
     }
     fn checkpoint(&mut self, sequence: u64, state: &[u8]) -> Result<(), StoreError> {
+        self.flush_consumer_state(true)?;
         if sequence != self.last_sequence()? {
             return Err(StoreError::Invalid);
         }
@@ -558,10 +612,22 @@ impl Store for SqliteStore {
             return Err(StoreError::Invalid);
         }
         crate::fault::point("after_wal_restart");
+        self.buffered_since = None;
         Ok(())
     }
 
     fn append(&mut self, subject: &str, headers: &[u8], payload: &[u8]) -> Result<u64, StoreError> {
+        if !self.buffered_consumer.is_empty() {
+            return self.append_transaction(
+                &[Append {
+                    subject: subject.into(),
+                    headers: Bytes::copy_from_slice(headers),
+                    payload: Bytes::copy_from_slice(payload),
+                }],
+                &[],
+            );
+        }
+
         let last = self.last;
         let tx = self.connection.transaction()?;
         let seq = last
@@ -586,9 +652,24 @@ impl Store for SqliteStore {
         tx.commit()?;
         crate::fault::point("after_commit");
         self.last = seq;
+        self.buffered_since = None;
         Ok(seq)
     }
     fn get(&self, sequence: u64) -> Result<Option<Record>, StoreError> {
+        if sequence > self.last {
+            if let Some(r) = self
+                .buffered_consumer
+                .get((sequence - self.last - 1) as usize)
+            {
+                return Ok(Some(Record {
+                    sequence,
+                    subject: r.subject.clone(),
+                    headers: r.headers.clone(),
+                    payload: r.payload.clone(),
+                }));
+            }
+        }
+
         if sequence > i64::MAX as u64 {
             return Ok(None);
         }
@@ -621,14 +702,18 @@ impl Store for SqliteStore {
         .transpose()
     }
     fn last_sequence(&self) -> Result<u64, StoreError> {
-        u64::try_from(self.connection.query_row(
+        let persisted = u64::try_from(self.connection.query_row(
             "SELECT last_seq FROM meta WHERE id=1",
             [],
             |r| r.get::<_, i64>(0),
         )?)
-        .map_err(|_| StoreError::Invalid)
+        .map_err(|_| StoreError::Invalid)?;
+        persisted
+            .checked_add(self.buffered_consumer.len() as u64)
+            .ok_or(StoreError::Invalid)
     }
     fn purge(&mut self) -> Result<(), StoreError> {
+        self.flush_consumer_state(true)?;
         let tx = self.connection.transaction()?;
         tx.execute("DELETE FROM messages", [])?;
         crate::fault::point("before_purge_commit");
@@ -736,5 +821,109 @@ mod group_tests {
         assert_eq!(store.last_sequence().unwrap(), 3);
         assert_eq!(store.get(2).unwrap().unwrap().payload, records[0].payload);
         assert_eq!(store.get(3).unwrap().unwrap().payload, records[1].payload);
+    }
+}
+
+#[cfg(test)]
+mod unsafe_ack_tests {
+    use super::*;
+    #[test]
+    fn buffered_consumer_commits_preserve_full_publication_fences() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let mut store = SqliteStore::open_with_unsafe_ack_durability(&path).unwrap();
+        let record = Append {
+            subject: "consumer".into(),
+            headers: Bytes::new(),
+            payload: Bytes::from_static(b"ack"),
+        };
+        store
+            .append_consumer_state(std::slice::from_ref(&record))
+            .unwrap();
+        assert!(store.buffered_since.is_some());
+        assert_eq!(
+            store
+                .connection
+                .pragma_query_value(None, "synchronous", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        store.flush_consumer_state(false).unwrap();
+        assert!(store.buffered_since.is_some());
+        store.append("publish", b"", b"body").unwrap();
+        assert!(store.buffered_since.is_none());
+        store
+            .append_consumer_state(&[record.clone(), record.clone()])
+            .unwrap();
+        assert!(store.buffered_since.is_some());
+        store.flush_consumer_state(true).unwrap();
+        assert!(store.buffered_since.is_none());
+        assert_eq!(store.last_sequence().unwrap(), 4);
+        drop(store);
+        let mut store = SqliteStore::open(&path).unwrap();
+        assert!(!store.unsafe_ack_durability);
+        store.append_consumer_state(&[record]).unwrap();
+        assert!(store.buffered_since.is_none());
+        assert_eq!(store.last_sequence().unwrap(), 5);
+    }
+    #[test]
+    fn buffered_positions_are_visible_and_count_byte_and_time_limits_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store =
+            SqliteStore::open_with_unsafe_ack_durability(dir.path().join("store")).unwrap();
+        let record = Append {
+            subject: "consumer".into(),
+            headers: Bytes::new(),
+            payload: Bytes::from_static(b"ack"),
+        };
+        for sequence in 1..=257 {
+            assert_eq!(
+                store
+                    .append_consumer_state(std::slice::from_ref(&record))
+                    .unwrap(),
+                sequence
+            );
+            assert_eq!(store.last_sequence().unwrap(), sequence);
+            assert_eq!(store.get(sequence).unwrap().unwrap().payload, b"ack"[..]);
+        }
+        assert_eq!(store.last, 256);
+        assert_eq!(store.buffered_consumer.len(), 1);
+        store.buffered_since =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(60));
+        store.flush_consumer_state(false).unwrap();
+        assert_eq!(store.last, 257);
+        assert!(store.buffered_consumer.is_empty());
+        let large = Append {
+            headers: Bytes::from(vec![0; 600 * 1024]),
+            ..record.clone()
+        };
+        store
+            .append_consumer_state(std::slice::from_ref(&large))
+            .unwrap();
+        store
+            .append_consumer_state(std::slice::from_ref(&large))
+            .unwrap();
+        assert_eq!(store.last, 258);
+        assert_eq!(store.buffered_consumer.len(), 1);
+        store.checkpoint(259, b"state").unwrap();
+        assert_eq!(store.last, 259);
+        assert!(store.buffered_consumer.is_empty());
+        assert_eq!(store.load_checkpoint().unwrap().unwrap().0, 259);
+    }
+    #[test]
+    fn invalid_buffered_commit_does_not_change_synchronous_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store =
+            SqliteStore::open_with_unsafe_ack_durability(dir.path().join("store")).unwrap();
+        assert!(store.append_consumer_state(&[]).is_err());
+        assert_eq!(
+            store
+                .connection
+                .pragma_query_value(None, "synchronous", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert!(store.buffered_since.is_none());
+        store.append("publish", b"", b"body").unwrap();
     }
 }

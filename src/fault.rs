@@ -28,6 +28,17 @@ pub fn point(name: &str) {
 pub fn point(_: &str) {}
 
 #[cfg(feature = "fault-injection")]
+pub fn periodic_consumer_flush_ready() -> bool {
+    std::env::var_os("SCREECH_UNSAFE_ACK_FLUSH_GATE")
+        .is_none_or(|path| std::path::Path::new(&path).exists())
+}
+#[cfg(not(feature = "fault-injection"))]
+#[inline(always)]
+pub fn periodic_consumer_flush_ready() -> bool {
+    true
+}
+
+#[cfg(feature = "fault-injection")]
 pub fn operation(stage: &str, kind: &str) {
     point(&format!("{stage}_{kind}_commit"));
 }

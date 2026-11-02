@@ -288,3 +288,50 @@ fn external_content_still_checkpoints_at_record_limit_after_recovery() {
         b"new"[..]
     );
 }
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+    #[test]
+    fn unsafe_consumer_suffix_refines_last_full_fence(ops in prop::collection::vec(0u8..6, 1..100)) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let mut disk = setup(SqliteStore::open_with_unsafe_ack_durability(&path).unwrap(), Retention::Workqueue);
+        let inline = setup(MemoryStore::default(), Retention::Workqueue);
+        let mut model = inline.state().clone();
+        let mut durable = model.clone();
+        for (time, op) in ops.into_iter().enumerate() {
+            let time = time as u64 * 11;
+            match op {
+                0 | 1 => {
+                    let event = model.prepare_publish("S", "a.b", Bytes::new(), Bytes::from(vec![time as u8;4096]), time).unwrap();
+                    disk.commit(event.clone()).unwrap(); model.apply(event).unwrap();
+                    durable = model.clone(); // FULL publication also fences older buffered ACKs.
+                }
+                2 => {
+                    if let Some(event) = model.prepare_delivery("S", "D", time).unwrap() {
+                        disk.commit(event.clone()).unwrap(); model.apply(event).unwrap();
+                    }
+                }
+                3 => {
+                    let c = &model.streams["S"].consumers["D"];
+                    if let Some((&sequence,p)) = c.pending.iter().next() {
+                        let event = model.prepare_ack("S", "D", AckToken { generation:c.generation,sequence,consumer_sequence:p.consumer_sequence }, AckAction::Ack,time).unwrap();
+                        disk.commit(event.clone()).unwrap(); model.apply(event).unwrap();
+                    }
+                }
+                4 => { disk.checkpoint().unwrap(); durable = model.clone(); }
+                _ => {
+                    drop(disk.into_store());
+                    disk = Engine::recover(SqliteStore::open_with_unsafe_ack_durability(&path).unwrap()).unwrap();
+                    model = durable.clone();
+                }
+            }
+            let mut resolved = disk.state().clone();
+            let stream = resolved.streams.get_mut("S").unwrap();
+            for seq in stream.messages.keys().copied().collect::<Vec<_>>() {
+                stream.messages.insert(seq,disk.read_message(&stream.messages[&seq]).unwrap());
+            }
+            prop_assert_eq!(&resolved,&model);
+        }
+    }
+}

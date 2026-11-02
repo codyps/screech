@@ -1691,6 +1691,16 @@ impl<S: Store> Engine<S> {
     pub fn is_poisoned(&self) -> bool {
         self.poisoned.get()
     }
+    pub fn flush_consumer_state(&mut self, force: bool) -> Result<(), Error> {
+        if self.poisoned.get() {
+            return Err(invalid("Storage failed: restart required"));
+        }
+        if let Err(error) = self.store.flush_consumer_state(force) {
+            self.poisoned.set(true);
+            return Err(error.into());
+        }
+        Ok(())
+    }
     pub fn into_store(self) -> S {
         self.store
     }
@@ -1847,6 +1857,7 @@ impl<S: Store> Engine<S> {
             external_content: self.store.external_content(),
             bytes: 0,
             log_bytes: 0,
+            consumer_only: true,
             failed: false,
         })
     }
@@ -1870,7 +1881,9 @@ impl<S: Store> Engine<S> {
             .log_sequence
             .checked_add(plan.records.len() as u64)
             .ok_or(invalid("Log exhausted"))?;
-        let result = if !plan.contents.is_empty() {
+        let result = if plan.consumer_only {
+            self.store.append_consumer_state(&plan.records)
+        } else if !plan.contents.is_empty() {
             self.store
                 .append_with_content(&plan.records, &plan.contents)
         } else if plan.records.len() == 1 {
@@ -1923,7 +1936,10 @@ impl<S: Store> Engine<S> {
         let (record, content, detached) =
             encode_transition(&self.state, &event, self.store.external_content())?;
         let encoded_bytes = record.headers.len() + record.payload.len();
-        let result = if let Some(content) = content {
+        let result = if consumer_state_event(&event) {
+            self.store
+                .append_consumer_state(std::slice::from_ref(&record))
+        } else if let Some(content) = content {
             self.store
                 .append_with_content(std::slice::from_ref(&record), &[content])
         } else {
@@ -1969,6 +1985,7 @@ pub struct GroupPlan {
     external_content: bool,
     bytes: usize,
     log_bytes: usize,
+    consumer_only: bool,
     failed: bool,
 }
 impl GroupPlan {
@@ -2016,6 +2033,7 @@ impl GroupPlan {
         }
         crate::fault::operation("before", operation(&event));
         crate::fault::batch_point("before", &event);
+        self.consumer_only &= consumer_state_event(&event);
         #[cfg(feature = "fault-injection")]
         self.events.push(event.clone());
         if let Err(error) = self.state.apply_validated(event) {
@@ -2045,6 +2063,16 @@ fn operation(event: &Event) -> &'static str {
         Event::Expire { .. } => "expiration",
         _ => "publish",
     }
+}
+fn consumer_state_event(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Deliver { .. }
+            | Event::DeliverBatch { .. }
+            | Event::Ack { .. }
+            | Event::AckBatch { .. }
+            | Event::AckNext { .. }
+    )
 }
 fn content_parts(generation: u64, message: &StoredMessage) -> (ContentRef, Content) {
     let key = ContentKey {

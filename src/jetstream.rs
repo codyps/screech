@@ -191,6 +191,9 @@ impl Handle {
                     }
                 };
             }
+            if let Err(error) = worker.engine.flush_consumer_state(true) {
+                tracing::error!(%error, "consumer-state flush failed during shutdown");
+            }
             drop(worker);
             let _ = done_tx.send(());
         });
@@ -1545,6 +1548,9 @@ impl<S: Store> Worker<S> {
         if self.engine.is_poisoned() {
             return Ok(false);
         }
+        self.engine
+            .flush_consumer_state(false)
+            .map_err(|e| e.to_string())?;
         self.expire()?;
         let mut progressed = false;
         let n = self.pulls.len();

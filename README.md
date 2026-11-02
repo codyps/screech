@@ -155,6 +155,22 @@ object names use the individual path. The planner shares persistent ordered inde
 and copies changed tree paths, keeping speculative state separate from committed
 state. Small catalogs still clone. See [group commits](docs/group-commits.md).
 
+## Unsafe consumer ACK durability
+
+`--unsafe-ack-durability` requires `--store` and prints a startup warning. It allows
+consumer reservations and ACK confirmations before their records reach durable
+storage. A process or host failure can roll back pending deliveries, ACK floors and
+retention effects; acknowledged workqueue messages can redeliver. The default keeps
+reservations and confirmed ACKs strictly durable.
+
+The opt-in mode buffers at most 256 event records / 1 MiB, with a 50 ms flush target.
+A slow or stalled disk can exceed that interval. Publication ACKs, catalog changes
+and checkpoints remain FULL: they atomically persist the earlier buffered prefix
+along with their own records. Graceful shutdown attempts a final flush. A flush
+failure stops subsequent JetStream success. This mode makes consumer performance
+comparisons with NATS's buffered consumer state more useful; the guarantees are
+still not identical. Benchmark series label it **UNSAFE ACK durability** separately.
+
 ## Core forwarding and JetStream completion
 
 Live Core routing runs before storage admission/completion, even when a subject

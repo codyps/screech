@@ -13,7 +13,7 @@ import time
 from wire import Client
 
 class Server:
-    def __init__(self, binary, directory, point=None, action='hang', extra_env=None):
+    def __init__(self, binary, directory, point=None, action='hang', extra_env=None, extra_args=()):
         self.marker = directory / 'fault.marker'
         self.marker.unlink(missing_ok=True)
         env = os.environ.copy()
@@ -23,7 +23,7 @@ class Server:
                        SCREECH_FAULT_MARKER=str(self.marker))
         if extra_env:env.update(extra_env)
         self.log = open(directory/'stderr.log', 'ab')
-        self.process = subprocess.Popen([binary,'--port','0','--store',str(directory/'data.db')],
+        self.process = subprocess.Popen([binary,'--port','0','--store',str(directory/'data.db'), *extra_args],
                                          stdout=subprocess.PIPE, stderr=self.log, env=env)
         if not select.select([self.process.stdout], [], [], 15)[0]:
             self.kill(); raise TimeoutError('server startup timeout')

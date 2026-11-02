@@ -1,6 +1,6 @@
 # Durable group commits
 
-Normal synchronous publications, Fetch(1) and ACK requests can share a SQLite FULL
+In the default mode, synchronous publications, Fetch(1) and ACK requests can share a SQLite FULL
 transaction across streams and consumers. Only already queued work joins a group;
 there is no assembly timer or client extension. Requests arriving while the private
 projection is being processed can join before its commit. Collection remains FIFO:
@@ -81,3 +81,8 @@ event records, commit boundaries and checkpoint encoding unchanged.
 After a maintenance pass makes delivery progress, the worker polls ingress immediately
 and services the next bounded chunk. A pass with no progress uses its idle wait, so
 ready pull/push backlogs avoid timer gaps while blocked/empty consumers do not spin.
+
+With `--unsafe-ack-durability`, consumer-only groups can replace their model and
+release replies while their records remain in the bounded storage buffer. Groups
+containing publications or catalog changes still commit FULL and include the older
+buffered prefix. Periodic flush and shutdown use the same FULL transaction path.
