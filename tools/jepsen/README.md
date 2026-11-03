@@ -120,3 +120,39 @@ virtual disk; LazyFS models loss of unsynced file data, not arbitrary controller
 corruption, coherent rollback of an entire quorum, independent-machine power loss,
 or every filesystem metadata/reordering behavior. These histories are correctness
 checks and are not throughput/latency benchmarks or production certification.
+
+## Checked runs
+
+The completed three- and five-voter campaigns each passed all six scenarios, using
+20 publications/s, 30 seconds of faulted workload per scenario and up to 90 seconds
+for the final drain. Both used LazyFS 0.3.0, Jepsen 0.3.10 and jnats 2.24.1, with
+Linux 6.18.59 under QEMU TCG.
+
+| Scenario | Three-voter acknowledged publications | Five-voter acknowledged publications |
+| --- | ---: | ---: |
+| `baseline` | 545 | 578 |
+| `power` | 69 | 110 |
+| `pause-kill` | 211 | 241 |
+| `partition` | 409 | 438 |
+| `corrupt` | 280 | 377 |
+| `wipe` | 340 | 418 |
+
+All 4,016 acknowledged publications were retained globally and through every
+public node address, with zero unexpected values. All twelve final membership and
+durable-position inspections passed. The 48 mount canaries demonstrated both
+unsynced-byte loss and fsynced-byte preservation; there were 93 additional
+acknowledged process-kill/cache-clear operations. The checker negative controls
+passed 13 assertions across two tests. These histories required no server changes.
+
+The tested server binary SHA-256 was
+`95a41ee9b1ebda6d8394a1bca04ce766192f6d1b564fb1143dd91b2eff18cc84`.
+The harness implementation is commit `81eb0f7`; server source was unchanged by the
+harness commit. Full results, histories, plots, canaries and convergence evidence
+are retained locally in `results/jepsen-three-voters-retry/` and
+`results/jepsen-five-voters-retry/`. They remain ignored artifacts.
+
+During bring-up, failed attempts exposed a missing guest `getent` dependency and
+an inspection request that failed immediately on a transient gateway disconnect.
+The assurance checker rejected those attempts. The guest now includes the resolver
+tool, and final inspection retries disconnects within its bounded recovery window;
+both complete campaigns then passed. The scope limits above still apply.

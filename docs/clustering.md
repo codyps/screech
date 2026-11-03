@@ -454,15 +454,30 @@ CI runs this suite together with the full Rust, cluster recovery and standalone
 fault suites. The new sync-failure selector in the test-only interposer preserves
 its original standalone defaults.
 
+The [Jepsen/LazyFS harness](../tools/jepsen/README.md) now adapts the upstream
+NATS queue workload and loss/divergence checker to ordinary three/five-voter
+Screech startup. Real LazyFS mounts cover each voter's database, WAL, watermark,
+manifest and recovery generations. Every mount must demonstrate loss of unsynced
+bytes and preservation of fsynced bytes; every injected cache clear must receive
+its completion acknowledgement. Histories cover majority/all-voter cache loss,
+overlapping quorums with pauses, partitions plus kills, bit flips, truncation and
+complete voter-state deletion. Final checks require all local manifest identities
+to be current voters and persisted application positions to converge. Required
+faults and nonzero acknowledged writes prevent vacuous passes. The recorded
+three/five-voter campaigns passed all twelve histories, retaining all 4,016
+acknowledged publications. See the harness README for setup, commands, artifacts
+and the exact checked contract.
+
 The assurance limits remain explicit. A healthy surviving quorum is required for
 repair; a consistent rollback of all local files including the watermark cannot be
 diagnosed locally. This review does not certify arbitrary storage/controller faults,
 or all network schedules. The existing guest-power-loss job exercises standalone
-mode; multi-voter guest/LazyFS power-loss histories remain a production gate. The
-current snapshot transfer size/memory limits and serialized SQLite I/O still apply;
-these correctness histories are not throughput or tail-latency benchmarks. MQTT,
-leafnodes, gateways, JWT permission rules and other unimplemented NATS facilities
-are outside this durability review.
+mode. The LazyFS voters use separate networks and mounts in one guest kernel;
+independent-machine power-loss histories and Jepsen consumer ACK/lifecycle workloads
+remain production gates. The current snapshot transfer size/memory limits and
+serialized SQLite I/O still apply; these correctness histories are not throughput
+or tail-latency benchmarks. MQTT, leafnodes, gateways, JWT permission rules and other
+unimplemented NATS facilities are outside this durability review.
 
 ## Proposed engine and storage design
 
@@ -910,10 +925,11 @@ experimental branch after the Raft baseline. Do not ship two consensus modes.
 
 ### 6. Validate real failures and sustained load
 
-Extend process/VM harnesses to independent nodes. Use a storage fault layer capable
-of discarding unsynced writes. Adapt Jepsen for consumer ACK/lifecycle operations as
-well as publication. Check safety throughout; require liveness only after a healthy
-quorum, usable disks and bounded scheduling return.
+The [NATS-derived Jepsen/LazyFS harness](../tools/jepsen/README.md) supplies the
+publication workload with real loss of unsynced writes and final membership and
+durable-position checks. Extend it to independent machines and to consumer
+ACK/lifecycle operations as well as publication. Check safety throughout; require
+liveness only after a healthy quorum, usable disks and bounded scheduling return.
 
 Required histories:
 

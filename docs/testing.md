@@ -95,6 +95,38 @@ the guest kernel/page cache; host/controller power failure is not simulated. Hos
 storage must honor flushes. Logs and structured results are CI artifacts, not source
 files committed to main.
 
+## Jepsen and LazyFS cluster histories
+
+The [NATS-derived Jepsen harness](../tools/jepsen/README.md) runs real LazyFS on
+three or five voters in separate network namespaces inside an isolated VM. It
+requires x86-64 Linux and Nix, with no host root, Docker or FUSE device. From the
+repository root:
+
+```sh
+cargo build --locked
+python3 tools/jepsen/bootstrap.py
+python3 tools/jepsen/check.py
+python3 tools/jepsen/vm.py \
+  --runtime results/jepsen-runtime/runtime.json \
+  --output results/jepsen-five-voters
+```
+
+Use `--nodes 3` for a three-voter campaign. Scenarios include majority/all-voter
+cache loss, overlapping quorums with pauses, partitions plus kills, database
+corruption/truncation and complete voter-state loss. All starts use the ordinary
+cluster configuration. Per-mount canaries verify the filesystem fault model;
+required fault counts and acknowledged writes prevent vacuous passes. The upstream
+queue checker verifies publication retention globally and through every public
+node address. A separate final inspection verifies voter admission and durable
+application-position convergence.
+
+The runner exits nonzero for an invalid or incomplete campaign. Jepsen histories,
+loss plots, per-node logs, convergence evidence, runtime metadata and `results.json`
+remain under the selected ignored output directory. These tests cover publication
+and queue reads; Jepsen consumer ACK/lifecycle workloads and independent-machine
+power failure remain separate work. See the harness README for the exact limits
+and the checked runs.
+
 ## Benchmarks
 
 See [CI benchmarks](ci-benchmarks.md) for scenarios, sync modes, timing boundaries,
