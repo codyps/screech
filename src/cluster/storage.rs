@@ -3,6 +3,7 @@
 //! durability path. Accepted suffixes are never exposed through the Store view.
 use super::{error, Batch, ClusterConfig};
 mod snapshots;
+mod watermark;
 use crate::storage::{Content, ContentKey, Record};
 use fs2::FileExt;
 use protobuf::Message;
@@ -33,6 +34,7 @@ pub(crate) struct Database {
     pub max_log_bytes: u64,
     pub snapshot_position: (u64, u64, u64),
     _lock: File,
+    watermark: watermark::Watermark,
 }
 #[derive(Clone)]
 pub(crate) struct LogStorage {
@@ -52,9 +54,10 @@ impl Database {
         let marker = path.with_extension("cluster-lock");
         let existed = path.exists();
         if !existed && !bootstrap && !join {
-            return Err(error("fresh cluster storage requires explicit initial bootstrap; lost voters must not be recreated"));
+            return Err(error("cluster storage is missing; startup must recover a fresh incarnation through the quorum"));
         }
-        let mut lock = OpenOptions::new()
+        let marker_bytes = std::fs::read(&marker).unwrap_or_default();
+        let lock = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -109,14 +112,6 @@ impl Database {
             conn.execute("INSERT INTO cluster_meta VALUES('identity',?1)", [identity])
                 .map_err(error)?;
         }
-        lock.write_all(b"screech-cluster-v1\n")?;
-        lock.sync_all()?;
-        File::open(
-            path.parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new(".")),
-        )?
-        .sync_all()?;
         let incarnation = if let Some(bytes) = conn
             .query_row(
                 "SELECT value FROM cluster_meta WHERE key='incarnation'",
@@ -141,10 +136,15 @@ impl Database {
         };
         let genesis = ConfState::from((
             config.voters(),
-            if join { vec![config.node_id] } else { vec![] },
+            if incarnation != [0; 16] {
+                vec![config.node_id]
+            } else {
+                vec![]
+            },
         ));
         let mut db = Self {
             conn,
+            watermark: watermark::Watermark::open(path, config, initialized, &marker_bytes)?,
             _lock: lock,
             failed: false,
             snapshot_position: (0, 0, 0),
@@ -176,6 +176,7 @@ impl Database {
         for idx in base + 1..=last {
             let _ = db.entry(idx)?;
         }
+        db.verify_watermark()?;
         db.recover_membership()?;
         // Rebuild indexes from the durable committed prefix, never the accepted tail.
         db.conn.execute_batch("DELETE FROM event_index;DELETE FROM body_index;DELETE FROM cluster_meta WHERE key='view';").map_err(error)?;
@@ -186,6 +187,16 @@ impl Database {
             )
             .map_err(error)?;
         db.apply(hard.commit)?;
+        db.seal()?;
+        db._lock.set_len(0)?;
+        db._lock.write_all(watermark::MARKER)?;
+        db._lock.sync_all()?;
+        File::open(
+            path.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new(".")),
+        )?
+        .sync_all()?;
         Ok(db)
     }
     pub fn meta(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
@@ -301,6 +312,7 @@ impl Database {
         }
         crate::fault::point("before_cluster_persist");
         tx.commit().map_err(error)?;
+        self.seal()?;
         crate::fault::point("after_cluster_persist");
         Ok(())
     }
@@ -496,7 +508,7 @@ mod tests {
         storage::{Append, Content},
     };
     use bytes::Bytes;
-    fn config() -> ClusterConfig {
+    pub(super) fn config() -> ClusterConfig {
         ClusterConfig {
             cluster_id: "test".into(),
             node_id: 1,

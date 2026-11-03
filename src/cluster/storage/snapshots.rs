@@ -300,8 +300,9 @@ impl Database {
         .map_err(error)?;
         crate::fault::point("before_cluster_snapshot_install");
         tx.commit().map_err(error)?;
-        crate::fault::point("after_cluster_snapshot_install");
         self.snapshot_position = (index, snapshot.get_metadata().term, image.sequence);
+        self.seal()?;
+        crate::fault::point("after_cluster_snapshot_install");
         Ok(())
     }
     pub fn view(&self) -> io::Result<u64> {
