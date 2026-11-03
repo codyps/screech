@@ -164,6 +164,11 @@ pub(crate) fn apply_configuration(node: &mut RawNode<LogStorage>, commit: u64) -
         if e.get_entry_type() == EntryType::EntryConfChangeV2 {
             let cc = ConfChangeV2::parse_from_bytes(&e.data).map_err(error)?;
             let conf = node.apply_conf_change(&cc).map_err(error)?;
+            if step_down_removed(node) {
+                // Configuration callbacks can queue leader-only probes. A
+                // removed leader must not carry them into follower LightReady.
+                node.raft.msgs.clear();
+            }
             let mut db = node.store().db.lock().unwrap();
             let mut state = db.membership()?;
             Database::note_change(&mut state, &e)?;
@@ -301,6 +306,20 @@ pub(crate) fn advance_replacement(node: &mut RawNode<LogStorage>) -> io::Result<
         cc,
     )
     .map_err(error)
+}
+
+/// raft-rs 0.7 marks a removed leader non-promotable but leaves step-down to
+/// its caller. Step down immediately after applying committed removal, before
+/// advance can try to update the removed leader's progress.
+pub(crate) fn step_down_removed(node: &mut RawNode<LogStorage>) -> bool {
+    if node.raft.state == StateRole::Leader
+        && !node.raft.prs().conf().voters().contains(node.raft.id)
+    {
+        node.raft.become_follower(node.raft.term, 0);
+        true
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]

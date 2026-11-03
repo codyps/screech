@@ -19,7 +19,10 @@ use std::{
     io,
     net::SocketAddr,
     path::Path,
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 use storage::{Database, LogStorage};
@@ -121,6 +124,9 @@ enum Input {
     Message(Message, [u8; 16], tokio::sync::OwnedSemaphorePermit),
     Propose {
         term: u64,
+        configuration: u64,
+        session: u64,
+        activate: bool,
         data: Vec<u8>,
         reply: Reply,
     },
@@ -128,6 +134,8 @@ enum Input {
     Fault,
     Replace {
         term: u64,
+        configuration: u64,
+        session: u64,
         replacement: membership::Replacement,
         reply: Reply,
     },
@@ -142,17 +150,32 @@ struct Client {
     term: u64,
     replicas: usize,
     configuration: u64,
+    session: u64,
+    active_session: Arc<AtomicU64>,
 }
 impl Client {
     fn propose(&self, data: Vec<u8>) -> io::Result<u64> {
+        self.request(data, false)
+    }
+    fn activate(&self) -> io::Result<u64> {
+        self.request(Vec::new(), true)
+    }
+    fn request(&self, data: Vec<u8>, activate: bool) -> io::Result<u64> {
         let role = *self.role.borrow();
-        if role.leader != self.id || role.term != self.term {
+        if role.leader != self.id
+            || role.term != self.term
+            || role.configuration != self.configuration
+            || (!activate && self.active_session.load(Ordering::Acquire) != self.session)
+        {
             return Err(error("leadership changed"));
         }
         let (reply, rx) = mpsc::sync_channel(1);
         self.tx
             .try_send(Input::Propose {
                 term: self.term,
+                configuration: self.configuration,
+                session: self.session,
+                activate,
                 data,
                 reply,
             })
@@ -171,12 +194,13 @@ impl Client {
         result
     }
     fn current(&self) -> io::Result<()> {
-        if *self.role.borrow()
-            != (Role {
-                leader: self.id,
-                term: self.term,
-                configuration: self.configuration,
-            })
+        if self.active_session.load(Ordering::Acquire) != self.session
+            || *self.role.borrow()
+                != (Role {
+                    leader: self.id,
+                    term: self.term,
+                    configuration: self.configuration,
+                })
         {
             Err(error("leadership changed"))
         } else {
@@ -195,6 +219,8 @@ impl Store for ClusterStore {
             .tx
             .try_send(Input::Replace {
                 term: self.client.term,
+                configuration: self.client.configuration,
+                session: self.client.session,
                 replacement: membership::Replacement { old, new, nonce },
                 reply,
             })
@@ -616,6 +642,8 @@ pub async fn run(
     };
     let logger = slog::Logger::root(slog::Discard, slog::o!());
     let mut node = RawNode::new(&raft_config, log, &logger).map_err(error)?;
+    let active_session = Arc::new(AtomicU64::new(0));
+    let actor_session = active_session.clone();
     let actor_config = config.clone();
     let actor = std::thread::Builder::new()
         .name("screech-raft".into())
@@ -649,10 +677,14 @@ pub async fn run(
                     }
                     Ok(Input::Replace {
                         term,
+                        configuration,
+                        session,
                         replacement,
                         reply,
                     }) => {
                         if term != node.raft.term
+                            || configuration != node.store().db.lock().unwrap().conf_index()?
+                            || session != actor_session.load(Ordering::Acquire)
                             || !actor_config.peers.contains_key(&replacement.new)
                         {
                             let _ = reply
@@ -662,8 +694,20 @@ pub async fn run(
                             let _ = reply.send(result.map(|_| 0));
                         }
                     }
-                    Ok(Input::Propose { term, data, reply }) => {
-                        if node.raft.state != StateRole::Leader || node.raft.term != term {
+                    Ok(Input::Propose {
+                        term,
+                        configuration,
+                        session,
+                        activate,
+                        data,
+                        reply,
+                    }) => {
+                        if node.raft.state != StateRole::Leader
+                            || node.raft.term != term
+                            || configuration != node.store().db.lock().unwrap().conf_index()?
+                            || (!activate && session != actor_session.load(Ordering::Acquire))
+                            || (activate && !data.is_empty())
+                        {
                             let _ = reply.send(Err(error("not current leader")));
                         } else {
                             let used: i64 = node
@@ -689,6 +733,9 @@ pub async fn run(
                                 context.extend_from_slice(&serial.to_le_bytes());
                                 match node.propose(context.clone(), data) {
                                     Ok(()) => {
+                                        if activate {
+                                            actor_session.store(session, Ordering::Release);
+                                        }
                                         pending.insert(context, (Instant::now(), reply));
                                     }
                                     Err(e) => {
@@ -749,6 +796,7 @@ pub async fn run(
     let mut service_role = role.clone();
     let mut service_stop = stop_rx.clone();
     let service = tokio::spawn(async move {
+        let mut session = 0u64;
         let mut running: Option<(
             watch::Sender<bool>,
             tokio::task::JoinHandle<io::Result<()>>,
@@ -764,6 +812,9 @@ pub async fn run(
                 let _ = task.await;
             }
             if current.leader == service_config.node_id && running.is_none() {
+                session = session
+                    .checked_add(1)
+                    .expect("application sessions exhausted");
                 let client = Client {
                     tx: service_tx.clone(),
                     role: service_role.clone(),
@@ -772,10 +823,12 @@ pub async fn run(
                     term: current.term,
                     replicas: service_config.voters().len(),
                     configuration: current.configuration,
+                    session,
+                    active_session: active_session.clone(),
                 };
                 // Establish a current-term committed observation before recovery.
                 let prepared = tokio::task::spawn_blocking(move || {
-                    client.propose(Vec::new())?;
+                    client.activate()?;
                     crate::jetstream::Handle::start_single_voter(ClusterStore { client })
                         .map_err(error)
                 })
@@ -1028,6 +1081,51 @@ mod tests {
         }
     }
     #[test]
+    fn removed_leader_steps_down_after_leave_joint_is_committed() {
+        use raft::eraftpb::{ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2};
+        let dir = tempfile::tempdir().unwrap();
+        let mut sim = Simulation::new(dir.path());
+        sim.nodes[0].campaign().unwrap();
+        sim.settle(None);
+        let change = |id, kind| ConfChangeSingle {
+            node_id: id,
+            change_type: kind,
+            ..Default::default()
+        };
+        sim.nodes[0]
+            .propose_conf_change(
+                vec![],
+                ConfChangeV2 {
+                    changes: vec![change(4, ConfChangeType::AddLearnerNode)].into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sim.settle(None);
+        sim.nodes[0]
+            .propose_conf_change(
+                vec![],
+                ConfChangeV2 {
+                    transition: ConfChangeTransition::Explicit,
+                    changes: vec![
+                        change(4, ConfChangeType::AddNode),
+                        change(1, ConfChangeType::RemoveNode),
+                    ]
+                    .into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sim.settle(None);
+        assert!(!membership::step_down_removed(&mut sim.nodes[0]));
+        sim.nodes[0]
+            .propose_conf_change(vec![], ConfChangeV2::default())
+            .unwrap();
+        sim.settle(None);
+        assert_eq!(sim.nodes[0].raft.state, StateRole::Follower);
+        assert!(!membership::step_down_removed(&mut sim.nodes[0]));
+    }
+    #[test]
     fn authentication_binds_cluster_sender_and_complete_payload() {
         let mac = authenticate("secret", "cluster", 1, b"entry")
             .finalize()
@@ -1082,6 +1180,8 @@ mod checkpoint_tests {
                 term: 1,
                 replicas: 3,
                 configuration: 0,
+                session: 0,
+                active_session: Arc::new(AtomicU64::new(0)),
             },
         };
         let mut source =
@@ -1127,6 +1227,13 @@ mod checkpoint_tests {
             store.load_checkpoint().unwrap().unwrap().1.as_ref(),
             expected.as_slice()
         );
+        // A new service in the same Raft term/configuration fences the old
+        // worker before it can enqueue any stale prepared operation.
+        store.client.active_session.store(1, Ordering::Release);
+        assert!(store.client.propose(Vec::new()).is_err());
+        assert!(_requests.try_recv().is_err());
+        assert!(!db.lock().unwrap().failed);
+        store.client.active_session.store(0, Ordering::Release);
         db.lock()
             .unwrap()
             .conn
