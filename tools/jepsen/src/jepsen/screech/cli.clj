@@ -9,6 +9,7 @@
             [jepsen.os :as os]
             [jepsen.tests :as tests]
             [jepsen.screech.db :as db]
+            [jepsen.screech.consumer :as consumer]
             [jepsen.screech.nemesis :as nemesis]
             [jepsen.screech.queue :as queue]
             [jepsen.screech.remote :as remote]))
@@ -20,7 +21,9 @@
 (defn assurance [database fault-stats scenario]
   (reify checker/Checker
     (check [_ test history _]
-      (let [acknowledged (count (filter #(and (= :publish (:f %)) (= :ok (:type %))) history))
+      (let [acknowledged (if (= :consumer-lifecycle (:workload test))
+                           (consumer/acknowledged history)
+                           (count (filter #(and (= :publish (:f %)) (= :ok (:type %))) history)))
             canaries (= (count (:nodes test)) (:canaries @(:stats database)))
             required (some-> (required-faults scenario) (assoc :verify 1))
             required (or required (throw (ex-info "Unknown fault scenario" {:scenario scenario})))
@@ -33,9 +36,14 @@
 (defn test-map [opts]
   (let [nodes (mapv #(str "n" %) (range 1 (inc (:node-count opts))))
         database (db/database)
-        workload (queue/workload (assoc opts :nodes nodes))
+        workload-fn (case (:workload opts :queue)
+                      :queue queue/workload
+                      :consumer-lifecycle consumer/workload)
+        workload (workload-fn (assoc opts :nodes nodes))
         fault-stats (atom {})
         generator (gen/phases
+                    (when-let [initial (:initial-generator workload)]
+                      (->> initial gen/clients (gen/time-limit 120)))
                     (->> (:generator workload)
                          (gen/stagger (/ 1.0 (:rate opts)))
                          (gen/nemesis (nemesis/generator (:scenario opts) nodes))
@@ -44,7 +52,7 @@
                     (->> (:final-generator workload) gen/clients (gen/time-limit (:final-time-limit opts)))
                     (gen/nemesis [(nemesis/op :verify nil)]))]
     (merge tests/noop-test opts
-           {:name (str "screech-lazyfs-" (name (:scenario opts)))
+           {:name (str "screech-lazyfs-" (name (:workload opts :queue)) "-" (name (:scenario opts)))
             :nodes nodes :os os/noop :remote (remote/remote (:control-endpoint opts)) :db database
             :cluster-id (str (java.util.UUID/randomUUID))
             :cluster-secret (str (java.util.UUID/randomUUID) (java.util.UUID/randomUUID))
@@ -59,9 +67,9 @@
 (defn -main [& args]
   (let [opts (merge {:node-count 5 :concurrency 10 :rate 30 :time-limit 30 :final-time-limit 60}
                     (json/parse-string (slurp (first args)) true))
-        opts (update opts :scenario keyword)
+        opts (-> opts (update :scenario keyword) (update :workload #(keyword (or % "queue"))))
         result (core/run! (test-map opts))
-        summary {:scenario (:scenario opts) :valid? (get-in result [:results :valid?])
+        summary {:workload (:workload opts) :scenario (:scenario opts) :valid? (get-in result [:results :valid?])
                  :results (:results result)}]
     (spit "summary.json" (json/generate-string summary {:pretty true}))
     (println "SCREECH_JEPSEN_RESULT" (json/generate-string summary))

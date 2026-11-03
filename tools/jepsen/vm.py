@@ -126,6 +126,8 @@ def run(args):
     (output / 'specs').mkdir()
     shutil.copy2(args.binary, output / 'screech-server')
     scenarios = args.scenarios.split(',')
+    workloads = args.workloads.split(',')
+    cases = [(workload, scenario) for workload in workloads for scenario in scenarios]
     # Keep ports reserved until QEMU is ready to bind them.
     reservations = [socket.socket() for _ in range(6)]
     for reservation in reservations:
@@ -136,14 +138,15 @@ def run(args):
     token_file = output / 'control-token'
     token_file.write_text(token)
     token_file.chmod(0o600)
-    for index, scenario in enumerate(scenarios):
-        spec = {'scenario': scenario, 'node-count': args.nodes, 'concurrency': args.nodes * 2,
+    for index, (workload, scenario) in enumerate(cases):
+        spec = {'scenario': scenario, 'workload': workload, 'node-count': args.nodes,
+                'concurrency': args.nodes * (2 if workload == 'queue' else 1),
                 'rate': args.rate, 'time-limit': args.time_limit, 'final-time-limit': args.final_time_limit,
                 'project': str(REPO / 'tools/jepsen'), 'binary': '/results/screech-server',
                 'lazyfs-binary': str((REPO / 'upstream/lazyfs/lazyfs/build/lazyfs').resolve()),
                 'control-endpoint': endpoint,
                 'client-addresses': {f'n{i}': f'nats://127.0.0.1:{ports[i]}' for i in range(1, args.nodes + 1)}}
-        (output / 'specs' / f'{index:02}-{scenario}.json').write_text(json.dumps(spec))
+        (output / 'specs' / f'{index:02}-{workload}-{scenario}.json').write_text(json.dumps(spec))
     runtime['upstream'] = json.loads((REPO / 'tools/jepsen/upstream.json').read_text())
     with (output / 'screech-server').open('rb') as binary:
         runtime['binary_sha256'] = hashlib.file_digest(binary, 'sha256').hexdigest()
@@ -205,7 +208,7 @@ def run(args):
             process.wait(timeout=10)
             token_file.unlink(missing_ok=True)
     summaries = [json.loads(path.read_text()) for path in sorted((output / 'runs').glob('*/summary.json'))]
-    valid = error is None and len(summaries) == len(scenarios) and all(row['valid?'] is True for row in summaries) and all(code == 0 for code in completed)
+    valid = error is None and len(summaries) == len(cases) and all(row['valid?'] is True for row in summaries) and all(code == 0 for code in completed)
     result = {'passed': valid, 'scenarios': summaries, 'runtime': runtime, 'controller_exits': completed, 'error': error,
               'scope': 'Real Jepsen host controller, real LazyFS and voters in separate network namespaces on one isolated Linux kernel; TCG; no host/controller failure simulation'}
     (output / 'results.json').write_text(json.dumps(result, indent=2))
@@ -220,6 +223,7 @@ if __name__ == '__main__':
     parser.add_argument('--runtime', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--binary', type=Path, default=REPO / 'target/debug/screech-server')
+    parser.add_argument('--workloads', default='queue', help='Comma-separated queue,consumer-lifecycle workloads')
     parser.add_argument('--scenarios', default='baseline,power,pause-kill,partition,corrupt,wipe')
     parser.add_argument('--nodes', type=int, choices=[3, 5], default=5)
     parser.add_argument('--rate', type=int, default=30)

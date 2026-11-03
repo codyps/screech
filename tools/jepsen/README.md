@@ -48,7 +48,7 @@ A short duration that never reaches all the required faults fails the assurance
 checker. Increase the duration when testing a slow machine or sustained outages.
 The runner returns nonzero on an invalid history, incomplete campaign, checker
 exception or timeout. `results.json` contains each checker result and runtime
-provenance. Each `runs/<scenario>/` contains the controller log and normal Jepsen
+provenance. Each `runs/<workload-scenario>/` contains the controller log and normal Jepsen
 store: histories, per-node logs, canary evidence, loss plots and checker output.
 The guest serial log and disk image are retained as well.
 
@@ -93,7 +93,7 @@ traffic. No fault executes host `iptables`, host `kill` or host disk corruption.
 The guest control service requires an isolated-VM marker and a per-run random
 token; the runner removes the token when the guest stops.
 
-## What is checked
+## Queue workload
 
 The NATS queue workload publishes unique process/counter values. Once faults heal,
 each client creates an independent ephemeral consumer and drains the stream.
@@ -111,17 +111,77 @@ positions converged. It does not compare every follower's payload bytes directly
 record validation and deeper recovery-image checks remain in the Rust/process
 recovery suites.
 
-This is the publication/queue portion of the
-[NATS Jepsen investigation](https://jepsen.io/analyses/nats-2.12.1), not a full
-linearizability or exactly-once test. It does not yet adapt confirmed consumer ACK,
-retention, deduplication or catalog lifecycle workloads. Those contracts have
-separate model/process regressions. All voters share one guest kernel and backing
-virtual disk; LazyFS models loss of unsynced file data, not arbitrary controller
+## Consumer ACK and lifecycle workload
+
+Use `--workloads consumer-lifecycle` for the consumer histories, or
+`--workloads queue,consumer-lifecycle` to run both suites against every selected
+fault schedule. The queue workload remains the default. Consumer histories use one
+client per node, seed fixtures before faults, then attempt up to two more cycles
+per client during faults. All confirmed results in an interrupted cycle remain
+binding; ambiguous requests may have committed and are never labelled confirmed.
+
+```sh
+python3 tools/jepsen/vm.py \
+  --runtime results/jepsen-runtime/runtime.json \
+  --output results/jepsen-consumer-five --nodes 5 \
+  --workloads consumer-lifecycle --rate 1 \
+  --time-limit 30 --final-time-limit 180
+```
+
+Each cycle owns three streams and records individual successful API responses in
+its Jepsen completion, including completions of type `:info`. An ACK counts as
+confirmed only after receiving its empty, non-status response to a request on the
+actual delivery ACK subject. A Core `PONG`, successful socket write, or ACK timeout
+does not count as confirmation. The audit also journals every successful read and
+deduplication/stale-ACK probe, so a later request timeout cannot erase evidence of
+a violation.
+
+| Fixture | Required behavior through faults and final recovery |
+| --- | --- |
+| Limits retention | A confirmed ACK advances the durable consumer floor and leaves no pending ACK. The payload stays present. A separately deleted consumer stays absent. Retrying the original publication ID with different bytes returns `duplicate=true` and the original sequence, with one unchanged stored record. |
+| Interest retention | A message ACKed by both consumers stays deleted. A second message ACKed by just one consumer stays present with the other consumer's reservation pending. Both consumers retain their confirmed ACK floors. |
+| Workqueue retention and recreation | A confirmed ACK's message stays deleted. A second, unacknowledged message is reserved, its consumer is deleted and recreated under the same name, and the new consumer receives that message with a new generation. The old ACK is replayed before and after faults; it must neither confirm nor remove the new reservation or advance its ACK floor. Retrying the deleted message's publication ID must still deduplicate without resurrecting it. |
+
+Every public node address audits every attempted cycle after healing. The checker
+reconstructs required stream/consumer existence, ACK floors, delivery reservations,
+retention and deduplication results from recorded operations, rather than trusting
+an expected-state object returned by the server. It also checks ACK policy and
+ACK-wait configuration, pending counts, original payload bytes and recreated
+consumer generations. Shared client state is an address catalog and probe-target
+list; it does not decide which recorded obligations the checker enforces. Failed
+requests leave weaker obligations only for their own unknown outcomes, preserving
+earlier confirmed results. Missing audits, missing seeded coverage, skipped faults,
+or missing final voter convergence fail the run.
+
+To replay the consumer checker against saved histories without restarting any
+servers, run:
+
+```sh
+python3 tools/jepsen/check.py --recheck results/jepsen-consumer-five
+```
+
+This writes `rechecked-consumers.json`. A successful report requires both the
+original complete campaign and all replayed consumer checks to pass.
+
+The deduplication window is 24 hours and ACK wait is one hour, keeping expiry and
+scheduled redelivery outside these bounded histories. Tests deliberately leave
+some messages pending and inspect their persisted reservations. They exercise
+consumer creation, deletion and recreation, three retention policies and retries
+of publication IDs. They do not cover every consumer option, retention count/age
+limit, stream deletion/recreation or full cross-stream linearizability.
+
+## Scope
+
+The queue workload derives from the
+[NATS Jepsen investigation](https://jepsen.io/analyses/nats-2.12.1); the consumer
+workload adds Screech protocol histories. Neither suite is a full linearizability
+or general exactly-once test. All voters share one guest kernel and backing virtual
+disk. LazyFS models loss of unsynced file data, rather than arbitrary controller
 corruption, coherent rollback of an entire quorum, independent-machine power loss,
 or every filesystem metadata/reordering behavior. These histories are correctness
 checks and are not throughput/latency benchmarks or production certification.
 
-## Checked runs
+## Checked queue runs
 
 The completed three- and five-voter campaigns each passed all six scenarios, using
 20 publications/s, 30 seconds of faulted workload per scenario and up to 90 seconds
