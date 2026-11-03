@@ -55,8 +55,8 @@ the default listen address is loopback.
 | Consumers | Durable pull/push, queue push, filters and delivery policies, ACK/ACK-All/NAK/progress/TERM/ACK-and-next, backoff, delivery limits and advisories, selected live configuration updates |
 | Retention and deduplication | Limits/interest/workqueue, count/byte/per-subject/age limits, discard old/new, persistent `Nats-Msg-Id` windows |
 | Storage | SQLite WAL FULL, atomic state checkpoints/log reclamation, corruption checks and generation fencing |
-| Clustering | Fixed three/five-voter Raft group, complete payload replication, elections, leader routing, quorum reads and restart recovery |
-| Remaining | Dynamic membership/log compaction, TLS/NKey/JWT/accounts, WebSockets, replay-original/advanced flow control and priority consumers, KV/object stores, per-message TTL/rollup, online backup/restore, monitoring/configuration reload |
+| Clustering | Three/five-voter Raft group, payload replication, elections, quorum reads, snapshot compaction/transfer and learner-based voter replacement |
+| Remaining | General membership changes/sharding, TLS/NKey/JWT/accounts, WebSockets, replay-original/advanced flow control and priority consumers, KV/object stores, per-message TTL/rollup, online backup/restore, monitoring/configuration reload |
 
 `INFO.jetstream=true` with `--store` announces this experimental subset. Unsupported
 configuration returns errors; this is not complete JetStream compatibility. Core

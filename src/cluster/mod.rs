@@ -186,6 +186,12 @@ impl Client {
     fn read<R>(&self, f: impl FnOnce(&mut Database) -> io::Result<R>) -> io::Result<R> {
         self.current()?;
         let mut db = self.db.lock().unwrap();
+        // A configuration/term can become durable before the watch is published,
+        // or while this caller waits for storage. This is stale work, not damage.
+        self.current()?;
+        if db.hard()?.term != self.term || db.conf_index()? != self.configuration {
+            return Err(error("application epoch changed"));
+        }
         let result = f(&mut db);
         if result.is_err() {
             db.failed = true;
@@ -1234,6 +1240,29 @@ mod checkpoint_tests {
         assert!(_requests.try_recv().is_err());
         assert!(!db.lock().unwrap().failed);
         store.client.active_session.store(0, Ordering::Release);
+        db.lock()
+            .unwrap()
+            .persist(
+                &[],
+                Some(&raft::eraftpb::HardState {
+                    term: 2,
+                    vote: 0,
+                    commit: 1,
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        assert!(store.client.read(|_| Ok(())).is_err());
+        assert!(
+            !db.lock().unwrap().failed,
+            "stale watched epoch must not quarantine healthy storage"
+        );
+        store.client.term = 2;
+        _role.send_replace(Role {
+            leader: 1,
+            term: 2,
+            configuration: 0,
+        });
         db.lock()
             .unwrap()
             .conn

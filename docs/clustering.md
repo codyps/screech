@@ -4,10 +4,10 @@ Re-reviewed November 2, 2026 against
 `55180229d3d1333dde425d4370cead697e40ba7e`, including the storage, durable model,
 worker, TCP output paths, tests and CI gates. The first review used `e9dd571`;
 the intervening content-paging and unsafe-ACK changes materially change this plan.
-The local NATS investigation is supporting evidence. The fixed-membership Raft
+The local NATS investigation is supporting evidence. The Raft replication and recovery
 baseline is now implemented; the broader production gates remain this plan's scope.
 
-## Implementation status: fixed-membership Raft
+## Implementation status: Raft snapshots and voter replacement
 
 `--cluster-config` enables a separate consensus store and a real Raft 0.7.0 event
 pump for three or five voters. Term/vote state and complete accepted entries persist
@@ -22,17 +22,39 @@ changes close client connections and a replacement leader recovers its local
 committed model. INFO advertises public reconnect endpoints. This deliberately
 uses connection-level forwarding before distributed Core interest routing.
 
-Static bootstrap is explicit, and ordinary startup refuses lost storage. A returning
-replica catches up from the complete retained log. Checkpoint caches are checksummed
-and never reclaim consensus history. Log-byte admission bounds retained history;
-compaction/snapshot transport, dynamic membership, safe voter replacement and
-standalone import remain future work. They are not implied by this baseline's
-functional failover tests. See [operations and limits](cluster-operations.md).
+Initial bootstrap is explicit, and ordinary startup refuses lost storage. A returning
+replica catches up through a verified complete snapshot when its log is behind the
+compacted prefix, followed by the retained tail. Snapshot metadata/model, live
+payloads, term/index, configuration and incarnation/tombstone state are installed
+atomically before acknowledging the transfer. Covered log entries and unreachable
+bodies are reclaimed in that same transaction; accepted suffixes remain intact.
+Automatic checkpointing considers committed position, log bytes and configuration
+changes. Transfer uses authenticated chunks and a full-image digest.
+
+Damaged voters are replaced under unused identities. `--cluster-join` creates a
+non-voting incarnation; quorum-authorized enrollment records its nonce. Promotion
+requires durable catch-up, then joint promotion/removal and an explicit leave-joint
+entry. A new leader resumes committed replacement state. An abandoned learner can
+be retired before enrolling another candidate. Retired or wrong-incarnation senders
+are fenced before voting; untrustworthy old state never bootstraps the replacement.
+Committed leader removal explicitly steps down the old leader. Application writer
+sessions also fence retiring workers across same-term configuration transitions,
+and activation commits a barrier before reconstructing the new model.
+
+General membership changes, sharding, standalone import, incremental snapshot I/O
+and stronger distributed corruption repair remain future work. Complete transfer
+images currently have a 512 MiB cap and materialize in memory; this has not certified
+large-store tail latency or peak memory. See [operations and limits](cluster-operations.md).
 
 Tests include real three/five-process failures, consumer ACK/dedup recovery, minority
 refusal and full restart, plus the actual Raft/storage implementation under reversed,
 duplicated and partitioned messages with conflicting accepted payloads. These are
 correctness evidence for the initial crash model, not performance certification.
+The recovery matrix additionally covers kills during snapshot transfer/activation,
+missing/blank/corrupt/stale stores, missing committed tails and snapshot bodies,
+incarnation loss, interrupted joint apply and loss of a replacement learner. These
+histories require a surviving healthy quorum; they do not claim recovery after all
+authoritative copies are destroyed.
 
 ## Implementation status: single-voter storage executor
 
