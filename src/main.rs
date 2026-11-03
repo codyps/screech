@@ -45,6 +45,13 @@ struct Args {
     /// Initialize a fresh voter for the first cluster bootstrap only.
     #[arg(long, requires = "cluster_config")]
     cluster_bootstrap: bool,
+    /// Enroll a fresh unused member identity as a non-voting learner.
+    #[arg(
+        long,
+        requires = "cluster_config",
+        conflicts_with = "cluster_bootstrap"
+    )]
+    cluster_join: bool,
 }
 fn main() -> std::io::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -71,6 +78,7 @@ async fn run() -> std::io::Result<()> {
             config,
             a.store.as_ref().expect("clap requires store"),
             a.cluster_bootstrap,
+            a.cluster_join,
             Config {
                 limits: Limits {
                     payload: a.max_payload,

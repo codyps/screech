@@ -2,6 +2,7 @@
 //! SQLite transaction domain. Indexes point into entries; payloads have no second
 //! durability path. Accepted suffixes are never exposed through the Store view.
 use super::{error, Batch, ClusterConfig};
+mod snapshots;
 use crate::storage::{Content, ContentKey, Record};
 use fs2::FileExt;
 use protobuf::Message;
@@ -10,6 +11,7 @@ use raft::{
     GetEntriesContext, RaftState, Storage, StorageError,
 };
 use rusqlite::{params, Connection, OptionalExtension};
+pub(crate) use snapshots::MAX_SNAPSHOT;
 use std::{
     fs::{File, OpenOptions},
     io::{self, Write},
@@ -24,18 +26,32 @@ fn sql(n: u64) -> io::Result<i64> {
 pub(crate) struct Database {
     pub conn: Connection,
     pub failed: bool,
+    pub gate: Arc<Mutex<()>>,
+    pub node_id: u64,
+    pub incarnation: [u8; 16],
+    pub genesis: ConfState,
+    pub max_log_bytes: u64,
+    pub snapshot_position: (u64, u64, u64),
     _lock: File,
 }
 #[derive(Clone)]
 pub(crate) struct LogStorage {
     pub db: Arc<Mutex<Database>>,
-    pub conf: ConfState,
 }
 impl Database {
+    #[cfg(test)]
     pub fn open(path: &Path, config: &ClusterConfig, bootstrap: bool) -> io::Result<Self> {
+        Self::open_mode(path, config, bootstrap, false)
+    }
+    pub fn open_mode(
+        path: &Path,
+        config: &ClusterConfig,
+        bootstrap: bool,
+        join: bool,
+    ) -> io::Result<Self> {
         let marker = path.with_extension("cluster-lock");
         let existed = path.exists();
-        if !existed && !bootstrap {
+        if !existed && !bootstrap && !join {
             return Err(error("fresh cluster storage requires explicit initial bootstrap; lost voters must not be recreated"));
         }
         let mut lock = OpenOptions::new()
@@ -66,7 +82,8 @@ impl Database {
         conn.execute_batch("CREATE TABLE IF NOT EXISTS cluster_meta(key TEXT PRIMARY KEY,value BLOB NOT NULL);
           CREATE TABLE IF NOT EXISTS entries(idx INTEGER PRIMARY KEY,term INTEGER NOT NULL,data BLOB NOT NULL,crc INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS event_index(seq INTEGER PRIMARY KEY,idx INTEGER NOT NULL,ordinal INTEGER NOT NULL);
-          CREATE TABLE IF NOT EXISTS body_index(generation INTEGER NOT NULL,seq INTEGER NOT NULL,idx INTEGER NOT NULL,ordinal INTEGER NOT NULL,PRIMARY KEY(generation,seq));").map_err(error)?;
+          CREATE TABLE IF NOT EXISTS body_index(generation INTEGER NOT NULL,seq INTEGER NOT NULL,idx INTEGER NOT NULL,ordinal INTEGER NOT NULL,PRIMARY KEY(generation,seq));
+          CREATE TABLE IF NOT EXISTS snapshot_bodies(generation INTEGER NOT NULL,seq INTEGER NOT NULL,data BLOB NOT NULL,digest BLOB NOT NULL,PRIMARY KEY(generation,seq));").map_err(error)?;
         let mut stable = config.clone();
         stable.max_log_bytes = 0;
         let identity = serde_json::to_vec(&stable).map_err(error)?;
@@ -78,8 +95,15 @@ impl Database {
                     |r| r.get(0),
                 )
                 .map_err(error)?;
-            if old != identity {
-                return Err(error("cluster/node identity or membership mismatch"));
+            let old: ClusterConfig = serde_json::from_slice(&old).map_err(error)?;
+            if old.node_id != config.node_id
+                || old.cluster_id != config.cluster_id
+                || old.secret != config.secret
+                || old.voters() != config.voters()
+            {
+                return Err(error(
+                    "cluster/node identity or genesis membership mismatch",
+                ));
             }
         } else {
             conn.execute("INSERT INTO cluster_meta VALUES('identity',?1)", [identity])
@@ -93,21 +117,74 @@ impl Database {
                 .unwrap_or_else(|| Path::new(".")),
         )?
         .sync_all()?;
+        let incarnation = if let Some(bytes) = conn
+            .query_row(
+                "SELECT value FROM cluster_meta WHERE key='incarnation'",
+                [],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(error)?
+        {
+            bytes.try_into().map_err(|_| error("invalid incarnation"))?
+        } else {
+            let mut n = [0; 16];
+            if join {
+                getrandom::fill(&mut n).map_err(error)?;
+            }
+            conn.execute(
+                "INSERT INTO cluster_meta VALUES('incarnation',?1)",
+                [n.as_slice()],
+            )
+            .map_err(error)?;
+            n
+        };
+        let genesis = ConfState::from((
+            config.voters(),
+            if join { vec![config.node_id] } else { vec![] },
+        ));
         let mut db = Self {
             conn,
             _lock: lock,
             failed: false,
+            snapshot_position: (0, 0, 0),
+            gate: Arc::new(Mutex::new(())),
+            node_id: config.node_id,
+            incarnation,
+            genesis: genesis.clone(),
+            max_log_bytes: config.max_log_bytes,
         };
+        if db.meta("conf")?.is_none() {
+            db.conn
+                .execute(
+                    "INSERT INTO cluster_meta VALUES('conf',?1)",
+                    [genesis.write_to_bytes().map_err(error)?],
+                )
+                .map_err(error)?;
+        }
+        db.restore_snapshot_position()?;
+        let base = db.snapshot_base()?.0;
+        if base > 0 {
+            let snap = db.snapshot()?;
+            let _ = snap;
+        }
         let hard = db.hard()?;
         let last = db.last()?;
         if hard.commit > last {
             return Err(error("committed Raft prefix is missing"));
         }
-        for idx in 1..=last {
+        for idx in base + 1..=last {
             let _ = db.entry(idx)?;
         }
+        db.recover_membership()?;
         // Rebuild indexes from the durable committed prefix, never the accepted tail.
         db.conn.execute_batch("DELETE FROM event_index;DELETE FROM body_index;DELETE FROM cluster_meta WHERE key='view';").map_err(error)?;
+        db.conn
+            .execute(
+                "INSERT OR REPLACE INTO cluster_meta VALUES('view',?1)",
+                [base.to_le_bytes().as_slice()],
+            )
+            .map_err(error)?;
         db.apply(hard.commit)?;
         Ok(db)
     }
@@ -132,12 +209,24 @@ impl Database {
             })
             .map_err(error)
             .and_then(|n| u64::try_from(n).map_err(error))
+            .and_then(|n| Ok(n.max(self.snapshot_base()?.0)))
     }
     pub fn end(&self) -> io::Result<u64> {
         self.conn
             .query_row("SELECT coalesce(max(seq),0) FROM event_index", [], |r| {
                 r.get::<_, i64>(0)
             })
+            .map_err(error)
+            .and_then(|n| u64::try_from(n).map_err(error))
+            .and_then(|n| Ok(n.max(self.snapshot_base()?.2)))
+    }
+    pub fn log_bytes(&self) -> io::Result<u64> {
+        self.conn
+            .query_row(
+                "SELECT coalesce(sum(length(data)),0) FROM entries",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
             .map_err(error)
             .and_then(|n| u64::try_from(n).map_err(error))
     }
@@ -230,7 +319,9 @@ impl Database {
         let mut decoded = Vec::new();
         for idx in base + 1..=commit {
             let entry = self.entry(idx)?;
-            let batch = if entry.data.is_empty() {
+            let batch = if entry.data.is_empty()
+                || entry.get_entry_type() != raft::eraftpb::EntryType::EntryNormal
+            {
                 None
             } else {
                 Some(Batch::decode(&entry.data)?)
@@ -307,6 +398,9 @@ impl Database {
             )
             .optional()
             .map_err(error)?;
+        if pos.is_none() {
+            return self.snapshot_content(key);
+        }
         pos.map(|(idx, n)| {
             let batch = Batch::decode(&self.entry(u64::try_from(idx).map_err(error)?)?.data)?;
             batch
@@ -324,9 +418,10 @@ fn raft_error(e: io::Error) -> raft::Error {
 }
 impl Storage for LogStorage {
     fn initial_state(&self) -> raft::Result<RaftState> {
+        let db = self.db.lock().unwrap();
         Ok(RaftState {
-            hard_state: self.db.lock().unwrap().hard().map_err(raft_error)?,
-            conf_state: self.conf.clone(),
+            hard_state: db.hard().map_err(raft_error)?,
+            conf_state: db.conf().map_err(raft_error)?,
         })
     }
     fn entries(
@@ -340,6 +435,9 @@ impl Storage for LogStorage {
         let limit = max_size.into().unwrap_or(u64::MAX);
         let mut bytes = 0;
         let mut entries = Vec::new();
+        if low <= db.snapshot_base().map_err(raft_error)?.0 {
+            return Err(raft::Error::Store(StorageError::Compacted));
+        }
         if high > db.last().map_err(raft_error)? + 1 {
             return Err(raft::Error::Store(StorageError::Unavailable));
         }
@@ -354,27 +452,39 @@ impl Storage for LogStorage {
         Ok(entries)
     }
     fn term(&self, idx: u64) -> raft::Result<u64> {
-        if idx == 0 {
-            Ok(0)
-        } else {
-            self.db
-                .lock()
-                .unwrap()
-                .entry(idx)
-                .map(|e| e.term)
-                .map_err(raft_error)
+        let db = self.db.lock().unwrap();
+        let (base, term, _) = db.snapshot_base().map_err(raft_error)?;
+        if idx < base {
+            return Err(raft::Error::Store(StorageError::Compacted));
         }
+        if idx == base {
+            return Ok(term);
+        }
+        db.entry(idx).map(|e| e.term).map_err(raft_error)
     }
     fn first_index(&self) -> raft::Result<u64> {
-        Ok(1)
+        Ok(self
+            .db
+            .lock()
+            .unwrap()
+            .snapshot_base()
+            .map_err(raft_error)?
+            .0
+            + 1)
     }
     fn last_index(&self) -> raft::Result<u64> {
         self.db.lock().unwrap().last().map_err(raft_error)
     }
-    fn snapshot(&self, _: u64, _: u64) -> raft::Result<Snapshot> {
-        Err(raft::Error::Store(
-            StorageError::SnapshotTemporarilyUnavailable,
-        ))
+    fn snapshot(&self, index: u64, _: u64) -> raft::Result<Snapshot> {
+        let db = self.db.lock().unwrap();
+        if db.snapshot_base().map_err(raft_error)?.0 < index
+            || db.snapshot_base().map_err(raft_error)?.0 == 0
+        {
+            return Err(raft::Error::Store(
+                StorageError::SnapshotTemporarilyUnavailable,
+            ));
+        }
+        db.snapshot().map_err(raft_error)
     }
 }
 
@@ -392,6 +502,7 @@ mod tests {
             node_id: 1,
             secret: "x".repeat(32),
             max_log_bytes: 128 * 1024 * 1024,
+            initial_voters: Vec::new(),
             peers: (1..=3)
                 .map(|id| {
                     (

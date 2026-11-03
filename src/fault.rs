@@ -4,6 +4,9 @@ pub fn point(name: &str) {
     if std::env::var("SCREECH_FAULT_POINT").as_deref() != Ok(name) {
         return;
     }
+    if std::env::var_os("SCREECH_FAULT_ARM").is_some_and(|p| !std::path::Path::new(&p).exists()) {
+        return;
+    }
     if let Ok(after) = std::env::var("SCREECH_FAULT_AFTER") {
         static HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let after: usize = after.parse().expect("positive fault occurrence");

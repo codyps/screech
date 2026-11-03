@@ -1,6 +1,8 @@
-//! Fixed-membership Raft cluster. Clients at every node reach the elected
+//! Raft cluster with snapshot catch-up and learner-based voter replacement.
+//! Clients at every node reach the elected
 //! leader's NATS service. Connections end on a view change and clients reconnect.
 //! All durable operations and current reads cross the same consensus boundary.
+mod membership;
 mod storage;
 use crate::{
     server::{Config as ServerConfig, Server},
@@ -9,12 +11,9 @@ use crate::{
 use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use protobuf::Message as ProtoMessage;
-use raft::{
-    eraftpb::{ConfState, Message},
-    RawNode, StateRole,
-};
+use raft::{eraftpb::Message, RawNode, StateRole};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     io,
@@ -50,18 +49,38 @@ pub struct ClusterConfig {
     pub peers: BTreeMap<u64, Peer>,
     #[serde(default = "log_budget")]
     pub max_log_bytes: u64,
+    #[serde(default)]
+    pub initial_voters: Vec<u64>,
 }
 fn log_budget() -> u64 {
     512 * 1024 * 1024
 }
 impl ClusterConfig {
+    pub fn voters(&self) -> Vec<u64> {
+        if self.initial_voters.is_empty() {
+            self.peers.keys().copied().collect()
+        } else {
+            self.initial_voters.clone()
+        }
+    }
     pub fn validate(&self) -> io::Result<()> {
+        if self.max_log_bytes < 2 * MAX_FRAME as u64 {
+            return Err(error(
+                "cluster log budget must be at least 80 MiB for checkpoint headroom",
+            ));
+        }
         if self.cluster_id.is_empty()
             || self.secret.len() < 32
             || !self.peers.contains_key(&self.node_id)
             || self.peers.keys().any(|id| *id == 0)
-            || !matches!(self.peers.len(), 3 | 5)
-            || self.max_log_bytes < MAX_FRAME as u64
+            || (!matches!(self.voters().len(), 3 | 5)
+                || self.voters().iter().any(|id| !self.peers.contains_key(id))
+                || self
+                    .voters()
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    != self.voters().len())
         {
             return Err(error("cluster requires an identity, secret of at least 32 bytes, and three or five distinct nonzero voter IDs"));
         }
@@ -95,10 +114,11 @@ impl Batch {
 struct Role {
     leader: u64,
     term: u64,
+    configuration: u64,
 }
 type Reply = mpsc::SyncSender<io::Result<u64>>;
 enum Input {
-    Message(Message),
+    Message(Message, [u8; 16], tokio::sync::OwnedSemaphorePermit),
     Propose {
         term: u64,
         data: Vec<u8>,
@@ -106,6 +126,12 @@ enum Input {
     },
     Stop,
     Fault,
+    Replace {
+        term: u64,
+        replacement: membership::Replacement,
+        reply: Reply,
+    },
+    SnapshotSent(u64, bool),
 }
 #[derive(Clone)]
 struct Client {
@@ -115,6 +141,7 @@ struct Client {
     id: u64,
     term: u64,
     replicas: usize,
+    configuration: u64,
 }
 impl Client {
     fn propose(&self, data: Vec<u8>) -> io::Result<u64> {
@@ -148,6 +175,7 @@ impl Client {
             != (Role {
                 leader: self.id,
                 term: self.term,
+                configuration: self.configuration,
             })
         {
             Err(error("leadership changed"))
@@ -160,6 +188,37 @@ struct ClusterStore {
     client: Client,
 }
 impl Store for ClusterStore {
+    fn replace_voter(&self, old: u64, new: u64, nonce: [u8; 16]) -> Result<(), StoreError> {
+        self.client.current()?;
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.client
+            .tx
+            .try_send(Input::Replace {
+                term: self.client.term,
+                replacement: membership::Replacement { old, new, nonce },
+                reply,
+            })
+            .map_err(|e| StoreError::Io(error(e)))?;
+        rx.recv_timeout(RPC_TIMEOUT)
+            .map_err(|e| StoreError::Io(error(e)))?
+            .map(|_| ())
+            .map_err(StoreError::from)
+    }
+    fn cluster_status(&self) -> Result<serde_json::Value, StoreError> {
+        self.client.read(|db|{
+            let conf=db.conf()?;let membership=db.membership()?;
+            Ok(serde_json::json!({"voters":conf.voters,"outgoing":conf.voters_outgoing,"learners":conf.learners,"retired":membership.retired,"replacement":membership.replacing,"configuration_index":db.conf_index()?,"snapshot_index":db.snapshot_base()?.0,"commit_index":db.hard()?.commit,"event_sequence":db.end()?}))
+        }).map_err(StoreError::from)
+    }
+    fn checkpoint_needed(&self) -> Result<bool, StoreError> {
+        self.client
+            .read(|db| {
+                Ok(db.log_bytes()? > db.max_log_bytes / 2
+                    || db.view()?.saturating_sub(db.snapshot_base()?.0) >= 256
+                    || db.conf_index()? > db.snapshot_base()?.0)
+            })
+            .map_err(StoreError::from)
+    }
     fn replicas(&self) -> usize {
         self.client.replicas
     }
@@ -172,9 +231,8 @@ impl Store for ClusterStore {
     fn external_content(&self) -> bool {
         true
     }
-    // Full history is retained for bounded catch-up in this first implementation.
-    // The admission budget stops writes before unbounded log growth. Application
-    // checkpoints are optional caches; they never truncate consensus authority.
+    // A complete durable snapshot replaces the covered committed prefix. The
+    // accepted suffix remains authoritative until consensus commits or replaces it.
     fn read_barrier(&self) -> Result<(), StoreError> {
         self.client
             .propose(Vec::new())
@@ -228,37 +286,10 @@ impl Store for ClusterStore {
     fn checkpoint_job(&mut self, seq: u64, job: CheckpointJob) -> Result<(), StoreError> {
         self.client.current()?;
         let image = job()?;
+        let gate = self.client.db.lock().unwrap().gate.clone();
+        let _gate = gate.lock().unwrap();
         self.client
-            .read(move |db| {
-                if db.end()? != seq {
-                    return Err(error("checkpoint position mismatch"));
-                }
-                for key in image.live {
-                    if db.content(key)?.is_none() {
-                        return Err(error("checkpoint content missing"));
-                    }
-                }
-                let mut checksum = crc32fast::Hasher::new();
-                checksum.update(&seq.to_le_bytes());
-                checksum.update(&image.data);
-                let tx = db.conn.transaction().map_err(error)?;
-                tx.execute(
-                    "INSERT OR REPLACE INTO cluster_meta VALUES('app_crc',?1)",
-                    [checksum.finalize().to_le_bytes().as_slice()],
-                )
-                .map_err(error)?;
-                tx.execute(
-                    "INSERT OR REPLACE INTO cluster_meta VALUES('app_snapshot',?1)",
-                    [image.data],
-                )
-                .map_err(error)?;
-                tx.execute(
-                    "INSERT OR REPLACE INTO cluster_meta VALUES('app_sequence',?1)",
-                    [seq.to_le_bytes().as_slice()],
-                )
-                .map_err(error)?;
-                tx.commit().map_err(error)
-            })
+            .read(move |db| db.compact(seq, image))
             .map_err(StoreError::from)
     }
     fn load_checkpoint(&self) -> Result<Option<(u64, Bytes)>, StoreError> {
@@ -297,18 +328,23 @@ fn pump(
     out: &BTreeMap<u64, tokio::sync::mpsc::Sender<Message>>,
 ) -> io::Result<()> {
     while node.has_ready() {
+        let gate = node.store().db.lock().unwrap().gate.clone();
+        let _gate = gate.lock().unwrap();
         let mut ready = node.ready();
-        if !ready.snapshot().is_empty() {
-            return Err(error("unexpected snapshot without compaction"));
-        }
         {
             let mut db = node.store().db.lock().unwrap();
-            db.persist(ready.entries(), ready.hs())?;
+            if ready.snapshot().is_empty() {
+                db.persist(ready.entries(), ready.hs())?;
+            } else {
+                db.install_snapshot(ready.snapshot(), ready.hs(), ready.entries(), false)?;
+            }
         }
         let mut messages = ready.take_messages();
         messages.extend(ready.take_persisted_messages());
         // Applying the durable hard-state prefix builds the application indexes.
         // Raft's committed entry lists may be split across Ready and LightReady.
+        let commit = node.store().db.lock().unwrap().hard()?.commit;
+        membership::apply_configuration(node, commit)?;
         let replies = {
             let mut db = node.store().db.lock().unwrap();
             let commit = db.hard()?.commit;
@@ -321,10 +357,11 @@ fn pump(
         }
         let mut light = node.advance(ready);
         if let Some(commit) = light.commit_index() {
-            let mut db = node.store().db.lock().unwrap();
-            let mut hard = db.hard()?;
+            let mut hard = node.store().db.lock().unwrap().hard()?;
             hard.commit = commit;
-            db.persist(&[], Some(&hard))?;
+            node.store().db.lock().unwrap().persist(&[], Some(&hard))?;
+            membership::apply_configuration(node, commit)?;
+            let mut db = node.store().db.lock().unwrap();
             for (key, end) in db.apply(commit)? {
                 if let Some((_, reply)) = pending.remove(&key) {
                     let _ = reply.send(Ok(end));
@@ -348,6 +385,7 @@ struct Envelope {
     from: u64,
     body: Vec<u8>,
     mac: Vec<u8>,
+    incarnation: [u8; 16],
 }
 fn authenticate(secret: &str, cluster: &str, from: u64, body: &[u8]) -> Hmac<Sha256> {
     let mut mac =
@@ -358,11 +396,131 @@ fn authenticate(secret: &str, cluster: &str, from: u64, body: &[u8]) -> Hmac<Sha
     mac.update(body);
     mac
 }
+#[derive(Serialize, Deserialize)]
+struct Chunk {
+    nonce: [u8; 16],
+    offset: u64,
+    total: u64,
+    hash: [u8; 32],
+    data: Vec<u8>,
+    snapshot: bool,
+}
+async fn send_message(
+    config: &ClusterConfig,
+    address: SocketAddr,
+    message: &Message,
+    incarnation: [u8; 16],
+) -> io::Result<()> {
+    let body = message.write_to_bytes().map_err(error)?;
+    if body.len() > storage::MAX_SNAPSHOT + MAX_FRAME {
+        return Err(error("message exceeds transfer budget"));
+    }
+    let hash: [u8; 32] = Sha256::digest(&body).into();
+    let mut nonce = [0; 16];
+    getrandom::fill(&mut nonce).map_err(error)?;
+    let mut stream = TcpStream::connect(address).await?;
+    for (n, data) in body.chunks(1024 * 1024).enumerate() {
+        let chunk = Chunk {
+            nonce,
+            offset: (n * 1024 * 1024) as u64,
+            total: body.len() as u64,
+            hash,
+            data: data.to_vec(),
+            snapshot: message.get_msg_type() == raft::eraftpb::MessageType::MsgSnapshot,
+        };
+        let body = postcard::to_allocvec(&chunk).map_err(error)?;
+        let mut auth = authenticate(&config.secret, &config.cluster_id, config.node_id, &body);
+        auth.update(&incarnation);
+        let mac = auth.finalize().into_bytes().to_vec();
+        let envelope = postcard::to_allocvec(&Envelope {
+            cluster: config.cluster_id.clone(),
+            from: config.node_id,
+            body,
+            mac,
+            incarnation,
+        })
+        .map_err(error)?;
+        stream.write_u32(envelope.len() as u32).await?;
+        stream.write_all(&envelope).await?;
+    }
+    Ok(())
+}
+async fn receive_message(
+    config: &ClusterConfig,
+    stream: &mut TcpStream,
+    bytes: Arc<Semaphore>,
+) -> io::Result<(Message, [u8; 16], tokio::sync::OwnedSemaphorePermit)> {
+    let mut data = Vec::new();
+    let mut identity = None;
+    let mut permit = None;
+    loop {
+        let size = stream.read_u32().await? as usize;
+        if size > 2 * 1024 * 1024 {
+            return Err(error("invalid transfer chunk size"));
+        }
+        let mut frame = vec![0; size];
+        stream.read_exact(&mut frame).await?;
+        let envelope: Envelope = postcard::from_bytes(&frame).map_err(error)?;
+        if envelope.cluster != config.cluster_id || !config.peers.contains_key(&envelope.from) {
+            return Err(error("unknown peer"));
+        }
+        let mut auth = authenticate(
+            &config.secret,
+            &envelope.cluster,
+            envelope.from,
+            &envelope.body,
+        );
+        auth.update(&envelope.incarnation);
+        auth.verify_slice(&envelope.mac).map_err(error)?;
+        let chunk: Chunk = postcard::from_bytes(&envelope.body).map_err(error)?;
+        if chunk.total > (storage::MAX_SNAPSHOT + MAX_FRAME) as u64
+            || chunk.total == 0
+            || chunk.data.is_empty()
+            || chunk.offset != data.len() as u64
+            || chunk.offset + chunk.data.len() as u64 > chunk.total
+        {
+            return Err(error("invalid transfer bounds"));
+        }
+        let expected = (envelope.from, chunk.nonce, chunk.total, chunk.hash);
+        if identity.is_none() {
+            permit = Some(
+                bytes
+                    .clone()
+                    .try_acquire_many_owned(chunk.total as u32)
+                    .map_err(error)?,
+            );
+            identity = Some(expected);
+        }
+        if identity != Some(expected) {
+            return Err(error("transfer identity changed"));
+        }
+        data.extend_from_slice(&chunk.data);
+        if chunk.snapshot {
+            crate::fault::point("after_cluster_snapshot_chunk");
+        }
+        if data.len() as u64 == chunk.total {
+            let actual: [u8; 32] = Sha256::digest(&data).into();
+            if actual != chunk.hash {
+                return Err(error("transfer digest mismatch"));
+            }
+            let message = Message::parse_from_bytes(&data).map_err(error)?;
+            if message.from != envelope.from || message.to != config.node_id {
+                return Err(error("peer identity mismatch"));
+            }
+            return Ok((
+                message,
+                envelope.incarnation,
+                permit.expect("nonempty authenticated transfer"),
+            ));
+        }
+    }
+}
 async fn network(
     config: &ClusterConfig,
     tx: mpsc::SyncSender<Input>,
     listener: TcpListener,
     mut stop: watch::Receiver<bool>,
+    incarnation: [u8; 16],
 ) -> BTreeMap<u64, tokio::sync::mpsc::Sender<Message>> {
     let mut out = BTreeMap::new();
     for (&id, peer) in &config.peers {
@@ -372,18 +530,15 @@ async fn network(
             let config = config.clone();
             let address = peer.raft;
             let mut stop = stop.clone();
+            let tx = tx.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
                         _=stop.changed()=>break,
                         message=receive.recv()=>{let Some(message)=message else{break};
-                            let body=match message.write_to_bytes(){Ok(b)=>b,Err(_)=>continue};
-                            let mac=authenticate(&config.secret,&config.cluster_id,config.node_id,&body).finalize().into_bytes().to_vec();
-                            let data=match postcard::to_allocvec(&Envelope{cluster:config.cluster_id.clone(),from:config.node_id,body,mac}){Ok(d)=>d,Err(_)=>continue};
-                            if data.len()>MAX_FRAME {continue;}
-                            let _=tokio::time::timeout(Duration::from_secs(1),async{
-                                let mut stream=TcpStream::connect(address).await?;stream.write_u32(data.len() as u32).await?;stream.write_all(&data).await
-                            }).await;
+                            let snapshot=message.get_msg_type()==raft::eraftpb::MessageType::MsgSnapshot;
+                            let result=tokio::time::timeout(Duration::from_secs(30),send_message(&config,address,&message,incarnation)).await;
+                            if snapshot {let _=tx.try_send(Input::SnapshotSent(id,matches!(result,Ok(Ok(())))));}
                         }
                     }
                 }
@@ -393,27 +548,15 @@ async fn network(
     let config = config.clone();
     tokio::spawn(async move {
         let slots = Arc::new(Semaphore::new(16));
-        let bytes = Arc::new(Semaphore::new(2 * MAX_FRAME));
+        let bytes = Arc::new(Semaphore::new(2 * (storage::MAX_SNAPSHOT + MAX_FRAME)));
         loop {
             tokio::select! {
                 _=stop.changed()=>break,
                 accepted=listener.accept()=>{
                     let Ok((mut stream,_))=accepted else{break};let Ok(slot)=slots.clone().try_acquire_owned() else{continue};
                     let config=config.clone();let tx=tx.clone();let bytes=bytes.clone();
-                    tokio::spawn(async move {
-                        let _slot=slot;
-                        let _=tokio::time::timeout(Duration::from_secs(2),async {
-                            let size=stream.read_u32().await? as usize;
-                            if size>MAX_FRAME{return Err(error("peer frame too large"));}
-                            let _bytes=bytes.try_acquire_many_owned(size as u32).map_err(error)?;
-                            let mut data=vec![0;size];stream.read_exact(&mut data).await?;
-                            let envelope:Envelope=postcard::from_bytes(&data).map_err(error)?;
-                            if envelope.cluster!=config.cluster_id || !config.peers.contains_key(&envelope.from){return Err(error("unknown peer"));}
-                            authenticate(&config.secret,&envelope.cluster,envelope.from,&envelope.body).verify_slice(&envelope.mac).map_err(error)?;
-                            let message=Message::parse_from_bytes(&envelope.body).map_err(error)?;
-                            if message.from!=envelope.from || message.to!=config.node_id {return Err(error("peer identity mismatch"));}
-                            tx.try_send(Input::Message(message)).map_err(error)?;Ok::<_,io::Error>(())
-                        }).await;
+                    tokio::spawn(async move{let _slot=slot;
+                        if let Ok(Ok((message,nonce,permit)))=tokio::time::timeout(Duration::from_secs(30),receive_message(&config,&mut stream,bytes)).await {let _=tx.try_send(Input::Message(message,nonce,permit));}
                     });
                 }
             }
@@ -422,29 +565,44 @@ async fn network(
     out
 }
 
-/// Run a fixed-membership cluster node until shutdown. Store paths and node
-/// identities are immutable. Rejoining replicas catch up from the retained log.
+/// Run a cluster node until shutdown. Store paths and node incarnations are
+/// immutable; damaged members are replaced through enrolled learner identities.
 pub async fn run(
     config: ClusterConfig,
     path: &Path,
     bootstrap: bool,
+    join: bool,
     mut server_config: ServerConfig,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
     config.validate()?;
+    if join && config.voters().contains(&config.node_id) {
+        return Err(error(
+            "a replacement must use a new node ID outside the original voters",
+        ));
+    }
     let peer = &config.peers[&config.node_id];
     let listener = TcpListener::bind(peer.raft).await?;
     let clients = TcpListener::bind(peer.client).await?;
-    let db = Arc::new(Mutex::new(Database::open(path, &config, bootstrap)?));
+    let db = Arc::new(Mutex::new(Database::open_mode(
+        path, &config, bootstrap, join,
+    )?));
     let (tx, rx) = mpsc::sync_channel(256);
     let (role_tx, role) = watch::channel(Role::default());
     let (stop, stop_rx) = watch::channel(false);
-    let out = network(&config, tx.clone(), listener, stop_rx.clone()).await;
-    let voters: Vec<_> = config.peers.keys().copied().collect();
-    let log = LogStorage {
-        db: db.clone(),
-        conf: ConfState::from((voters, Vec::<u64>::new())),
-    };
+    let incarnation = db.lock().unwrap().incarnation;
+    if join {
+        println!(
+            "JOIN {} {}",
+            config.node_id,
+            incarnation
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+    }
+    let out = network(&config, tx.clone(), listener, stop_rx.clone(), incarnation).await;
+    let log = LogStorage { db: db.clone() };
     let raft_config = raft::Config {
         id: config.node_id,
         election_tick: 15,
@@ -468,11 +626,41 @@ pub async fn run(
             let mut serial = 0u64;
             let mut tick = Instant::now();
             loop {
+                let mut incoming_lease = None;
                 match rx.recv_timeout(Duration::from_millis(20)) {
                     Ok(Input::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Ok(Input::SnapshotSent(id, ok)) => node.report_snapshot(
+                        id,
+                        if ok {
+                            raft::SnapshotStatus::Finish
+                        } else {
+                            raft::SnapshotStatus::Failure
+                        },
+                    ),
                     Ok(Input::Fault) => return Err(error("replica storage failed; quarantined")),
-                    Ok(Input::Message(message)) => {
-                        let _ = node.step(message);
+                    Ok(Input::Message(message, nonce, permit)) => {
+                        incoming_lease = Some(permit);
+                        let db = node.store().db.lock().unwrap();
+                        let allowed = db.accepts_sender(&message, nonce)?;
+                        drop(db);
+                        if allowed {
+                            let _ = node.step(message);
+                        }
+                    }
+                    Ok(Input::Replace {
+                        term,
+                        replacement,
+                        reply,
+                    }) => {
+                        if term != node.raft.term
+                            || !actor_config.peers.contains_key(&replacement.new)
+                        {
+                            let _ = reply
+                                .send(Err(error("invalid replacement target or leader epoch")));
+                        } else {
+                            let result = membership::start_replacement(&mut node, replacement);
+                            let _ = reply.send(result.map(|_| 0));
+                        }
                     }
                     Ok(Input::Propose { term, data, reply }) => {
                         if node.raft.state != StateRole::Leader || node.raft.term != term {
@@ -517,9 +705,13 @@ pub async fn run(
                     tick = Instant::now();
                 }
                 pump(&mut node, &mut pending, &out)?;
+                drop(incoming_lease);
+                membership::advance_replacement(&mut node)?;
+                let configuration = node.store().db.lock().unwrap().conf_index()?;
                 let role = Role {
                     leader: node.raft.leader_id,
                     term: node.raft.term,
+                    configuration,
                 };
                 role_tx.send_if_modified(|old| {
                     if *old != role {
@@ -560,12 +752,12 @@ pub async fn run(
         let mut running: Option<(
             watch::Sender<bool>,
             tokio::task::JoinHandle<io::Result<()>>,
-            u64,
+            Role,
         )> = None;
         loop {
             let current = *service_role.borrow_and_update();
             if running.as_ref().is_some_and(|(_, _, term)| {
-                current.leader != service_config.node_id || current.term != *term
+                current.leader != service_config.node_id || current != *term
             }) {
                 let (stop, task, _) = running.take().unwrap();
                 stop.send_replace(true);
@@ -578,7 +770,8 @@ pub async fn run(
                     db: service_db.clone(),
                     id: service_config.node_id,
                     term: current.term,
-                    replicas: service_config.peers.len(),
+                    replicas: service_config.voters().len(),
+                    configuration: current.configuration,
                 };
                 // Establish a current-term committed observation before recovery.
                 let prepared = tokio::task::spawn_blocking(move || {
@@ -590,11 +783,21 @@ pub async fn run(
                 match prepared {
                     Ok(Ok(handle)) => {
                         let mut local = server_config.clone();
+                        if let Ok(conf) = service_db.lock().unwrap().conf() {
+                            local.connect_urls = service_config
+                                .peers
+                                .iter()
+                                .filter(|(id, _)| {
+                                    conf.voters.contains(id) || conf.voters_outgoing.contains(id)
+                                })
+                                .map(|(_, p)| p.client.to_string())
+                                .collect();
+                        }
                         local.jetstream = Some(handle.clone());
                         match Server::bind(local).await {
                             Ok(server) => {
                                 let (stop, rx) = watch::channel(false);
-                                running = Some((stop, tokio::spawn(server.run(rx)), current.term));
+                                running = Some((stop, tokio::spawn(server.run(rx)), current));
                             }
                             Err(e) => {
                                 handle.shutdown().await;
@@ -672,6 +875,7 @@ mod tests {
             node_id: id,
             secret: "s".repeat(32),
             max_log_bytes: log_budget(),
+            initial_voters: Vec::new(),
             peers: (1..=3)
                 .map(|n| {
                     (
@@ -704,10 +908,7 @@ mod tests {
                     Database::open(&root.join(id.to_string()), &config(id), true).unwrap(),
                 ));
                 let applied = db.lock().unwrap().hard().unwrap().commit;
-                let log = LogStorage {
-                    db,
-                    conf: ConfState::from((vec![1, 2, 3], vec![])),
-                };
+                let log = LogStorage { db };
                 let c = raft::Config {
                     id,
                     election_tick: 10,
@@ -866,7 +1067,11 @@ mod checkpoint_tests {
         let db = Arc::new(Mutex::new(
             Database::open(&dir.path().join("db"), &config, true).unwrap(),
         ));
-        let (_role, rx) = watch::channel(Role { leader: 1, term: 1 });
+        let (_role, rx) = watch::channel(Role {
+            leader: 1,
+            term: 1,
+            configuration: 0,
+        });
         let (tx, _requests) = mpsc::sync_channel(1);
         let mut store = ClusterStore {
             client: Client {
@@ -876,21 +1081,52 @@ mod checkpoint_tests {
                 id: 1,
                 term: 1,
                 replicas: 3,
+                configuration: 0,
             },
         };
+        let mut source =
+            crate::durable::Engine::recover(crate::storage::MemoryStore::default()).unwrap();
+        source.checkpoint().unwrap();
+        let data = source
+            .into_store()
+            .load_checkpoint()
+            .unwrap()
+            .unwrap()
+            .1
+            .to_vec();
+        let expected = data.clone();
+        {
+            let mut db = db.lock().unwrap();
+            let entry = raft::eraftpb::Entry {
+                index: 1,
+                term: 1,
+                ..Default::default()
+            };
+            let hard = raft::eraftpb::HardState {
+                term: 1,
+                vote: 1,
+                commit: 1,
+                ..Default::default()
+            };
+            db.persist(&[entry], Some(&hard)).unwrap();
+            db.apply(1).unwrap();
+        }
         store
             .checkpoint_job(
                 0,
-                Box::new(|| {
+                Box::new(move || {
                     Ok(crate::storage::CheckpointImage {
-                        data: b"snapshot".to_vec(),
+                        data,
                         live: Vec::new(),
                         imports: Vec::new(),
                     })
                 }),
             )
             .unwrap();
-        assert_eq!(store.load_checkpoint().unwrap().unwrap().1, "snapshot");
+        assert_eq!(
+            store.load_checkpoint().unwrap().unwrap().1.as_ref(),
+            expected.as_slice()
+        );
         db.lock()
             .unwrap()
             .conn

@@ -1759,6 +1759,17 @@ impl<S: Store> Engine<S> {
     pub(crate) fn replicas(&self) -> usize {
         self.store.as_ref().map_or(1, Store::replicas)
     }
+    pub(crate) fn checkpoint_needed(&self) -> Result<bool, Error> {
+        Ok(self.storage()?.checkpoint_needed()?)
+    }
+    pub(crate) fn cluster_status(&self) -> Result<serde_json::Value, Error> {
+        self.ensure_ready()?;
+        Ok(self.storage()?.cluster_status()?)
+    }
+    pub(crate) fn replace_voter(&self, old: u64, new: u64, nonce: [u8; 16]) -> Result<(), Error> {
+        self.ensure_ready()?;
+        Ok(self.storage()?.replace_voter(old, new, nonce)?)
+    }
     pub(crate) fn can_release_output(&self) -> bool {
         !self.poisoned.get()
             && self.pending.is_none()
@@ -2524,4 +2535,35 @@ fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot, Error> {
         }
         _ => Err(invalid("Invalid snapshot version")),
     }
+}
+
+pub(crate) fn validate_cluster_snapshot(bytes: &[u8], contents: &[Content]) -> Result<(), Error> {
+    let snapshot = decode_snapshot(bytes)?;
+    snapshot.state.check_invariants()?;
+    let mut by_key = std::collections::BTreeMap::new();
+    for c in contents {
+        if by_key.insert(c.key, c).is_some() {
+            return Err(invalid("Duplicate snapshot content"));
+        }
+    }
+    for message in snapshot
+        .state
+        .streams
+        .values()
+        .flat_map(|s| s.messages.values())
+    {
+        let key = message
+            .content
+            .as_ref()
+            .ok_or(invalid("Inline content in cluster snapshot"))?
+            .key;
+        let content = by_key
+            .remove(&key)
+            .ok_or(invalid("Incomplete snapshot content"))?;
+        hydrate_content(message, content.clone())?;
+    }
+    if !by_key.is_empty() {
+        return Err(invalid("Unreferenced snapshot content"));
+    }
+    Ok(())
 }

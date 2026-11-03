@@ -1019,6 +1019,32 @@ impl<S: Store> Worker<S> {
     fn api(&mut self, parts: &[&str], body: &Value) -> Result<Value, String> {
         let time = self.time();
         match parts {
+            ["SCREECH", "CLUSTER", "STATUS"] => {
+                self.engine.cluster_status().map_err(|e| e.to_string())
+            }
+            ["SCREECH", "CLUSTER", "REPLACE"] => {
+                let old = body["old"].as_u64().ok_or("old voter required")?;
+                let new = body["new"].as_u64().ok_or("new voter required")?;
+                let hex = body["nonce"]
+                    .as_str()
+                    .ok_or("new member incarnation nonce required")?;
+                if hex.len() != 32 || !hex.is_ascii() {
+                    return Err("invalid incarnation nonce".into());
+                }
+                let mut nonce = [0; 16];
+                for (i, b) in nonce.iter_mut().enumerate() {
+                    *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+                        .map_err(|_| "invalid incarnation nonce")?;
+                }
+                self.engine
+                    .replace_voter(old, new, nonce)
+                    .map_err(|e| e.to_string())?;
+                Ok(json!({"accepted":true,"note":"poll cluster status for committed replacement"}))
+            }
+            ["SCREECH", "CLUSTER", "COMPACT"] if self.engine.replicas() > 1 => {
+                self.engine.checkpoint().map_err(|e| e.to_string())?;
+                Ok(json!({"success":true}))
+            }
             #[cfg(feature = "fault-injection")]
             ["SCREECH", "GROUPS"] => Ok(json!({"committed_groups":self.engine.committed_groups()})),
             #[cfg(feature = "fault-injection")]
@@ -1733,6 +1759,9 @@ impl<S: Store> Worker<S> {
     fn maintain(&mut self) -> Result<bool, String> {
         if self.engine.is_poisoned() {
             return Ok(false);
+        }
+        if self.plan.is_none() && self.engine.checkpoint_needed().map_err(|e| e.to_string())? {
+            self.engine.checkpoint().map_err(|e| e.to_string())?;
         }
         if self.plan.is_none()
             && (!self.pulls.is_empty()

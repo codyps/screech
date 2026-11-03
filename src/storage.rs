@@ -74,6 +74,15 @@ fn content_checksum(content: &Content) -> u32 {
 }
 /// An atomic durable append log. Metadata and records share one transaction domain.
 pub trait Store: Send {
+    fn cluster_status(&self) -> Result<serde_json::Value, StoreError> {
+        Err(StoreError::Invalid)
+    }
+    fn replace_voter(&self, _old: u64, _new: u64, _nonce: [u8; 16]) -> Result<(), StoreError> {
+        Err(StoreError::Invalid)
+    }
+    fn checkpoint_needed(&self) -> Result<bool, StoreError> {
+        Ok(false)
+    }
     fn replicas(&self) -> usize {
         1
     }

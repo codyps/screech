@@ -5,22 +5,26 @@ from pathlib import Path
 from wire import Client
 
 class Cluster:
-    def __init__(self,binary,root,count=3):
+    def __init__(self,binary,root,count=3,spares=0):
         self.binary=binary;self.root=root;self.processes={};self.logs={};self.initialized=set()
         held=[]
-        for _ in range(3*count):
+        for _ in range(3*(count+spares)):
             s=socket.socket();s.bind(('127.0.0.1',0));held.append(s)
         ports=[s.getsockname()[1] for s in held]
-        self.peers={str(i+1):dict(raft=f'127.0.0.1:{ports[3*i]}',client=f'127.0.0.1:{ports[3*i+1]}',service=f'127.0.0.1:{ports[3*i+2]}') for i in range(count)}
-        for i in range(1,count+1):
+        self.peers={str(i+1):dict(raft=f'127.0.0.1:{ports[3*i]}',client=f'127.0.0.1:{ports[3*i+1]}',service=f'127.0.0.1:{ports[3*i+2]}') for i in range(count+spares)}
+        for i in range(1,count+spares+1):
             node=root/str(i);node.mkdir()
-            (node/'config.json').write_text(json.dumps(dict(cluster_id='process-test',node_id=i,secret='test-secret-'+'x'*32,peers=self.peers)))
+            (node/'config.json').write_text(json.dumps(dict(cluster_id='process-test',node_id=i,secret='test-secret-'+'x'*32,peers=self.peers,initial_voters=list(range(1,count+1)))))
         for s in held:s.close()
-    def start(self,i):
+    def start(self,i,join=False,extra_env=None):
         node=self.root/str(i);log=open(node/'server.log','ab');self.logs[i]=log
         args=[self.binary,'--store',str(node/'db'),'--cluster-config',str(node/'config.json')]
-        if i not in self.initialized:args.append('--cluster-bootstrap');self.initialized.add(i)
-        self.processes[i]=subprocess.Popen(args,stdout=log,stderr=log)
+        if join:args.append('--cluster-join');self.initialized.add(i)
+        elif i not in self.initialized:args.append('--cluster-bootstrap');self.initialized.add(i)
+        import os
+        env=os.environ.copy()
+        if extra_env:env.update(extra_env)
+        self.processes[i]=subprocess.Popen(args,stdout=log,stderr=log,env=env)
     def kill(self,i):
         p=self.processes.pop(i,None)
         if p is not None:
@@ -48,7 +52,10 @@ class Cluster:
             values=[]
             for i in self.processes:
                 with sqlite3.connect(self.root/str(i)/'db') as db:
-                    values.append(db.execute('select seq,idx,ordinal from event_index order by seq').fetchall())
+                    end=db.execute('select coalesce(max(seq),0) from event_index').fetchone()[0]
+                    floor=db.execute("select value from cluster_meta where key='app_sequence'").fetchone()
+                    view=db.execute("select value from cluster_meta where key='view'").fetchone()
+                    values.append((max(end,int.from_bytes(floor[0],'little') if floor else 0),int.from_bytes(view[0],'little') if view else 0))
             if values and all(v==values[0] for v in values):return
             time.sleep(.05)
         raise AssertionError('committed replicas did not converge')

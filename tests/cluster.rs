@@ -51,6 +51,7 @@ async fn official_client_discovers_peers_and_reconnects_after_leader_process_los
             secret: "x".repeat(32),
             peers: peers.clone(),
             max_log_bytes: 128 * 1024 * 1024,
+            initial_voters: Vec::new(),
         };
         let file = node.join("config.json");
         std::fs::write(&file, serde_json::to_vec(&config).unwrap()).unwrap();

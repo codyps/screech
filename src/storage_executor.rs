@@ -71,6 +71,15 @@ fn stopped() -> StoreError {
     .into()
 }
 impl Store for ExecutorStore {
+    fn cluster_status(&self) -> Result<serde_json::Value, StoreError> {
+        self.call(|s| s.cluster_status())
+    }
+    fn replace_voter(&self, old: u64, new: u64, nonce: [u8; 16]) -> Result<(), StoreError> {
+        self.call(move |s| s.replace_voter(old, new, nonce))
+    }
+    fn checkpoint_needed(&self) -> Result<bool, StoreError> {
+        self.call(|s| s.checkpoint_needed())
+    }
     fn replicas(&self) -> usize {
         self.replicas
     }
