@@ -107,6 +107,15 @@ impl Database {
         }
         Ok(s)
     }
+    pub(super) fn validate_stored_snapshot(&self) -> io::Result<()> {
+        let snapshot = self.snapshot()?;
+        let image: Image = postcard::from_bytes(&snapshot.data).map_err(error)?;
+        if image.version != 1 || image.contents.len() != image.manifest.len() {
+            return Err(error("invalid stored snapshot image"));
+        }
+        self.validate_voter_count(snapshot.get_metadata().get_conf_state())?;
+        crate::durable::validate_cluster_snapshot(&image.model, &image.contents).map_err(error)
+    }
     pub fn compact(&mut self, sequence: u64, image: CheckpointImage) -> io::Result<()> {
         if self.end()? != sequence {
             return Err(error("checkpoint position mismatch"));
@@ -181,6 +190,7 @@ impl Database {
         let members: crate::cluster::membership::Membership =
             postcard::from_bytes(&image.membership).map_err(error)?;
         let conf = snapshot.get_metadata().get_conf_state();
+        self.validate_voter_count(conf)?;
         if !local {
             if !conf.voters.contains(&self.node_id)
                 && !conf.learners.contains(&self.node_id)
@@ -443,6 +453,218 @@ mod tests {
         assert_eq!(db.end().unwrap(), 2);
         assert_eq!(db.last().unwrap(), 2);
         assert_eq!(db.content(key).unwrap().unwrap().payload, "retained");
+    }
+    #[test]
+    fn invalid_model_with_valid_file_digests_cannot_resume_as_a_voter() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut db, data) = donor(dir.path());
+        db.compact(
+            2,
+            CheckpointImage {
+                data,
+                live: vec![ContentKey {
+                    generation: 1,
+                    sequence: 1,
+                }],
+                imports: vec![],
+            },
+        )
+        .unwrap();
+        let mut stored =
+            Snapshot::parse_from_bytes(&db.meta("raft_snapshot").unwrap().unwrap()).unwrap();
+        let mut image: Image = postcard::from_bytes(&stored.data).unwrap();
+        image.model[0] = 127; // An unsupported application model, with intact payloads.
+        stored.data = postcard::to_allocvec(&image).unwrap().into();
+        let bytes = stored.write_to_bytes().unwrap();
+        db.conn
+            .execute(
+                "UPDATE cluster_meta SET value=?1 WHERE key='raft_snapshot'",
+                [bytes.as_slice()],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE cluster_meta SET value=?1 WHERE key='raft_snapshot_hash'",
+                [digest(&bytes).as_slice()],
+            )
+            .unwrap();
+        drop(db);
+        assert!(
+            Database::open(&dir.path().join("donor"), &config(1), false).is_err(),
+            "structurally invalid snapshot resumed voting before model validation"
+        );
+    }
+    #[test]
+    fn restored_snapshot_cannot_reduce_the_configured_voter_quorum() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut db, data) = donor(dir.path());
+        db.compact(
+            2,
+            CheckpointImage {
+                data,
+                live: vec![ContentKey {
+                    generation: 1,
+                    sequence: 1,
+                }],
+                imports: vec![],
+            },
+        )
+        .unwrap();
+        let mut stored =
+            Snapshot::parse_from_bytes(&db.meta("raft_snapshot").unwrap().unwrap()).unwrap();
+        stored.mut_metadata().mut_conf_state().voters = vec![1];
+        let bytes = stored.write_to_bytes().unwrap();
+        db.conn
+            .execute(
+                "UPDATE cluster_meta SET value=?1 WHERE key='raft_snapshot'",
+                [bytes.as_slice()],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE cluster_meta SET value=?1 WHERE key='raft_snapshot_hash'",
+                [digest(&bytes).as_slice()],
+            )
+            .unwrap();
+        drop(db);
+        assert!(
+            Database::open(&dir.path().join("donor"), &config(1), false).is_err(),
+            "recovery reduced the quorum to one voter"
+        );
+    }
+    #[test]
+    fn delayed_empty_snapshot_cannot_erase_newly_committed_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        let (donor, data) = donor(dir.path());
+        let mut source = Database::open(&dir.path().join("source"), &config(1), true).unwrap();
+        let hard = |commit| HardState {
+            term: 1,
+            vote: 1,
+            commit,
+            ..Default::default()
+        };
+        source
+            .persist(
+                &[Entry {
+                    index: 1,
+                    term: 1,
+                    ..Default::default()
+                }],
+                Some(&hard(1)),
+            )
+            .unwrap();
+        source.apply(1).unwrap();
+        let mut empty = Engine::recover(crate::storage::MemoryStore::default()).unwrap();
+        empty.checkpoint().unwrap();
+        let empty = empty
+            .into_store()
+            .load_checkpoint()
+            .unwrap()
+            .unwrap()
+            .1
+            .to_vec();
+        source
+            .compact(
+                0,
+                CheckpointImage {
+                    data: empty,
+                    live: vec![],
+                    imports: vec![],
+                },
+            )
+            .unwrap();
+        let old = source.snapshot().unwrap();
+        let mut created = donor.entry(1).unwrap();
+        created.index = 2;
+        source.persist(&[created], Some(&hard(2))).unwrap();
+        source.apply(2).unwrap();
+        let key = ContentKey {
+            generation: 1,
+            sequence: 1,
+        };
+        source
+            .compact(
+                2,
+                CheckpointImage {
+                    data: data.clone(),
+                    live: vec![key],
+                    imports: vec![],
+                },
+            )
+            .unwrap();
+        let new = source.snapshot().unwrap();
+        let mut receiver = Database::open(&dir.path().join("receiver"), &config(2), true).unwrap();
+        let mut received = hard(2);
+        received.vote = 2;
+        receiver
+            .install_snapshot(&new, Some(&received), &[], false)
+            .unwrap();
+        assert!(receiver.install_snapshot(&old, None, &[], false).is_err());
+        assert_eq!(receiver.snapshot_base().unwrap(), (2, 1, 2));
+        assert_eq!(receiver.meta("app_snapshot").unwrap().unwrap(), data);
+        assert_eq!(receiver.content(key).unwrap().unwrap().payload, "retained");
+        drop(receiver);
+        let receiver = Database::open(&dir.path().join("receiver"), &config(2), false).unwrap();
+        assert_eq!(receiver.end().unwrap(), 2);
+        assert_eq!(receiver.content(key).unwrap().unwrap().payload, "retained");
+    }
+    #[test]
+    fn snapshot_decode_failure_never_advances_applied_or_releases_protocol_responses() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut donor, data) = donor(dir.path());
+        donor
+            .compact(
+                2,
+                CheckpointImage {
+                    data,
+                    live: vec![ContentKey {
+                        generation: 1,
+                        sequence: 1,
+                    }],
+                    imports: vec![],
+                },
+            )
+            .unwrap();
+        let mut snapshot = donor.snapshot().unwrap();
+        snapshot.data = vec![255].into();
+        let db = std::sync::Arc::new(std::sync::Mutex::new(
+            Database::open(&dir.path().join("receiver"), &config(2), true).unwrap(),
+        ));
+        let log = crate::cluster::LogStorage { db: db.clone() };
+        let mut node = raft::RawNode::new(
+            &raft::Config {
+                id: 2,
+                ..Default::default()
+            },
+            log,
+            &slog::Logger::root(slog::Discard, slog::o!()),
+        )
+        .unwrap();
+        node.step(raft::eraftpb::Message {
+            msg_type: raft::eraftpb::MessageType::MsgSnapshot,
+            from: 1,
+            to: 2,
+            term: 1,
+            snapshot: Some(snapshot).into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(node.has_ready());
+        let (send, mut receive) = tokio::sync::mpsc::channel(4);
+        let outgoing = std::collections::BTreeMap::from([(1, send)]);
+        assert!(crate::cluster::pump(
+            &mut node,
+            &mut std::collections::BTreeMap::new(),
+            &outgoing,
+            &std::collections::BTreeMap::new()
+        )
+        .is_err());
+        assert!(receive.try_recv().is_err());
+        assert_eq!(node.raft.raft_log.applied, 0);
+        let db = db.lock().unwrap();
+        assert_eq!(db.hard().unwrap().commit, 0);
+        assert_eq!(db.view().unwrap(), 0);
+        assert_eq!(db.last().unwrap(), 0);
     }
     #[test]
     fn malformed_snapshot_or_wrong_incarnation_cannot_replace_the_old_root() {

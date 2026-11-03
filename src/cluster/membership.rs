@@ -20,6 +20,29 @@ pub(crate) struct Change {
     pub stage: u8,
 }
 impl Database {
+    pub(crate) fn validate_voter_count(&self, conf: &raft::eraftpb::ConfState) -> io::Result<()> {
+        // This implementation replaces voters one-for-one. General resizing is
+        // not supported; replay may never silently shrink the required quorum.
+        let expected = self.genesis.voters.len();
+        let distinct = |ids: &[u64]| {
+            ids.iter()
+                .copied()
+                .filter(|id| *id != 0)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                == expected
+        };
+        if conf.voters.len() != expected
+            || !distinct(&conf.voters)
+            || (!conf.voters_outgoing.is_empty()
+                && (conf.voters_outgoing.len() != expected || !distinct(&conf.voters_outgoing)))
+        {
+            return Err(error(
+                "recovered membership changes the configured voter quorum",
+            ));
+        }
+        Ok(())
+    }
     pub fn accepts_sender(&self, message: &Message, nonce: [u8; 16]) -> io::Result<bool> {
         let state = self.membership()?;
         let conf = self.conf()?;
@@ -130,6 +153,7 @@ impl Database {
             }
         }
         let conf = node.raft.prs().conf().to_conf_state();
+        self.validate_voter_count(&conf)?;
         if (conf.voters.contains(&self.node_id) || state.identities.contains_key(&self.node_id))
             && state
                 .identities
@@ -178,6 +202,7 @@ pub(crate) fn apply_configuration(node: &mut RawNode<LogStorage>, commit: u64) -
                 node.raft.msgs.clear();
             }
             let mut db = node.store().db.lock().unwrap();
+            db.validate_voter_count(&conf)?;
             let mut state = db.membership()?;
             Database::note_change(&mut state, &e)?;
             let tx = db.conn.transaction().map_err(error)?;

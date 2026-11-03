@@ -165,8 +165,9 @@ impl Database {
         db.restore_snapshot_position()?;
         let base = db.snapshot_base()?.0;
         if base > 0 {
-            let snap = db.snapshot()?;
-            let _ = snap;
+            // A checksum-valid but malformed model/catalog is not a safe voter.
+            // Validate before RawNode can campaign or send replication messages.
+            db.validate_stored_snapshot()?;
         }
         let hard = db.hard()?;
         let last = db.last()?;
