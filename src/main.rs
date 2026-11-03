@@ -39,19 +39,9 @@ struct Args {
     /// Experimental strict fixed single-voter engine (no peer replication yet).
     #[arg(long, requires = "store", conflicts_with = "unsafe_ack_durability")]
     single_voter: bool,
-    /// Fixed-membership Raft cluster configuration (JSON).
+    /// Raft cluster configuration (JSON); startup forms or heals the cluster automatically.
     #[arg(long, requires = "store", conflicts_with_all = ["single_voter", "unsafe_ack_durability"])]
     cluster_config: Option<std::path::PathBuf>,
-    /// Initialize a fresh voter for the first cluster bootstrap only.
-    #[arg(long, requires = "cluster_config")]
-    cluster_bootstrap: bool,
-    /// Enroll a fresh unused member identity as a non-voting learner.
-    #[arg(
-        long,
-        requires = "cluster_config",
-        conflicts_with = "cluster_bootstrap"
-    )]
-    cluster_join: bool,
 }
 fn main() -> std::io::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -77,8 +67,6 @@ async fn run() -> std::io::Result<()> {
         return screech::cluster::run(
             config,
             a.store.as_ref().expect("clap requires store"),
-            a.cluster_bootstrap,
-            a.cluster_join,
             Config {
                 limits: Limits {
                     payload: a.max_payload,
@@ -166,7 +154,17 @@ mod tests {
     #[test]
     fn cluster_flags_require_explicit_storage_and_exclude_standalone_modes() {
         assert!(Args::try_parse_from(["screech", "--cluster-config", "cluster.json"]).is_err());
-        assert!(Args::try_parse_from(["screech", "--cluster-bootstrap"]).is_err());
+        for removed in ["--cluster-bootstrap", "--cluster-join"] {
+            assert!(Args::try_parse_from([
+                "screech",
+                "--store",
+                "db",
+                "--cluster-config",
+                "cluster.json",
+                removed
+            ])
+            .is_err());
+        }
         for flag in ["--single-voter", "--unsafe-ack-durability"] {
             assert!(Args::try_parse_from([
                 "screech",
@@ -184,10 +182,9 @@ mod tests {
             "db",
             "--cluster-config",
             "cluster.json",
-            "--cluster-bootstrap",
         ])
         .unwrap();
-        assert!(args.cluster_bootstrap);
+        assert!(args.cluster_config.is_some());
     }
 
     #[test]

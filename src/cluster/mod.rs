@@ -3,6 +3,7 @@
 //! leader's NATS service. Connections end on a view change and clients reconnect.
 //! All durable operations and current reads cross the same consensus boundary.
 mod membership;
+mod startup;
 mod storage;
 use crate::{
     server::{Config as ServerConfig, Server},
@@ -14,6 +15,7 @@ use protobuf::Message as ProtoMessage;
 use raft::{eraftpb::Message, RawNode, StateRole};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+pub use startup::run;
 use std::{
     collections::BTreeMap,
     io,
@@ -64,6 +66,16 @@ impl ClusterConfig {
             self.peers.keys().copied().collect()
         } else {
             self.initial_voters.clone()
+        }
+    }
+    fn slot_for(&self, member: u64, identities: &BTreeMap<u64, [u8; 16]>) -> Option<u64> {
+        if self.peers.contains_key(&member) {
+            Some(member)
+        } else {
+            identities
+                .get(&member)
+                .map(|n| u64::from_le_bytes(n[..8].try_into().unwrap()))
+                .filter(|slot| self.peers.contains_key(slot))
         }
     }
     pub fn validate(&self) -> io::Result<()> {
@@ -140,6 +152,13 @@ enum Input {
         reply: Reply,
     },
     SnapshotSent(u64, bool),
+    Enroll {
+        slot: u64,
+        member: u64,
+        nonce: [u8; 16],
+        term: u64,
+        reply: Reply,
+    },
 }
 #[derive(Clone)]
 struct Client {
@@ -358,6 +377,7 @@ fn pump(
     node: &mut RawNode<LogStorage>,
     pending: &mut BTreeMap<Vec<u8>, (Instant, Reply)>,
     out: &BTreeMap<u64, tokio::sync::mpsc::Sender<Message>>,
+    routes: &BTreeMap<u64, u64>,
 ) -> io::Result<()> {
     while node.has_ready() {
         let gate = node.store().db.lock().unwrap().gate.clone();
@@ -403,8 +423,18 @@ fn pump(
         messages.extend(light.take_messages());
         // The application is represented by its committed indexes, advanced above.
         node.advance_apply();
+        let identities = node.store().db.lock().unwrap().membership()?.identities;
         for message in messages {
-            if let Some(tx) = out.get(&message.to) {
+            let route = if out.contains_key(&message.to) {
+                message.to
+            } else {
+                identities
+                    .get(&message.to)
+                    .map(|n| u64::from_le_bytes(n[..8].try_into().unwrap()))
+                    .or_else(|| routes.get(&message.to).copied())
+                    .unwrap_or(message.to)
+            };
+            if let Some(tx) = out.get(&route) {
                 let _ = tx.try_send(message);
             }
         }
@@ -481,19 +511,24 @@ async fn receive_message(
     config: &ClusterConfig,
     stream: &mut TcpStream,
     bytes: Arc<Semaphore>,
+    mut first: Option<u32>,
 ) -> io::Result<(Message, [u8; 16], tokio::sync::OwnedSemaphorePermit)> {
     let mut data = Vec::new();
     let mut identity = None;
     let mut permit = None;
     loop {
-        let size = stream.read_u32().await? as usize;
+        let size = if let Some(n) = first.take() {
+            n as usize
+        } else {
+            stream.read_u32().await? as usize
+        };
         if size > 2 * 1024 * 1024 {
             return Err(error("invalid transfer chunk size"));
         }
         let mut frame = vec![0; size];
         stream.read_exact(&mut frame).await?;
         let envelope: Envelope = postcard::from_bytes(&frame).map_err(error)?;
-        if envelope.cluster != config.cluster_id || !config.peers.contains_key(&envelope.from) {
+        if envelope.cluster != config.cluster_id || envelope.from == 0 {
             return Err(error("unknown peer"));
         }
         let mut auth = authenticate(
@@ -550,8 +585,7 @@ async fn receive_message(
 async fn network(
     config: &ClusterConfig,
     tx: mpsc::SyncSender<Input>,
-    listener: TcpListener,
-    mut stop: watch::Receiver<bool>,
+    stop: watch::Receiver<bool>,
     incarnation: [u8; 16],
 ) -> BTreeMap<u64, tokio::sync::mpsc::Sender<Message>> {
     let mut out = BTreeMap::new();
@@ -570,70 +604,34 @@ async fn network(
                         message=receive.recv()=>{let Some(message)=message else{break};
                             let snapshot=message.get_msg_type()==raft::eraftpb::MessageType::MsgSnapshot;
                             let result=tokio::time::timeout(Duration::from_secs(30),send_message(&config,address,&message,incarnation)).await;
-                            if snapshot {let _=tx.try_send(Input::SnapshotSent(id,matches!(result,Ok(Ok(())))));}
+                            if snapshot {let _=tx.try_send(Input::SnapshotSent(message.to,matches!(result,Ok(Ok(())))));}
                         }
                     }
                 }
             });
         }
     }
-    let config = config.clone();
-    tokio::spawn(async move {
-        let slots = Arc::new(Semaphore::new(16));
-        let bytes = Arc::new(Semaphore::new(2 * (storage::MAX_SNAPSHOT + MAX_FRAME)));
-        loop {
-            tokio::select! {
-                _=stop.changed()=>break,
-                accepted=listener.accept()=>{
-                    let Ok((mut stream,_))=accepted else{break};let Ok(slot)=slots.clone().try_acquire_owned() else{continue};
-                    let config=config.clone();let tx=tx.clone();let bytes=bytes.clone();
-                    tokio::spawn(async move{let _slot=slot;
-                        if let Ok(Ok((message,nonce,permit)))=tokio::time::timeout(Duration::from_secs(30),receive_message(&config,&mut stream,bytes)).await {let _=tx.try_send(Input::Message(message,nonce,permit));}
-                    });
-                }
-            }
-        }
-    });
     out
 }
 
 /// Run a cluster node until shutdown. Store paths and node incarnations are
 /// immutable; damaged members are replaced through enrolled learner identities.
-pub async fn run(
+async fn run_runtime(
     config: ClusterConfig,
-    path: &Path,
-    bootstrap: bool,
-    join: bool,
+    slot: u64,
+    database: Database,
     mut server_config: ServerConfig,
     mut shutdown: watch::Receiver<bool>,
+    hub: startup::Hub,
 ) -> io::Result<()> {
-    config.validate()?;
-    if join && config.voters().contains(&config.node_id) {
-        return Err(error(
-            "a replacement must use a new node ID outside the original voters",
-        ));
-    }
-    let peer = &config.peers[&config.node_id];
-    let listener = TcpListener::bind(peer.raft).await?;
+    let peer = &config.peers[&slot];
     let clients = TcpListener::bind(peer.client).await?;
-    let db = Arc::new(Mutex::new(Database::open_mode(
-        path, &config, bootstrap, join,
-    )?));
+    let db = Arc::new(Mutex::new(database));
     let (tx, rx) = mpsc::sync_channel(256);
     let (role_tx, role) = watch::channel(Role::default());
     let (stop, stop_rx) = watch::channel(false);
     let incarnation = db.lock().unwrap().incarnation;
-    if join {
-        println!(
-            "JOIN {} {}",
-            config.node_id,
-            incarnation
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        );
-    }
-    let out = network(&config, tx.clone(), listener, stop_rx.clone(), incarnation).await;
+    let out = network(&config, tx.clone(), stop_rx.clone(), incarnation).await;
     let log = LogStorage { db: db.clone() };
     let raft_config = raft::Config {
         id: config.node_id,
@@ -649,6 +647,13 @@ pub async fn run(
     let logger = slog::Logger::root(slog::Discard, slog::o!());
     let mut node = RawNode::new(&raft_config, log, &logger).map_err(error)?;
     let active_session = Arc::new(AtomicU64::new(0));
+    hub.install(startup::Active {
+        config: config.clone(),
+        tx: tx.clone(),
+        role: role.clone(),
+        db: db.clone(),
+        session: active_session.clone(),
+    });
     let actor_session = active_session.clone();
     let actor_config = config.clone();
     let actor = std::thread::Builder::new()
@@ -658,6 +663,10 @@ pub async fn run(
             let mut nonce = [0u8; 16];
             getrandom::fill(&mut nonce).map_err(error)?;
             let mut serial = 0u64;
+            // New learners must reply to replacement leaders before receiving
+            // a snapshot containing the committed placement map. These routes
+            // are transport hints only; membership still gates every message.
+            let mut routes = BTreeMap::new();
             let mut tick = Instant::now();
             loop {
                 let mut incoming_lease = None;
@@ -678,8 +687,78 @@ pub async fn run(
                         let allowed = db.accepts_sender(&message, nonce)?;
                         drop(db);
                         if allowed {
+                            if let Some(slot) = actor_config.slot_for(message.from, &BTreeMap::from([(message.from,nonce)])) {
+                                routes.insert(message.from,slot);
+                            }
+                            if message.get_msg_type() == raft::eraftpb::MessageType::MsgSnapshot {
+                                tracing::debug!(from=message.from,to=message.to,index=message.get_snapshot().get_metadata().index, conf=?message.get_snapshot().get_metadata().get_conf_state(),"received snapshot");
+                            }
                             let _ = node.step(message);
+                        } else {
+                            tracing::debug!(from=message.from,to=message.to,kind=?message.get_msg_type(),"fenced peer message");
                         }
+                    }
+                    Ok(Input::Enroll {
+                        slot,
+                        member,
+                        nonce,
+                        term,
+                        reply,
+                    }) => {
+                        let result = (|| -> io::Result<u64> {
+                            if node.raft.state != StateRole::Leader || term != node.raft.term {
+                                return Err(error("leadership changed"));
+                            }
+                            if member == 0 || actor_config.peers.contains_key(&member)
+                                || actor_config.slot_for(member, &BTreeMap::from([(member,nonce)])) != Some(slot)
+                            {
+                                return Err(error("invalid recovery placement"));
+                            }
+                            let db = node.store().db.lock().unwrap();
+                            let conf = db.conf()?;
+                            let state = db.membership()?;
+                            if conf
+                                .voters
+                                .iter()
+                                .chain(&conf.learners)
+                                .chain(&conf.voters_outgoing)
+                                .any(|id| *id == member && state.identities.get(id) == Some(&nonce))
+                            {
+                                return Ok(0);
+                            }
+                            if !conf.voters_outgoing.is_empty() {
+                                return Err(error("joint change in progress"));
+                            }
+                            let old = conf
+                                .voters
+                                .iter()
+                                .find(|id| {
+                                    actor_config.slot_for(**id, &state.identities) == Some(slot)
+                                })
+                                .copied();
+                            let learner = conf
+                                .learners
+                                .iter()
+                                .find(|id| {
+                                    actor_config.slot_for(**id, &state.identities) == Some(slot)
+                                })
+                                .copied();
+                            drop(db);
+                            if let Some(old) = old {
+                                membership::start_replacement(
+                                    &mut node,
+                                    membership::Replacement {
+                                        old,
+                                        new: member,
+                                        nonce,
+                                    },
+                                )?;
+                            } else {
+                                membership::enroll_standby(&mut node, member, nonce, learner)?;
+                            }
+                            Ok(0)
+                        })();
+                        let _ = reply.send(result);
                     }
                     Ok(Input::Replace {
                         term,
@@ -691,7 +770,12 @@ pub async fn run(
                         if term != node.raft.term
                             || configuration != node.store().db.lock().unwrap().conf_index()?
                             || session != actor_session.load(Ordering::Acquire)
-                            || !actor_config.peers.contains_key(&replacement.new)
+                            || actor_config
+                                .slot_for(
+                                    replacement.new,
+                                    &BTreeMap::from([(replacement.new, replacement.nonce)]),
+                                )
+                                .is_none()
                         {
                             let _ = reply
                                 .send(Err(error("invalid replacement target or leader epoch")));
@@ -757,7 +841,7 @@ pub async fn run(
                     node.tick();
                     tick = Instant::now();
                 }
-                pump(&mut node, &mut pending, &out)?;
+                pump(&mut node, &mut pending, &out, &routes)?;
                 drop(incoming_lease);
                 membership::advance_replacement(&mut node)?;
                 let configuration = node.store().db.lock().unwrap().conf_index()?;
@@ -842,14 +926,22 @@ pub async fn run(
                 match prepared {
                     Ok(Ok(handle)) => {
                         let mut local = server_config.clone();
-                        if let Ok(conf) = service_db.lock().unwrap().conf() {
-                            local.connect_urls = service_config
-                                .peers
+                        let discovery = {
+                            let db = service_db.lock().unwrap();
+                            db.conf().map(|c| {
+                                (c, db.membership().map(|m| m.identities).unwrap_or_default())
+                            })
+                        };
+                        if let Ok((conf, identities)) = discovery {
+                            local.connect_urls = conf
+                                .voters
                                 .iter()
-                                .filter(|(id, _)| {
-                                    conf.voters.contains(id) || conf.voters_outgoing.contains(id)
-                                })
-                                .map(|(_, p)| p.client.to_string())
+                                .chain(&conf.voters_outgoing)
+                                .filter_map(|id| service_config.slot_for(*id, &identities))
+                                .filter_map(|slot| service_config.peers.get(&slot))
+                                .map(|p| p.client.to_string())
+                                .collect::<std::collections::BTreeSet<_>>()
+                                .into_iter()
                                 .collect();
                         }
                         local.jetstream = Some(handle.clone());
@@ -894,13 +986,14 @@ pub async fn run(
             result=actor_status.changed()=>{if result.is_err(){break;}},
             accepted=clients.accept()=>{
                 let (mut incoming,_)=accepted?;let Ok(slot)=slots.clone().try_acquire_owned() else{continue};
-                let mut role=role.clone();let peers=config.peers.clone();let mut stop=stop_rx.clone();
+                let mut role=role.clone();let peers=config.peers.clone();let route_db=db.clone();let mut stop=stop_rx.clone();
                 tokio::spawn(async move {
                     let _slot=slot;
                     let selected=tokio::time::timeout(Duration::from_secs(6),async{
                         loop {
                             let current=*role.borrow_and_update();
-                            if let Some(peer)=peers.get(&current.leader) {if let Ok(stream)=TcpStream::connect(peer.service).await{return Ok::<_,io::Error>((current,stream));}}
+                            let leader_slot=if peers.contains_key(&current.leader){current.leader}else{route_db.lock().unwrap().membership().ok().and_then(|m|m.identities.get(&current.leader).map(|n|u64::from_le_bytes(n[..8].try_into().unwrap()))).unwrap_or(0)};
+                            if let Some(peer)=peers.get(&leader_slot) {if let Ok(stream)=TcpStream::connect(peer.service).await{return Ok::<_,io::Error>((current,stream));}}
                             tokio::select!{_=role.changed()=>{},_=tokio::time::sleep(Duration::from_millis(50))=>{}}
                         }
                     }).await;
@@ -928,7 +1021,7 @@ pub async fn run(
 mod tests {
     use super::*;
     use crate::storage::Append;
-    fn config(id: u64) -> ClusterConfig {
+    pub(super) fn config(id: u64) -> ClusterConfig {
         ClusterConfig {
             cluster_id: "simulation".into(),
             node_id: id,
@@ -992,7 +1085,7 @@ mod tests {
             // ordering/idempotency rather than simulating an ideal transport.
             for _ in 0..100 {
                 for node in &mut self.nodes {
-                    pump(node, &mut BTreeMap::new(), &self.send).unwrap();
+                    pump(node, &mut BTreeMap::new(), &self.send, &BTreeMap::new()).unwrap();
                 }
                 let mut messages = Vec::new();
                 for rx in &mut self.receive {

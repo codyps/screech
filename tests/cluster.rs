@@ -62,7 +62,6 @@ async fn official_client_discovers_peers_and_reconnects_after_leader_process_los
                 .arg(file)
                 .arg("--store")
                 .arg(node.join("db"))
-                .arg("--cluster-bootstrap")
                 .stdout(Stdio::null())
                 .stderr(log)
                 .spawn()

@@ -6,7 +6,7 @@ from wire import Client
 
 class Cluster:
     def __init__(self,binary,root,count=3,spares=0):
-        self.binary=binary;self.root=root;self.processes={};self.logs={};self.initialized=set()
+        self.binary=binary;self.root=root;self.processes={};self.logs={};self.started_from={}
         held=[]
         for _ in range(3*(count+spares)):
             s=socket.socket();s.bind(('127.0.0.1',0));held.append(s)
@@ -16,11 +16,11 @@ class Cluster:
             node=root/str(i);node.mkdir()
             (node/'config.json').write_text(json.dumps(dict(cluster_id='process-test',node_id=i,secret='test-secret-'+'x'*32,peers=self.peers,initial_voters=list(range(1,count+1)))))
         for s in held:s.close()
-    def start(self,i,join=False,extra_env=None):
+    def start(self,i,extra_env=None):
+        try:self.started_from[i]=self.member(i)
+        except (FileNotFoundError,ValueError,KeyError,TypeError):self.started_from[i]=None
         node=self.root/str(i);log=open(node/'server.log','ab');self.logs[i]=log
         args=[self.binary,'--store',str(node/'db'),'--cluster-config',str(node/'config.json')]
-        if join:args.append('--cluster-join');self.initialized.add(i)
-        elif i not in self.initialized:args.append('--cluster-bootstrap');self.initialized.add(i)
         import os
         env=os.environ.copy()
         if extra_env:env.update(extra_env)
@@ -46,19 +46,33 @@ class Cluster:
             time.sleep(.05)
         raise TimeoutError('no serving leader')
     def client(self,i):return Client(self.address(i),timeout=8)
+    def store_path(self,i):
+        node=self.root/str(i);manifest=node/'db.node-state'
+        try:
+            record=json.loads(bytes(json.loads(manifest.read_text())['body']))
+            if record.get('instance'):return Path(record['instance']['path'])
+        except (FileNotFoundError,ValueError,KeyError):pass
+        return node/'db'
+    def member(self,i):
+        record=json.loads(bytes(json.loads((self.root/str(i)/'db.node-state').read_text())['body']))
+        return record['instance']['member']
     def await_equal(self):
-        until=time.monotonic()+10
+        until=time.monotonic()+30
         while time.monotonic()<until:
             values=[]
-            for i in self.processes:
-                with sqlite3.connect(self.root/str(i)/'db') as db:
-                    end=db.execute('select coalesce(max(seq),0) from event_index').fetchone()[0]
-                    floor=db.execute("select value from cluster_meta where key='app_sequence'").fetchone()
-                    view=db.execute("select value from cluster_meta where key='view'").fetchone()
-                    values.append((max(end,int.from_bytes(floor[0],'little') if floor else 0),int.from_bytes(view[0],'little') if view else 0))
-            if values and all(v==values[0] for v in values):return
+            try:
+                for i in self.processes:
+                    path=self.store_path(i)
+                    if not path.exists():break
+                    with sqlite3.connect(f'file:{path}?mode=ro',uri=True) as db:
+                        end=db.execute('select coalesce(max(seq),0) from event_index').fetchone()[0]
+                        floor=db.execute("select value from cluster_meta where key='app_sequence'").fetchone()
+                        view=db.execute("select value from cluster_meta where key='view'").fetchone()
+                        values.append((max(end,int.from_bytes(floor[0],'little') if floor else 0),int.from_bytes(view[0],'little') if view else 0))
+                if len(values)==len(self.processes) and values and all(v==values[0] for v in values):return
+            except sqlite3.Error:pass
             time.sleep(.05)
-        raise AssertionError('committed replicas did not converge')
+        raise AssertionError(('committed replicas did not converge',values))
 
 def run(binary):
     results=[]

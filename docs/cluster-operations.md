@@ -9,8 +9,7 @@ existing formats and behavior.
 ## Start three local nodes
 
 Build the binary and generate configurations sharing a cluster identity, peer list
-and a randomly generated authentication secret. This address book includes three
-spare identities/endpoints for later replacement:
+and a randomly generated authentication secret:
 
 ```sh
 cargo build --release --locked
@@ -18,15 +17,15 @@ python3 - <<'PY'
 from pathlib import Path
 import json, secrets
 root = Path('cluster-data')
-if any((root / str(n) / 'cluster.json').exists() for n in range(1, 7)):
+if any((root / str(n) / 'cluster.json').exists() for n in range(1, 4)):
     raise SystemExit('Configuration already exists; reuse it for restart')
 secret = secrets.token_hex(32)
 peers = {str(n): {
     'raft': f'127.0.0.1:{7400+n}',
     'client': f'127.0.0.1:{4200+n}',
     'service': f'127.0.0.1:{7500+n}',
-} for n in range(1, 7)}
-for n in range(1, 7):
+} for n in range(1, 4)}
+for n in range(1, 4):
     node = root / str(n)
     node.mkdir(parents=True, exist_ok=True)
     config = node / 'cluster.json'
@@ -39,12 +38,12 @@ for n in range(1, 7):
 PY
 ```
 
-In three terminals, initialize each voter once:
+In three terminals, start the servers:
 
 ```sh
-./target/release/screech-server --store cluster-data/1/cluster.db --cluster-config cluster-data/1/cluster.json --cluster-bootstrap
-./target/release/screech-server --store cluster-data/2/cluster.db --cluster-config cluster-data/2/cluster.json --cluster-bootstrap
-./target/release/screech-server --store cluster-data/3/cluster.db --cluster-config cluster-data/3/cluster.json --cluster-bootstrap
+./target/release/screech-server --store cluster-data/1/cluster.db --cluster-config cluster-data/1/cluster.json
+./target/release/screech-server --store cluster-data/2/cluster.db --cluster-config cluster-data/2/cluster.json
+./target/release/screech-server --store cluster-data/3/cluster.db --cluster-config cluster-data/3/cluster.json
 ```
 
 Connect NATS clients to ports 4201–4203. Each public endpoint routes connections
@@ -66,22 +65,44 @@ authentication behavior. Protect both the peer and service endpoints accordingly
 
 ## Restart and storage identity
 
-Restart a stopped process with the same configuration and store, omitting
-`--cluster-bootstrap`. Keep the database, WAL/SHM files and `.cluster-lock` marker
-together. Bootstrap initializes fresh storage for the original voters only.
-Normal startup refuses missing or blank databases. Do not recreate a voter with
-lost vote history using bootstrap. Use the learner replacement procedure below.
-A store with untrustworthy bytes is never used to reconstruct replacement state;
-the surviving healthy quorum supplies that state.
+Use exactly the same command for first startup, restart and repair:
 
-Node identity, cluster identity, secret and initial voter IDs are persisted and
-must match at restart. Active membership is recovered from committed Raft changes.
-The address book can add spare endpoints; update it consistently on every node and
-restart to load changed routes before enrolling those identities. Keep initial voter
-IDs unchanged. `max_log_bytes` is an operational budget and can be raised on restart
-without changing identity. Standalone databases cannot be opened as
-cluster databases; offline import is future work. Graceful shutdown and SIGKILL
-restarts preserve acknowledged state under the configured local storage contract.
+```sh
+./target/release/screech-server --store cluster-data/1/cluster.db --cluster-config cluster-data/1/cluster.json
+```
+
+There are no bootstrap or join flags and no separate repair operation. On first
+formation, all configured initial voters must be reachable once. Each supplies an
+authenticated claim tied to its fresh local startup identity. The complete formation
+certificate is persisted before voting. A partially completed formation resumes
+from that certificate; missing historical stores cannot issue fresh genesis votes.
+Later intact cluster restarts need a current voting majority.
+
+The configured `node_id` identifies a stable server slot and its three addresses.
+Raft member IDs are internal and can change during recovery. When a live quorum is
+reachable, a returning server starts a fresh nonvoting incarnation, including when
+its local database appears intact. This avoids trusting a consistent stale database
+as current vote history. The quorum enrolls it, transfers verified state, then
+promotes it through joint consensus while retiring the previous voter in that slot.
+A damaged store waits without voting if no healthy quorum is available. The same
+supervisor retries after runtime storage failures and interrupted recovery.
+
+The `.node-state` file durably selects the current store generation. Replacement
+stores live beneath `<store stem>.recovery/<member>/store.db`. Original and failed
+generations are preserved for diagnosis and consume disk until archived or removed
+while the server is stopped. Keep the active generation, WAL/SHM files, startup
+manifest, recovery watermarks and lock markers together. Startup verifies persisted identities, log
+continuity, snapshots and required bodies before resuming a stored voter. A complete
+restart relies on the surviving stores retaining their durable voting history;
+restoring an entire voting quorum to older, internally consistent backups is not a
+supported recovery procedure. Rolling back a database together with its watermark
+requires a reachable healthy quorum: a consistent rollback of every local file
+cannot be recognized from local checks alone.
+
+Keep the cluster identity, secret and initial voter list unchanged. Protect the
+configuration as well as data files. `max_log_bytes` can be raised on restart.
+Standalone stores are not imported into the cluster; recovery obtains authoritative
+state from peers. Their standalone behavior and formats remain unchanged.
 
 All streams use the full voter group. API responses report three or five replicas.
 Client default replica requests of zero/one use the full group; explicitly requesting
@@ -96,6 +117,15 @@ transitions and their payloads. Record/content indexes refer into those entries 
 expose only the durably committed prefix. Recovery rebuilds indexes from that prefix,
 then reconstructs the model from a validated checkpoint and its committed tail.
 Uncommitted accepted entries remain available to Raft for conflict replacement.
+
+Before releasing persistence-dependent messages, an authenticated local watermark
+seals the durable term, vote, commit and accepted log position. Startup compares the
+database against this watermark, rejecting rolled-back history even without a
+reachable leader. Missing or corrupt watermarks require quorum repair. A database
+ahead of the watermark is safe to resume after interrupted publication. SQLite is
+the only source of replicated application state; the watermark can only reject a
+store. Atomic watermark publication adds file and directory syncs when the durable
+position changes. Its throughput/latency cost still needs measurement and optimization.
 
 Checkpoints atomically publish the complete snapshot and reclaim its covered log
 prefix. Snapshot metadata binds the model, event position, term/index, configuration,
@@ -128,72 +158,40 @@ still delay that node's Raft I/O. Surviving nodes can elect another leader. Thro
 tail latency, host power-loss behavior and the stronger corruption-repair fault
 model have not been certified. This remains experimental software.
 
-## Replace a damaged voter
+## Automatic repair and observation
 
-This requires a healthy majority of the current voters. Three-voter clusters can
-repair one unavailable member; five-voter clusters can repair two unavailable
-members by replacing them one at a time. Replication cannot recover acknowledged
-bytes after every authoritative copy has been destroyed.
+Restart the failed server with its original configuration and command. Missing,
+blank, malformed, truncated and corrupt stores recover under fresh internal member
+IDs at the same addresses. No spare endpoints, edited configuration, nonce copying
+or admin request is required. A failed learner is retired before the next candidate
+is enrolled; a new leader resumes interrupted committed membership changes.
 
-1. Stop the damaged process. Preserve its files for diagnosis. If the store is
-   missing, corrupt or rolled back, leave that identity offline during replacement.
-   A consistent old copy can pass checksums; do not trust it as current vote history.
-2. Choose an unused node ID with distinct endpoints already in every node's address
-   book. Never recycle a retired ID. Start it with an empty store using join mode:
+Repair needs a healthy majority of the current voters. Three voters can repair one
+unavailable member; five can repair two, serializing membership transitions. No
+failure detector removes voters or reduces quorum requirements. Replication cannot
+recover acknowledged bytes after all authoritative copies have been destroyed.
 
-   ```sh
-   ./target/release/screech-server --store cluster-data/4/cluster.db --cluster-config cluster-data/4/cluster.json --cluster-join
-   ```
+For observation, request `$JS.API.SCREECH.CLUSTER.STATUS` with an empty JSON object.
+`voters`, `learners`, `outgoing`, `replacement` and `retired` expose the committed
+internal membership and recovery progress. The selected member ID and store path
+are logged at startup. Completion means the selected member is in `voters`,
+`outgoing` is empty and `replacement` is null. Nonvoter slots listed only in the
+address book automatically enroll as standbys and do not increase the voter count.
+The earlier `REPLACE` admin API remains available for explicit membership requests;
+automatic startup does not require it.
 
-   Startup prints `JOIN 4 <32-hex-digit-nonce>`. The fresh incarnation is durable.
-   The process starts without voting authority.
-3. Submit a replacement through any healthy public endpoint. For example, replacing
-   voter 2 with learner 4, copy the actual JOIN nonce into this request:
-
-   ```sh
-   PYTHONPATH=scripts python3 - <<'PY'
-   from wire import Client
-   c = Client(('127.0.0.1', 4201))
-   print(c.request('$JS.API.SCREECH.CLUSTER.REPLACE', {
-       'old': 2, 'new': 4, 'nonce': '<actual JOIN nonce>',
-   }))
-   c.close()
-   PY
-   ```
-
-   `accepted` means the operation was queued, not that replacement is complete.
-   Configuration changes close client connections; an interrupted reply has an
-   unknown outcome. Repeating the same request is safe.
-4. Poll `$JS.API.SCREECH.CLUSTER.STATUS` using an empty JSON object. Completion means
-   `voters` contains 4, `outgoing` is empty and `retired["2"]` is 4. The leader first
-   commits learner enrollment, waits for verified durable catch-up, then commits
-   joint promotion/removal and leaves the joint configuration. New leaders resume
-   an operation from committed metadata after a failure.
-
-If a candidate learner loses its disk before promotion, choose another unused ID
-and submit the same `old` voter with the new target/nonce. The leader commits removal
-of the failed learner before enrolling the new target; abandoned learner identities
-are tombstoned with a retired value of zero. If joint promotion has already begun,
-allow it to finish, then replace the damaged promoted member under its now-current ID.
-
-An active voter whose store is wiped cannot rejoin by generating a new incarnation
-under the old ID. Its messages do not match the committed enrollment, and a snapshot
-for that old incarnation cannot activate the new one. Use another unused ID and the
-healthy quorum. Retired senders are fenced before Raft processes their votes, even
-if they restart with a valid stale store. Keep retired processes stopped.
-
-These admin subjects use the existing NATS authentication/authorization boundary.
-Peer authentication binds sender incarnation as well as cluster ID and message bytes.
-There is no automatic failure-detector removal or forced quorum reduction.
-The removed leader steps down after committed removal, and a new application
-writer session fences any work from a retiring service before recovery begins.
+Retired or wrong-incarnation messages are fenced before Raft processes votes.
+The removed leader steps down after committed removal. Application writer sessions
+fence retiring services across configuration changes before another model recovers.
+Client connections can close during this transition; use ordinary reconnect and
+publication deduplication behavior.
 
 ## Upgrade from the earlier retained-log cluster build
 
-Stop the cluster, preserve its database/WAL/lock files, and update all binaries
+Stop the cluster, preserve its databases, WAL files and startup metadata, and update all binaries
 before restarting against those stores. The previous persisted batch format is
-readable, and configuration is reconstructed before serving. This change extends
-the peer wire format with incarnation and chunk framing; mixed-version operation
+readable, and configuration is reconstructed before serving. Startup now multiplexes authenticated formation/recovery requests on the Raft
+port alongside replication; mixed-version operation
 is not supported. Existing standalone and strict single-voter stores keep their
 original behavior and formats.
 
@@ -215,8 +213,9 @@ reversed/duplicated messages, conflicting payloads and restart. CI runs both.
 The recovery suite additionally kills receivers during transfer and on both sides
 of snapshot activation, changes the donor image during a paused transfer, and
 repairs killed members with absent, blank, unreadable, truncated and stale stores.
-It checks missing/corrupt snapshot bodies, lost incarnation metadata, a leader killed
-during joint apply, and a learner whose store disappears during enrollment. Live leader replacement
-also runs while publications continue; every acknowledged sequence is checked. A full
+It checks missing/corrupt snapshot bodies, lost incarnation/startup metadata, crashes
+during formation, a leader killed during joint apply, and a learner whose store
+disappears during enrollment. Publications also continue through leader loss and
+automatic repair; every acknowledged sequence is checked. A full
 restart after replacing the original voters verifies configuration recovery from
 snapshots. The ordinary standalone crash suites remain separate regression gates.

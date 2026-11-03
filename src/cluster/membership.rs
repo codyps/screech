@@ -81,6 +81,14 @@ impl Database {
                 state.retired.insert(change.replacement.new, 0);
                 state.replacing = None;
             }
+            5 => {
+                state
+                    .identities
+                    .insert(change.replacement.new, change.replacement.nonce);
+            }
+            6 => {
+                state.retired.insert(change.replacement.new, 0);
+            }
             _ => return Err(error("unknown replacement stage")),
         }
         Ok(())
@@ -320,6 +328,51 @@ pub(crate) fn step_down_removed(node: &mut RawNode<LogStorage>) -> bool {
     } else {
         false
     }
+}
+
+/// Non-voting slots can start as standbys without changing the voter count.
+/// Losing a standby's store retires its old incarnation before enrollment.
+pub(crate) fn enroll_standby(
+    node: &mut RawNode<LogStorage>,
+    new: u64,
+    nonce: [u8; 16],
+    old: Option<u64>,
+) -> io::Result<()> {
+    if node.raft.pending_conf_index > node.raft.raft_log.applied {
+        return Err(error("configuration change pending"));
+    }
+    let db = node.store().db.lock().unwrap();
+    let state = db.membership()?;
+    if state.identities.contains_key(&new) || state.retired.contains_key(&new) {
+        return Err(error("recovery identity already used"));
+    }
+    let (target, kind, stage, nonce) = if let Some(old) = old {
+        (
+            old,
+            ConfChangeType::RemoveNode,
+            6,
+            state.identities.get(&old).copied().unwrap_or([0; 16]),
+        )
+    } else {
+        (new, ConfChangeType::AddLearnerNode, 5, nonce)
+    };
+    drop(db);
+    node.propose_conf_change(
+        postcard::to_allocvec(&Change {
+            replacement: Replacement {
+                old: 0,
+                new: target,
+                nonce,
+            },
+            stage,
+        })
+        .map_err(error)?,
+        ConfChangeV2 {
+            changes: vec![single(target, kind)].into(),
+            ..Default::default()
+        },
+    )
+    .map_err(error)
 }
 
 #[cfg(test)]

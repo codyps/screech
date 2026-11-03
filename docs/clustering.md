@@ -7,7 +7,7 @@ the intervening content-paging and unsafe-ACK changes materially change this pla
 The local NATS investigation is supporting evidence. The Raft replication and recovery
 baseline is now implemented; the broader production gates remain this plan's scope.
 
-## Implementation status: Raft snapshots and voter replacement
+## Implementation status: automatic formation and recovery
 
 `--cluster-config` enables a separate consensus store and a real Raft 0.7.0 event
 pump for three or five voters. Term/vote state and complete accepted entries persist
@@ -22,20 +22,32 @@ changes close client connections and a replacement leader recovers its local
 committed model. INFO advertises public reconnect endpoints. This deliberately
 uses connection-level forwarding before distributed Core interest routing.
 
-Initial bootstrap is explicit, and ordinary startup refuses lost storage. A returning
-replica catches up through a verified complete snapshot when its log is behind the
-compacted prefix, followed by the retained tail. Snapshot metadata/model, live
+One ordinary startup command handles formation, restart and repair; bootstrap and
+join flags have been removed. Fresh original voters first persist an authenticated
+formation certificate requiring all initial voters. Historical stores cannot form
+a fresh genesis. Intact complete-cluster restarts resume their durable histories;
+damaged stores wait for a live healthy quorum. A returning replica catches up through
+a verified complete snapshot when its log is behind the compacted prefix, followed by the retained tail. Snapshot metadata/model, live
 payloads, term/index, configuration and incarnation/tombstone state are installed
 atomically before acknowledging the transfer. Covered log entries and unreachable
 bodies are reclaimed in that same transaction; accepted suffixes remain intact.
 Automatic checkpointing considers committed position, log bytes and configuration
 changes. Transfer uses authenticated chunks and a full-image digest.
 
-Damaged voters are replaced under unused identities. `--cluster-join` creates a
-non-voting incarnation; quorum-authorized enrollment records its nonce. Promotion
-requires durable catch-up, then joint promotion/removal and an explicit leave-joint
+Configured node IDs and endpoints identify stable physical slots. Startup creates
+fresh internal member IDs when a live quorum is reachable, including for intact
+returning stores so consistent stale copies are never used for repair votes.
+Damaged generations remain archived; a synced authenticated startup manifest selects
+the new store. Startup automatically requests quorum-authorized enrollment of its
+nonvoting incarnation. Promotion requires durable catch-up, then joint promotion/removal and an explicit leave-joint
 entry. A new leader resumes committed replacement state. An abandoned learner can
-be retired before enrolling another candidate. Retired or wrong-incarnation senders
+be retired automatically before enrolling another candidate. Authenticated transport
+hints let new learners reply to replacement leaders before receiving the committed
+routing map in a snapshot. A synced local recovery watermark fences stale vote,
+commit and accepted-log positions even when leader discovery cannot complete.
+Missing/corrupt watermarks force quorum repair; SQLite remains the sole log/data
+authority. Watermark publication adds durability syncs, so throughput and tail
+latency must be measured before production use. Retired or wrong-incarnation senders
 are fenced before voting; untrustworthy old state never bootstraps the replacement.
 Committed leader removal explicitly steps down the old leader. Application writer
 sessions also fence retiring workers across same-term configuration transitions,
@@ -52,7 +64,10 @@ duplicated and partitioned messages with conflicting accepted payloads. These ar
 correctness evidence for the initial crash model, not performance certification.
 The recovery matrix additionally covers kills during snapshot transfer/activation,
 missing/blank/corrupt/stale stores, missing committed tails and snapshot bodies,
-incarnation loss, interrupted joint apply and loss of a replacement learner. These
+incarnation/manifest loss, interrupted startup publication, interrupted joint apply,
+loss of a replacement learner, and damaged minorities waiting for a returning quorum.
+Every repair history uses ordinary startup at unchanged addresses, without a manual
+membership operation. These
 histories require a surviving healthy quorum; they do not claim recovery after all
 authoritative copies are destroyed.
 
