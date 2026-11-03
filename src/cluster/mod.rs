@@ -218,6 +218,21 @@ impl Client {
         }
         result
     }
+    fn recovery_failed(&self, failure: &crate::durable::Error) {
+        use crate::durable::Error;
+        if matches!(
+            failure,
+            Error::Invalid(_)
+                | Error::Json(_)
+                | Error::Codec(_)
+                | Error::Store(StoreError::Corrupt(_) | StoreError::Invalid)
+        ) {
+            // A malformed model/replay must not leave an unavailable leader
+            // heartbeating forever. Epoch checks prevent a retired service from
+            // quarantining a healthy successor. Quorum/timeouts are retried.
+            let _ = self.read::<()>(|_| Err(error(failure)));
+        }
+    }
     fn current(&self) -> io::Result<()> {
         if self.active_session.load(Ordering::Acquire) != self.session
             || *self.role.borrow()
@@ -324,8 +339,49 @@ impl Store for ClusterStore {
         self.client.read(|db| db.end()).map_err(StoreError::from)
     }
     fn get_content(&self, key: ContentKey) -> Result<Option<Content>, StoreError> {
+        // This private adapter resolves references from the committed model.
+        // Absence is corruption, not an optional lookup: report it within read()
+        // so the Raft replica is fenced as well as the application worker.
         self.client
-            .read(|db| db.content(key))
+            .read(|db| {
+                db.content(key)?
+                    .map(Some)
+                    .ok_or_else(|| error("missing committed content"))
+            })
+            .map_err(StoreError::from)
+    }
+    fn get_contents(&self, keys: &[ContentKey]) -> Result<Vec<Content>, StoreError> {
+        self.client
+            .read(|db| {
+                keys.iter()
+                    .map(|key| {
+                        db.content(*key)?
+                            .ok_or_else(|| error("missing committed content"))
+                    })
+                    .collect()
+            })
+            .map_err(StoreError::from)
+    }
+    fn validate_content(
+        &self,
+        key: ContentKey,
+        subject: &str,
+        headers: u64,
+        payload: u64,
+    ) -> Result<(), StoreError> {
+        self.client
+            .read(|db| {
+                let content = db
+                    .content(key)?
+                    .ok_or_else(|| error("missing committed content"))?;
+                if content.subject != subject
+                    || content.headers.len() as u64 != headers
+                    || content.payload.len() as u64 != payload
+                {
+                    return Err(error("committed content reference mismatch"));
+                }
+                Ok(())
+            })
             .map_err(StoreError::from)
     }
     fn purge(&mut self) -> Result<(), StoreError> {
@@ -919,8 +975,13 @@ async fn run_runtime(
                 // Establish a current-term committed observation before recovery.
                 let prepared = tokio::task::spawn_blocking(move || {
                     client.activate()?;
-                    crate::jetstream::Handle::start_single_voter(ClusterStore { client })
-                        .map_err(error)
+                    let guard = client.clone();
+                    crate::jetstream::Handle::start_single_voter(ClusterStore { client }).map_err(
+                        |failure| {
+                            guard.recovery_failed(&failure);
+                            error(failure)
+                        },
+                    )
                 })
                 .await;
                 match prepared {
@@ -1022,13 +1083,16 @@ mod tests {
     use super::*;
     use crate::storage::Append;
     pub(super) fn config(id: u64) -> ClusterConfig {
+        config_size(id, 3)
+    }
+    fn config_size(id: u64, voters: u64) -> ClusterConfig {
         ClusterConfig {
             cluster_id: "simulation".into(),
             node_id: id,
             secret: "s".repeat(32),
             max_log_bytes: log_budget(),
             initial_voters: Vec::new(),
-            peers: (1..=3)
+            peers: (1..=voters)
                 .map(|n| {
                     (
                         n,
@@ -1049,15 +1113,19 @@ mod tests {
     }
     impl Simulation {
         fn new(root: &Path) -> Self {
+            Self::with_voters(root, 3)
+        }
+        fn with_voters(root: &Path, voters: u64) -> Self {
             let mut send = BTreeMap::new();
             let mut receive = Vec::new();
             let mut nodes = Vec::new();
-            for id in 1..=3 {
+            for id in 1..=voters {
                 let (tx, rx) = tokio::sync::mpsc::channel(1024);
                 send.insert(id, tx);
                 receive.push(rx);
                 let db = Arc::new(Mutex::new(
-                    Database::open(&root.join(id.to_string()), &config(id), true).unwrap(),
+                    Database::open(&root.join(id.to_string()), &config_size(id, voters), true)
+                        .unwrap(),
                 ));
                 let applied = db.lock().unwrap().hard().unwrap().commit;
                 let log = LogStorage { db };
@@ -1225,6 +1293,184 @@ mod tests {
         assert!(!membership::step_down_removed(&mut sim.nodes[0]));
     }
     #[test]
+    fn old_term_majority_cannot_commit_before_a_current_term_entry() {
+        use raft::eraftpb::{HardState, MessageType};
+        let dir = tempfile::tempdir().unwrap();
+        let mut sim = Simulation::with_voters(dir.path(), 5);
+        sim.nodes[0].campaign().unwrap();
+        sim.settle(None);
+        let initial = sim.nodes[0]
+            .store()
+            .db
+            .lock()
+            .unwrap()
+            .hard()
+            .unwrap()
+            .commit;
+        // Accept a prior-term application entry only on the old leader. No ACK
+        // was released. Elections may leave this entry on several replicas.
+        sim.propose(0, 1, b"prior-term");
+        pump(
+            &mut sim.nodes[0],
+            &mut BTreeMap::new(),
+            &sim.send,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let entry = sim.nodes[0]
+            .store()
+            .db
+            .lock()
+            .unwrap()
+            .entry(initial + 1)
+            .unwrap();
+        for rx in &mut sim.receive {
+            while rx.try_recv().is_ok() {}
+        }
+        sim.nodes[0].raft.become_follower(2, 0);
+        sim.nodes[0].raft.become_candidate();
+        sim.nodes[0].raft.become_leader();
+        pump(
+            &mut sim.nodes[0],
+            &mut BTreeMap::new(),
+            &sim.send,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let term = sim.nodes[0].raft.term;
+        let current = sim.nodes[0]
+            .store()
+            .db
+            .lock()
+            .unwrap()
+            .entry(entry.index + 1)
+            .unwrap();
+        assert_eq!(current.term, term);
+        for rx in &mut sim.receive {
+            while rx.try_recv().is_ok() {}
+        }
+        // Deliver real AppendEntries to two followers, withholding the new
+        // term's entry. Persist their responses through the production pump.
+        for (previous, record) in [(initial, entry.clone()), (entry.index, current.clone())] {
+            let previous_term = if previous == initial { 1 } else { entry.term };
+            for follower in [1, 2] {
+                sim.nodes[follower]
+                    .step(Message {
+                        msg_type: MessageType::MsgAppend,
+                        from: 1,
+                        to: follower as u64 + 1,
+                        term,
+                        index: previous,
+                        log_term: previous_term,
+                        commit: initial,
+                        entries: vec![record.clone()].into(),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                pump(
+                    &mut sim.nodes[follower],
+                    &mut BTreeMap::new(),
+                    &sim.send,
+                    &BTreeMap::new(),
+                )
+                .unwrap();
+            }
+            while let Ok(message) = sim.receive[0].try_recv() {
+                sim.nodes[0].step(message).unwrap();
+            }
+            pump(
+                &mut sim.nodes[0],
+                &mut BTreeMap::new(),
+                &sim.send,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            let db = sim.nodes[0].store().db.lock().unwrap();
+            if record.term < term {
+                assert_eq!(db.hard().unwrap().commit, initial);
+                assert_eq!(
+                    db.end().unwrap(),
+                    0,
+                    "old-term quorum released application state"
+                );
+            } else {
+                assert_eq!(db.hard().unwrap().commit, current.index);
+                assert_eq!(db.end().unwrap(), 1);
+                assert_eq!(
+                    db.content(ContentKey {
+                        generation: 1,
+                        sequence: 1
+                    })
+                    .unwrap()
+                    .unwrap()
+                    .payload,
+                    b"prior-term".as_slice()
+                );
+            }
+        }
+        // The persisted state, rather than an in-memory commit hint, survives.
+        let expected = HardState {
+            term,
+            vote: 1,
+            commit: current.index,
+            ..Default::default()
+        };
+        assert_eq!(
+            sim.nodes[0].store().db.lock().unwrap().hard().unwrap(),
+            expected
+        );
+    }
+    #[test]
+    fn campaign_persists_its_own_vote_before_sending_vote_requests_and_restart() {
+        use raft::eraftpb::MessageType;
+        let dir = tempfile::tempdir().unwrap();
+        let mut sim = Simulation::new(dir.path());
+        sim.nodes[0].raft.become_follower(1, 0);
+        sim.nodes[0].raft.become_candidate();
+        // Use the normal campaign path after a previous term/vote, as in #7956.
+        sim.nodes[0].raft.become_follower(2, 0);
+        sim.nodes[0].campaign().unwrap();
+        sim.settle(Some(1));
+        // Pre-vote cannot change durable term/vote without a quorum.
+        assert_eq!(
+            sim.nodes[0].store().db.lock().unwrap().hard().unwrap().term,
+            2
+        );
+        sim.nodes[0].raft.pre_vote = false;
+        sim.nodes[0].campaign().unwrap();
+        let term = sim.nodes[0].raft.term;
+        // Pump persists Ready hard state before exposing any protocol output.
+        pump(
+            &mut sim.nodes[0],
+            &mut BTreeMap::new(),
+            &sim.send,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let hard = sim.nodes[0].store().db.lock().unwrap().hard().unwrap();
+        assert_eq!((hard.term, hard.vote), (term, 1));
+        let mut requests = 0;
+        for rx in &mut sim.receive {
+            while let Ok(message) = rx.try_recv() {
+                if message.get_msg_type() == MessageType::MsgRequestVote {
+                    assert_eq!(message.term, hard.term);
+                    requests += 1;
+                }
+            }
+        }
+        assert_eq!(requests, 2);
+        drop(sim);
+        let sim = Simulation::new(dir.path());
+        assert_eq!(
+            sim.nodes[0].store().db.lock().unwrap().hard().unwrap(),
+            hard
+        );
+        assert_eq!(
+            sim.nodes[0].raft.prs().conf().to_conf_state().voters.len(),
+            3
+        );
+    }
+    #[test]
     fn authentication_binds_cluster_sender_and_complete_payload() {
         let mac = authenticate("secret", "cluster", 1, b"entry")
             .finalize()
@@ -1365,5 +1611,156 @@ mod checkpoint_tests {
             )
             .unwrap();
         assert!(store.load_checkpoint().is_err());
+    }
+}
+
+#[cfg(test)]
+mod application_failure_tests {
+    use super::*;
+    fn client(root: &Path) -> (Client, mpsc::Receiver<Input>) {
+        let config = super::tests::config(1);
+        let mut db = Database::open(&root.join("db"), &config, true).unwrap();
+        let key = ContentKey {
+            generation: 1,
+            sequence: 1,
+        };
+        let entry = raft::eraftpb::Entry {
+            index: 1,
+            term: 1,
+            data: postcard::to_allocvec(&Batch {
+                version: 1,
+                records: vec![],
+                contents: vec![Content {
+                    key,
+                    subject: "data".into(),
+                    headers: Bytes::new(),
+                    payload: Bytes::from_static(b"body"),
+                }],
+            })
+            .unwrap()
+            .into(),
+            ..Default::default()
+        };
+        db.persist(
+            &[entry],
+            Some(&raft::eraftpb::HardState {
+                term: 1,
+                vote: 1,
+                commit: 1,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        db.apply(1).unwrap();
+        let (_, role) = watch::channel(Role {
+            leader: 1,
+            term: 1,
+            configuration: 0,
+        });
+        let (tx, rx) = mpsc::sync_channel(4);
+        (
+            Client {
+                tx,
+                role,
+                db: Arc::new(Mutex::new(db)),
+                id: 1,
+                term: 1,
+                configuration: 0,
+                replicas: 3,
+                session: 0,
+                active_session: Arc::new(AtomicU64::new(0)),
+            },
+            rx,
+        )
+    }
+    #[test]
+    fn missing_required_content_and_invalid_references_fence_consensus() {
+        for kind in ["single", "batch", "reference"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (client, rx) = client(dir.path());
+            let db = client.db.clone();
+            let store = ClusterStore { client };
+            let key = ContentKey {
+                generation: 1,
+                sequence: 1,
+            };
+            let result = if kind == "reference" {
+                store.validate_content(key, "wrong-subject", 0, 4)
+            } else {
+                db.lock()
+                    .unwrap()
+                    .conn
+                    .execute("DELETE FROM body_index", [])
+                    .unwrap();
+                if kind == "single" {
+                    store.get_content(key).map(|_| ())
+                } else {
+                    store.get_contents(&[key]).map(|_| ())
+                }
+            };
+            assert!(result.is_err());
+            assert!(db.lock().unwrap().failed);
+            assert!(matches!(rx.try_recv(), Ok(Input::Fault)));
+        }
+    }
+    #[test]
+    fn malformed_recovery_fences_current_replica_but_epoch_changes_and_network_errors_do_not() {
+        use crate::durable::Error;
+        for kind in [
+            "invalid",
+            "json",
+            "codec",
+            "missing",
+            "network",
+            "session",
+            "term",
+            "configuration",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (client, rx) = client(dir.path());
+            let failure = match kind {
+                "json" => Error::Json(serde_json::from_str::<serde_json::Value>("{").unwrap_err()),
+                "codec" => Error::Codec(postcard::Error::DeserializeUnexpectedEnd),
+                "missing" => Error::Store(StoreError::Corrupt(1)),
+                "network" => Error::Store(
+                    io::Error::new(io::ErrorKind::TimedOut, "quorum unavailable").into(),
+                ),
+                _ => Error::Invalid("bad durable model"),
+            };
+            if kind == "session" {
+                client.active_session.store(1, Ordering::Release);
+            }
+            if kind == "term" {
+                client
+                    .db
+                    .lock()
+                    .unwrap()
+                    .persist(
+                        &[],
+                        Some(&raft::eraftpb::HardState {
+                            term: 2,
+                            commit: 1,
+                            ..Default::default()
+                        }),
+                    )
+                    .unwrap();
+            }
+            if kind == "configuration" {
+                client
+                    .db
+                    .lock()
+                    .unwrap()
+                    .conn
+                    .execute(
+                        "INSERT OR REPLACE INTO cluster_meta VALUES('conf_index',?1)",
+                        [1u64.to_le_bytes().as_slice()],
+                    )
+                    .unwrap();
+            }
+            client.recovery_failed(&failure);
+            let corrupt = matches!(kind, "invalid" | "json" | "codec" | "missing");
+            assert_eq!(client.db.lock().unwrap().failed, corrupt, "{kind}");
+            assert_eq!(matches!(rx.try_recv(), Ok(Input::Fault)), corrupt, "{kind}");
+        }
     }
 }
