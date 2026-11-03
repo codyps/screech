@@ -37,7 +37,8 @@ For a three- or five-voter Raft cluster, use `--cluster-config` and the separate
 cluster storage format. The [cluster operations guide](docs/cluster-operations.md)
 covers bootstrap, reconnects, failure recovery and current capacity limits.
 The [NATS-derived Jepsen/LazyFS harness](tools/jepsen/README.md) tests clustered
-publication durability with real filesystem cache loss, partitions and voter damage.
+publication and consumer ACK/lifecycle durability with real filesystem cache loss,
+partitions and voter damage.
 
 The binary prints `LISTEN host:port` after binding; `--port 0` selects an available
 port. SIGINT/SIGTERM cancel connection waits and bound output/runtime shutdown,

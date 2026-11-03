@@ -216,3 +216,42 @@ an inspection request that failed immediately on a transient gateway disconnect.
 The assurance checker rejected those attempts. The guest now includes the resolver
 tool, and final inspection retries disconnects within its bounded recovery window;
 both complete campaigns then passed. The scope limits above still apply.
+
+## Checked consumer runs
+
+Three- and five-voter consumer campaigns each passed all six LazyFS schedules.
+Each used one client per node, a one-cycle/s main generator, a 30-second fault
+phase and a 180-second final audit scheduling window, preceded by seeded fixtures.
+The main generator attempts at most two additional cycles per client.
+
+| Scenario | Three-voter confirmed ACKs | Five-voter confirmed ACKs |
+| --- | ---: | ---: |
+| `baseline` | 45 | 75 |
+| `power` | 17 | 27 |
+| `pause-kill` | 22 | 27 |
+| `partition` | 33 | 53 |
+| `corrupt` | 26 | 32 |
+| `wipe` | 32 | 46 |
+
+The 144 attempted cycles recorded 435 confirmed ACK responses and
+435 acknowledged publications. All required consumer/stream ACK floors,
+reservations, configuration, retention, deduplication and recreation obligations
+passed, including obligations from interrupted cycles. All 48 successful node
+audits and all twelve final voter-membership/durable-position inspections passed.
+The 48 real-mount canaries passed, alongside 95 acknowledged process-kill/cache-clear
+operations. This exercises ordinary automatic voter replacement without a separate
+recovery command.
+
+All saved histories were replayed against the final checker (`46d057f`), including
+its checks that both ACK floors preserve confirmed positions and stay behind pending
+reservations. Both replay reports passed. The checker suite passed 62 assertions
+across eight tests. A separate three-voter queue baseline passed to check the
+existing default workload after adding workload selection. No server changes were
+required; the binary hash matches the earlier queue campaigns above.
+
+The implementation is commit `9e03543`, followed by the ACK-floor oracle refinement
+in `46d057f`. Full histories, original results, `rechecked-consumers.json`, node logs,
+canaries and convergence records are retained under the ignored
+`results/jepsen-consumer-three/` and `results/jepsen-consumer-five/` directories.
+The compatibility history is in `results/jepsen-queue-compatibility/`. The runtime
+versions and single-kernel scope are the same as the queue runs.

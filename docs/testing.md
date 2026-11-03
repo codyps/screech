@@ -120,11 +120,26 @@ queue checker verifies publication retention globally and through every public
 node address. A separate final inspection verifies voter admission and durable
 application-position convergence.
 
+Use `--workloads consumer-lifecycle --rate 1 --final-time-limit 180` to check
+confirmed ACK floors, limits/interest/workqueue retention, pending reservations,
+publication deduplication and consumer deletion/recreation under the same faults.
+The workload seeds confirmed fixtures before faults and records each successful
+request even if a later request times out. Final audits check every public node,
+including old ACK tokens replayed against the recreated consumer. Use
+`--workloads queue,consumer-lifecycle` for both suites.
+
+Saved consumer histories can be checked again with:
+
+```sh
+python3 tools/jepsen/check.py --recheck results/jepsen-consumer-five
+```
+
 The runner exits nonzero for an invalid or incomplete campaign. Jepsen histories,
 loss plots, per-node logs, convergence evidence, runtime metadata and `results.json`
-remain under the selected ignored output directory. These tests cover publication
-and queue reads; Jepsen consumer ACK/lifecycle workloads and independent-machine
-power failure remain separate work. See the harness README for the exact limits
+remain under the selected ignored output directory. These histories cover
+publication and the consumer contracts above. Independent-machine power failure,
+retention count/age limits and additional stream/catalog operations remain separate
+work. See the harness README for the exact limits
 and the checked runs.
 
 ## Benchmarks

@@ -468,13 +468,23 @@ three/five-voter campaigns passed all twelve histories, retaining all 4,016
 acknowledged publications. See the harness README for setup, commands, artifacts
 and the exact checked contract.
 
+The consumer workload now records confirmed ACKs and partial cycle completions,
+then audits every public node after the same faults. Its fixtures check retained
+limits data and durable ACK floors, interest deletion only after both consumers
+ACK, workqueue deletion, pending reservations, consumer deletion/recreation,
+fencing of the old ACK token and deduplication of both retained and already-deleted
+messages. A later timeout cannot discard earlier confirmations or successful reads.
+The checker can also be replayed against saved histories without running servers.
+The recorded three/five-voter consumer campaigns passed all twelve histories and
+all 435 confirmed ACK obligations, then passed replay against the final checker.
+
 The assurance limits remain explicit. A healthy surviving quorum is required for
 repair; a consistent rollback of all local files including the watermark cannot be
 diagnosed locally. This review does not certify arbitrary storage/controller faults,
 or all network schedules. The existing guest-power-loss job exercises standalone
 mode. The LazyFS voters use separate networks and mounts in one guest kernel;
-independent-machine power-loss histories and Jepsen consumer ACK/lifecycle workloads
-remain production gates. The current snapshot transfer size/memory limits and
+independent-machine power-loss histories and broader consumer-option/catalog
+workloads remain production gates. The current snapshot transfer size/memory limits and
 serialized SQLite I/O still apply; these correctness histories are not throughput
 or tail-latency benchmarks. MQTT, leafnodes, gateways, JWT permission rules and other
 unimplemented NATS facilities are outside this durability review.
@@ -926,10 +936,11 @@ experimental branch after the Raft baseline. Do not ship two consensus modes.
 ### 6. Validate real failures and sustained load
 
 The [NATS-derived Jepsen/LazyFS harness](../tools/jepsen/README.md) supplies the
-publication workload with real loss of unsynced writes and final membership and
-durable-position checks. Extend it to independent machines and to consumer
-ACK/lifecycle operations as well as publication. Check safety throughout; require
-liveness only after a healthy quorum, usable disks and bounded scheduling return.
+publication and consumer ACK/lifecycle workloads with real loss of unsynced writes
+and final membership and durable-position checks. Extend these to independent
+machines, additional consumer options and stream/catalog lifecycle operations.
+Check safety throughout; require liveness only after a healthy quorum, usable disks
+and bounded scheduling return.
 
 Required histories:
 
