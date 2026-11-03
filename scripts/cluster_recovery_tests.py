@@ -256,8 +256,12 @@ def run(binary):
                 marker=cluster.root/'1'/'formation-fault'
                 cluster.start(1,extra_env={'SCREECH_FAULT_POINT':point,'SCREECH_FAULT_AFTER':'2','SCREECH_FAULT_ACTION':'hang','SCREECH_FAULT_MARKER':str(marker)})
                 cluster.start(2);cluster.start(3);wait_marker(cluster,1,marker);cluster.kill(1)
+                # A crash before certificate publication may leave neither other
+                # node with the complete proof. Resume ordinary startup before
+                # requiring first formation; a serving cluster may not exist yet.
+                cluster.start(1)
                 leader=cluster.wait_leader();c=cluster.client(leader);c.create();assert c.publish(b'formation-crash')==1;c.close()
-                cluster.start(1);wait_healed(cluster,1);verify(cluster,{1:b'formation-crash'},acked=False)
+                wait_healed(cluster,1);verify(cluster,{1:b'formation-crash'},acked=False)
                 results.append(dict(test='automatic startup survives initial formation SIGKILL at '+point,passed=True))
             finally:cluster.close()
     with tempfile.TemporaryDirectory(prefix='screech-interrupted-genesis-') as tmp:

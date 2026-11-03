@@ -20,7 +20,8 @@ static int matches(int fd, int sync_call) {
     if (size < 0) return 0;
     path[size] = 0;
     const char *target = getenv("SCREECH_IO_TARGET");
-    const char *suffix = target && !strcmp(target, "db") ? "data.db" : "data.db-wal";
+    const char *suffix = getenv("SCREECH_IO_SUFFIX");
+    if (!suffix) suffix = target && !strcmp(target, "db") ? "data.db" : "data.db-wal";
     size_t length = strlen(suffix);
     if ((size_t)size < length || strcmp(path+size-length, suffix)) return 0;
     /* Select a later sync, e.g. the commit after WAL-header synchronization. */

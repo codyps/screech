@@ -392,6 +392,78 @@ Make these explicit Screech invariants:
 6. Lost files cannot reset voting state or node identity. Blank replacements join
    as learners with new identities under a valid membership change.
 
+## NATS failure review against the implementation (November 2, 2026)
+
+This follow-up examines the implemented storage, Raft pump, startup supervisor and
+application adapter, rather than relying on the design above. It reads upstream
+issue reports, the relevant merged patches and their tests, including the
+[2.12.6 release fixes](https://github.com/nats-io/nats-server/releases/tag/v2.12.6).
+Reports describe particular versions and schedules; a matching symptom does not
+establish that different systems share a root cause. An issue title containing
+“FIXED” is not evidence that its proposed patch was merged.
+
+The review reproduced and fixed two gaps in Screech:
+
+- Missing content referenced by the committed model returned `None` from the
+  cluster adapter. The engine stopped serving durable work, but the Raft actor kept
+  heartbeating, preventing healthy replicas from taking over. Single and batch
+  content resolution now report missing references inside the epoch-checked
+  database operation, quarantining the replica. Recovery reference validation also
+  checks subject and lengths there. Structurally invalid application recovery now
+  fences the current replica; stale epochs and network timeouts do not quarantine
+  otherwise healthy storage.
+- Startup verified stored snapshot byte digests and payloads without checking the
+  application model before constructing Raft. A malformed model with intact file
+  digests could therefore become a voter. Startup now validates the complete model,
+  required content set and membership before enabling the actor. The fixed-size
+  group also explicitly requires the configured number of distinct nonzero voters
+  on snapshot installation, membership replay and configuration application. A
+  malformed configuration cannot silently reduce the required quorum to one.
+
+Both gaps have failing-before/passing-after regressions. The tests distinguish byte
+corruption from structurally invalid data whose envelope checksums still match.
+
+| Upstream failure class and primary sources | Screech boundary and regression evidence |
+| --- | --- |
+| Acknowledging writes without syncing; divergent replicas after an OS crash and pauses ([#7567](https://github.com/nats-io/nats-server/issues/7567)) | SQLite WAL FULL persists entries and hard state before the pump releases protocol messages. The local watermark must also sync before success. The new process tests intercept actual leader WAL sync calls and inject errors both before and after the real sync; neither produces a publication success, and the process heals from the quorum. This tests sync failure ordering, not a guest power failure. |
+| Standalone confirmed consumer ACK preceding state installation ([#8821](https://github.com/nats-io/nats-server/issues/8821)) | Strict consumer reservations, ACKs, retention and publication dedup are transitions in the authoritative log. The existing standalone consumer crash suite and strict-mode engine/TCP tests check confirmed ACK recovery. The new empty-checkpoint/full-cluster-kill history checks consumer ACK floors and dedup as well as payloads. The explicitly unsafe standalone ACK option retains its weaker contract. |
+| Corrupt records skipped during enumeration ([#7549](https://github.com/nats-io/nats-server/issues/7549), [#8632](https://github.com/nats-io/nats-server/issues/8632)) | Entry CRCs and snapshot SHA-256 checks propagate failures. A missing required body is now also a replica fault, including in a batch. The new live-content tests require an error/disconnect, automatic fencing and recovery of both the first and subsequent messages; a damaged record is never treated as a successful empty read. |
+| Minority snapshot corruption interpreted as an empty catalog and orphan cleanup ([#7556](https://github.com/nats-io/nats-server/issues/7556)) | One replicated group owns catalog, consumers and bodies; there is no orphan-directory cleanup driven by a separate metadata group. Startup validates the complete image before voting. Tests corrupt two of five voters, including the old leader, retain their damaged files, heal both and verify catalog, payloads and ACK floors. A separate test proves a checksum-valid malformed model waits without starting Raft. |
+| Older/out-of-order snapshots erasing newly created streams ([#5700](https://github.com/nats-io/nats-server/pull/5700), [#5946](https://github.com/nats-io/nats-server/pull/5946)) | Snapshots are tied to a committed term/index and cannot move behind the current commit/base. Recovery replays the committed tail after the snapshot. New tests deliver an older empty snapshot after stream creation, and kill all processes immediately after acknowledged stream/consumer creation over an older empty checkpoint. |
+| Stream update omitting existing consumers from an asynchronous metadata snapshot ([#7939](https://github.com/nats-io/nats-server/pull/7939), fixed in 2.12.6) | `State::apply_validated(Event::Update)` changes the stream configuration while retaining its consumer map. Checkpoint jobs capture a private persistent state root. A process history updates a stream with an ACKed and a pending delivery, checkpoints, restarts all voters and checks both consumer positions. |
+| Snapshot decode error ignored while the applied index advanced ([#7944](https://github.com/nats-io/nats-server/pull/7944)) | The event pump returns on installation failure before releasing messages or calling advance. A malformed-image test checks durable commit/view, Raft applied position and the outbound queue. Structural application recovery errors now also cause replica fencing rather than endless service-recovery retries. |
+| Committing prior-term entries by counting replicas ([#7955](https://github.com/nats-io/nats-server/pull/7955)) | Pinned raft-rs 0.7 requires the commit candidate's log term to match the current term. A five-voter test delivers actual persisted follower ACKs for an older-term majority while withholding the current-term entry: application state remains uncommitted until a current-term majority is persisted. |
+| Persisting an incremented candidate term with a stale vote ([#7956](https://github.com/nats-io/nats-server/pull/7956)) | Raft supplies one HardState; SQLite and the recovery watermark persist it before vote requests escape. A campaign/restart regression checks the durable self-vote, term, outgoing vote requests and restored group size. |
+| Membership replay collapsing cluster size to one ([#7850](https://github.com/nats-io/nats-server/pull/7850)) | Snapshot configuration and committed changes reconstruct membership before actor startup. Cardinality validation now enforces the unchanged configured voter count. Tests reject a checksum-valid singleton snapshot and restart a repaired voter alone after compaction: it cannot establish a serving leader. |
+| Membership changes combined with partitions and kills losing acknowledged records ([#7545](https://github.com/nats-io/nats-server/issues/7545)) | Replacement enrolls a learner, waits for durable catch-up, then uses explicit joint promotion/removal and leave-joint; it does not shrink the quorum on timeout. Existing histories cover interrupted joint apply, lost learners, quorum refusal, stale writers and writes during repair. These are targeted schedules rather than exhaustive membership/partition exploration. |
+| Consumer deletion/recreation colliding on a shared directory ([#8793](https://github.com/nats-io/nats-server/issues/8793)) | Consumers have committed generation identities, without independently created/deleted consumer-store directories. The new clustered history recreates the same name, submits an old ACK and checks the new consumer before and after a checkpoint and election. Existing model/standalone histories cover deletion, recreation and stale tokens. |
+| Disk stalls leaving valid ACKs ignored indefinitely ([#8789](https://github.com/nats-io/nats-server/issues/8789)) | The new interposer history hangs an actual leader WAL sync during an ACK, checks that no confirmation escapes, elects a healthy leader, redelivers the pending message and confirms its original late ACK. Restarting the stalled process heals it without resurrecting the acknowledged payload. |
+| Stream data and consumer offsets recovering to different histories ([#7693](https://github.com/nats-io/nats-server/issues/7693), [#8036](https://github.com/nats-io/nats-server/issues/8036)) | Stream/consumer state shares the same log and checkpoint. Model invariants reject consumer offsets ahead of the stream and inconsistent pending/history records. Recovery does not reset offsets to disguise lost messages. Existing crash histories plus the new full-restart/update tests check payload and consumer positions together. |
+| Snapshot reading racing with deletion/retention ([#8820](https://github.com/nats-io/nats-server/pull/8820), closed without merge) | This report concerns streaming backup semantics, which are distinct from a Raft recovery snapshot. Screech constructs a complete image under the storage ordering/lock boundary from a captured model root, verifies every required body and transfers immutable bytes. Existing recovery tests purge and compact the donor while a receiver is paused mid-transfer, then verify the recovered state. |
+| Shutdown/recovery errors deleting authoritative Raft storage ([#6061](https://github.com/nats-io/nats-server/pull/6061)) | Storage or service startup errors do not authorize deletion of a generation. The supervisor fences it and creates a fresh learner generation through the surviving quorum. Damaged-file, interrupted manifest/snapshot and learner-loss histories check this path; original generations remain available for diagnosis. |
+
+Run the targeted process histories with:
+
+```sh
+cargo build --locked --features fault-injection
+cc -shared -fPIC -O2 -Wall -Wextra -Werror -o sqlite-io-fault.so scripts/sqlite_io_fault.c -ldl
+python3 scripts/cluster_nats_regression_tests.py target/debug/screech-server --shim ./sqlite-io-fault.so
+```
+
+CI runs this suite together with the full Rust, cluster recovery and standalone
+fault suites. The new sync-failure selector in the test-only interposer preserves
+its original standalone defaults.
+
+The assurance limits remain explicit. A healthy surviving quorum is required for
+repair; a consistent rollback of all local files including the watermark cannot be
+diagnosed locally. This review does not certify arbitrary storage/controller faults,
+or all network schedules. The existing guest-power-loss job exercises standalone
+mode; multi-voter guest/LazyFS power-loss histories remain a production gate. The
+current snapshot transfer size/memory limits and serialized SQLite I/O still apply;
+these correctness histories are not throughput or tail-latency benchmarks. MQTT,
+leafnodes, gateways, JWT permission rules and other unimplemented NATS facilities
+are outside this durability review.
+
 ## Proposed engine and storage design
 
 ```mermaid

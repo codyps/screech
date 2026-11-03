@@ -72,8 +72,8 @@ Use exactly the same command for first startup, restart and repair:
 ```
 
 There are no bootstrap or join flags and no separate repair operation. On first
-formation, all configured initial voters must be reachable once. Each supplies an
-authenticated claim tied to its fresh local startup identity. The complete formation
+formation, all configured initial voters must be reachable until the formation
+certificate is established. Each supplies an authenticated claim tied to its fresh local startup identity. The complete formation
 certificate is persisted before voting. A partially completed formation resumes
 from that certificate; missing historical stores cannot issue fresh genesis votes.
 Later intact cluster restarts need a current voting majority.
