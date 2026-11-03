@@ -1,0 +1,6 @@
+{
+  "nats_harness": {"url": "https://github.com/jepsen-io/nats", "commit": "4760f97f86350c5c9983478656dbcbcdade33817"},
+  "lazyfs": {"url": "https://github.com/dsrhaslab/lazyfs", "commit": "9c5685e828da8b5d113d2f9134f6671e481d7162", "tag": "0.3.0"},
+  "jepsen": "0.3.10",
+  "jnats": "2.24.1"
+}
