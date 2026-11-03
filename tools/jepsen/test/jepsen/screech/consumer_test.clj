@@ -65,6 +65,9 @@
   (is (= 5 (:confirmed-acks (check-snapshot snapshot))))
   (doseq [[path value expected]
           [[[:streams "L_x" :consumers "D" :ack_floor :consumer_seq] 0 :confirmed-ack-rollback]
+           [[:streams "L_x" :consumers "D" :ack_floor :stream_seq] 0 :confirmed-stream-ack-rollback]
+           [[:streams "I_x" :consumers "E" :ack_floor :consumer_seq] 2 :ack-floor-passed-pending-delivery]
+           [[:streams "I_x" :consumers "E" :ack_floor :stream_seq] 2 :stream-ack-floor-passed-pending-message]
            [[:streams "W_x" :messages 1] {:body "work-removed"} :retention-resurrected]
            [[:streams "I_x" :messages 1] {:body "interest-removed"} :retention-resurrected]
            [[:streams "I_x" :messages 2] missing :lost-or-changed-payload]
