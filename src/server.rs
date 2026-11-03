@@ -39,6 +39,7 @@ pub struct Config {
     pub max_pings: usize,
     pub token: Option<String>,
     pub jetstream: Option<crate::jetstream::Handle>,
+    pub connect_urls: Vec<String>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -54,6 +55,7 @@ impl Default for Config {
             max_pings: 2,
             token: None,
             jetstream: None,
+            connect_urls: Vec::new(),
         }
     }
 }
@@ -1055,7 +1057,10 @@ async fn connection(
 ) -> io::Result<()> {
     socket.set_nodelay(true)?;
     let addr = socket.local_addr()?;
-    let info = serde_json::json!({"server_id":identity.to_string(),"server_name":"screech","version":env!("CARGO_PKG_VERSION"),"go":"rust","host":addr.ip().to_string(),"port":addr.port(),"headers":true,"max_payload":config.limits.payload,"proto":1,"client_id":id,"auth_required":config.token.is_some(),"tls_required":false,"jetstream":config.jetstream.is_some()});
+    let mut info = serde_json::json!({"server_id":identity.to_string(),"server_name":"screech","version":env!("CARGO_PKG_VERSION"),"go":"rust","host":addr.ip().to_string(),"port":addr.port(),"headers":true,"max_payload":config.limits.payload,"proto":1,"client_id":id,"auth_required":config.token.is_some(),"tls_required":false,"jetstream":config.jetstream.is_some()});
+    if !config.connect_urls.is_empty() {
+        info["connect_urls"] = serde_json::json!(config.connect_urls);
+    }
     timeout(
         config.write_deadline,
         socket.write_all(format!("INFO {info}\r\n").as_bytes()),

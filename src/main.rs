@@ -156,6 +156,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cluster_flags_require_explicit_storage_and_exclude_standalone_modes() {
+        assert!(Args::try_parse_from(["screech", "--cluster-config", "cluster.json"]).is_err());
+        assert!(Args::try_parse_from(["screech", "--cluster-bootstrap"]).is_err());
+        for flag in ["--single-voter", "--unsafe-ack-durability"] {
+            assert!(Args::try_parse_from([
+                "screech",
+                "--store",
+                "db",
+                "--cluster-config",
+                "cluster.json",
+                flag
+            ])
+            .is_err());
+        }
+        let args = Args::try_parse_from([
+            "screech",
+            "--store",
+            "db",
+            "--cluster-config",
+            "cluster.json",
+            "--cluster-bootstrap",
+        ])
+        .unwrap();
+        assert!(args.cluster_bootstrap);
+    }
+
+    #[test]
     fn single_voter_requires_store_and_forbids_unsafe_ack() {
         assert!(Args::try_parse_from(["screech", "--single-voter"]).is_err());
         assert!(Args::try_parse_from([

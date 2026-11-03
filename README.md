@@ -33,6 +33,10 @@ run there. Durable requests wait for completion in order; Core traffic and socke
 heartbeats continue independently. There is no cluster availability or performance
 claim.
 
+For a three- or five-voter Raft cluster, use `--cluster-config` and the separate
+cluster storage format. The [cluster operations guide](docs/cluster-operations.md)
+covers bootstrap, reconnects, failure recovery and current capacity limits.
+
 The binary prints `LISTEN host:port` after binding; `--port 0` selects an available
 port. SIGINT/SIGTERM cancel connection waits and bound output/runtime shutdown,
 including a wedged storage worker. `--storage-deadline-ms` bounds client storage
@@ -51,7 +55,8 @@ the default listen address is loopback.
 | Consumers | Durable pull/push, queue push, filters and delivery policies, ACK/ACK-All/NAK/progress/TERM/ACK-and-next, backoff, delivery limits and advisories, selected live configuration updates |
 | Retention and deduplication | Limits/interest/workqueue, count/byte/per-subject/age limits, discard old/new, persistent `Nats-Msg-Id` windows |
 | Storage | SQLite WAL FULL, atomic state checkpoints/log reclamation, corruption checks and generation fencing |
-| Remaining | Clustering, TLS/NKey/JWT/accounts, WebSockets, replay-original/advanced flow control and priority consumers, KV/object stores, per-message TTL/rollup, online backup/restore, monitoring/configuration reload |
+| Clustering | Fixed three/five-voter Raft group, complete payload replication, elections, leader routing, quorum reads and restart recovery |
+| Remaining | Dynamic membership/log compaction, TLS/NKey/JWT/accounts, WebSockets, replay-original/advanced flow control and priority consumers, KV/object stores, per-message TTL/rollup, online backup/restore, monitoring/configuration reload |
 
 `INFO.jetstream=true` with `--store` announces this experimental subset. Unsupported
 configuration returns errors; this is not complete JetStream compatibility. Core

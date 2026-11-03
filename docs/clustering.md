@@ -4,8 +4,35 @@ Re-reviewed November 2, 2026 against
 `55180229d3d1333dde425d4370cead697e40ba7e`, including the storage, durable model,
 worker, TCP output paths, tests and CI gates. The first review used `e9dd571`;
 the intervening content-paging and unsafe-ACK changes materially change this plan.
-The local NATS investigation is supporting evidence. This is a proposal, not an
-implemented or benchmarked cluster.
+The local NATS investigation is supporting evidence. The fixed-membership Raft
+baseline is now implemented; the broader production gates remain this plan's scope.
+
+## Implementation status: fixed-membership Raft
+
+`--cluster-config` enables a separate consensus store and a real Raft 0.7.0 event
+pump for three or five voters. Term/vote state and complete accepted entries persist
+before protocol responses. Application indexes point into the committed entries;
+they never give an accepted suffix application authority. Physical entry identity
+includes term/index, so suffix replacement does not alias committed content.
+
+All public nodes proxy client connections to the elected leader. The leader's
+existing model owns stream/consumer decisions and Core interest. Quorum barriers
+protect model reads; successful mutations follow quorum commitment. Leadership
+changes close client connections and a replacement leader recovers its local
+committed model. INFO advertises public reconnect endpoints. This deliberately
+uses connection-level forwarding before distributed Core interest routing.
+
+Static bootstrap is explicit, and ordinary startup refuses lost storage. A returning
+replica catches up from the complete retained log. Checkpoint caches are checksummed
+and never reclaim consensus history. Log-byte admission bounds retained history;
+compaction/snapshot transport, dynamic membership, safe voter replacement and
+standalone import remain future work. They are not implied by this baseline's
+functional failover tests. See [operations and limits](cluster-operations.md).
+
+Tests include real three/five-process failures, consumer ACK/dedup recovery, minority
+refusal and full restart, plus the actual Raft/storage implementation under reversed,
+duplicated and partitioned messages with conflicting accepted payloads. These are
+correctness evidence for the initial crash model, not performance certification.
 
 ## Implementation status: single-voter storage executor
 
@@ -36,12 +63,11 @@ promise durable atomic appends.
 - Engine and TCP tests cover delayed completion, retained content, failed writes,
   checkpoints, generated equivalence to standalone, ACK recovery and reply order.
 
-This is not the completion of phase 1 or a Raft implementation. Storage work is off
-the durable worker, but its waiting adapter still serializes durable requests.
-Multiple proposals, a nonblocking consensus event pump, epoch/stepdown handling and a deterministic network/timer simulator
-remain. Proposal task identity is local to an engine lifetime. Conflict-safe
-replicated content identities, hard state, accepted-suffix recovery and snapshot
-transfer require a new consensus storage format before adding multiple voters.
+The single-voter waiting adapter still serializes durable requests. The clustered
+mode now has its own consensus pump, leadership lifecycle and accepted-suffix store.
+Multiple outstanding application proposals, asynchronous physical storage for the
+consensus pump and a fuller network/disk fault simulator remain. Single-voter
+proposal task identity is local to an engine lifetime; it is not a Raft entry ID.
 The current `(generation, sequence)` content identity remains valid only because
 this mode never persists a replaceable uncommitted suffix. Background checkpoints
 and concurrent GC are not enabled.

@@ -546,6 +546,11 @@ pub async fn run(
     // including Core subscriptions and pull inboxes, through this one owner.
     let connection_limit = server_config.max_connections;
     server_config.listen = peer.service;
+    server_config.connect_urls = config
+        .peers
+        .values()
+        .map(|p| p.client.to_string())
+        .collect();
     let service_config = config.clone();
     let service_tx = tx.clone();
     let service_db = db.clone();
@@ -599,7 +604,9 @@ pub async fn run(
                     }
                     Ok(Err(e)) => {
                         tracing::error!(%e, "leader recovery failed");
-                        if *service_role.borrow() == current {
+                        // A network/leadership error during recovery is retried;
+                        // only an observed storage fault quarantines the replica.
+                        if service_db.lock().unwrap().failed {
                             let _ = service_tx.try_send(Input::Fault);
                         }
                     }
