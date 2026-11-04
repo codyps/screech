@@ -232,19 +232,33 @@ impl Client {
     }
     fn read<R>(&self, f: impl FnOnce(&mut Database) -> io::Result<R>) -> io::Result<R> {
         self.current()?;
+        let gate = self.db.lock().unwrap().gate.clone();
+        let _gate = gate.lock().unwrap();
         let mut db = self.db.lock().unwrap();
         // A configuration/term can become durable before the watch is published,
         // or while this caller waits for storage. This is stale work, not damage.
         self.current()?;
-        if db.hard()?.term != self.term || db.conf_index()? != self.configuration {
-            return Err(error("application epoch changed"));
+        if db.failed {
+            return Err(error("replica quarantined"));
         }
-        let result = f(&mut db);
-        if result.is_err() {
+        // Epoch checks and all content lookups share a SQLite read snapshot.
+        // The gate excludes the owner's uncommitted projection and checkpoints;
+        // FULL checkpoint transactions can still suspend and resume this scope.
+        let mut stale = false;
+        let result = (|| {
+            db.begin_projection()?;
+            if db.hard()?.term != self.term || db.conf_index()? != self.configuration {
+                stale = true;
+                return Err(error("application epoch changed"));
+            }
+            f(&mut db)
+        })();
+        let finished = db.finish_projection(result.is_ok());
+        if (result.is_err() && !stale) || finished.is_err() {
             db.failed = true;
             let _ = self.tx.try_send(Input::Fault);
         }
-        result
+        finished.and(result)
     }
     fn recovery_failed(&self, failure: &crate::durable::Error) {
         use crate::durable::Error;
@@ -419,8 +433,6 @@ impl Store for ClusterStore {
     fn checkpoint_job(&mut self, seq: u64, job: CheckpointJob) -> Result<(), StoreError> {
         self.client.current()?;
         let image = job()?;
-        let gate = self.client.db.lock().unwrap().gate.clone();
-        let _gate = gate.lock().unwrap();
         self.client
             .read(move |db| db.compact(seq, image))
             .map_err(StoreError::from)
@@ -1961,6 +1973,37 @@ mod checkpoint_tests {
 #[cfg(test)]
 mod application_failure_tests {
     use super::*;
+    #[test]
+    fn content_reader_waits_for_projection_commit_and_cannot_see_a_rolled_back_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, _requests) = client(dir.path());
+        let database = client.db.clone();
+        let gate = database.lock().unwrap().gate.clone();
+        let owner = gate.lock().unwrap();
+        {
+            let mut db = database.lock().unwrap();
+            db.begin_projection().unwrap();
+            db.conn
+                .execute("INSERT INTO event_index VALUES(1,1,0)", [])
+                .unwrap();
+        }
+        let (started, waiting) = mpsc::channel();
+        let (done, result) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            done.send(client.read(|db| db.end())).unwrap();
+        });
+        waiting.recv().unwrap();
+        let early = result.recv_timeout(Duration::from_millis(100));
+        database.lock().unwrap().finish_projection(false).unwrap();
+        drop(owner);
+        reader.join().unwrap();
+        assert!(
+            matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
+            "reader exposed an uncommitted projection: {early:?}"
+        );
+        assert_eq!(result.recv().unwrap().unwrap(), 0);
+    }
     fn client(root: &Path) -> (Client, mpsc::Receiver<Input>) {
         let config = super::tests::config(1);
         let mut db = Database::open(&root.join("db"), &config, true).unwrap();
