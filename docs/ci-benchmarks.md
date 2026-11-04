@@ -35,7 +35,7 @@ trials. Core-on-stream uses durable ACK p99; Fetch(1) uses the full Fetch/ACK cy
 p99. One-trial runs cannot certify the target. Main CI also preserves this report
 with the published benchmark artifacts.
 The focused workflow also captures CPU stacks and disk/syscall summaries across
-all three voters, including per-file sync latency distributions. Separate publication-phase gates exclude setup and payload
+all five voters, including per-file sync latency distributions. Separate publication-phase gates exclude setup and payload
 validation; these diagnostic timings never count toward the performance target.
 
 ## Storage modes
