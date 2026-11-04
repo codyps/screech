@@ -559,7 +559,7 @@ def run(args):
     token_path.chmod(0o600)
     prepare_cluster(args, runtime, output)
     active_scenarios = {'vm-active-write', 'vm-active-flush', 'vm-torn', 'vm-eio-write', 'vm-eio-flush'}
-    fault_disks = bool(active_scenarios & set(args.scenarios.split(',')))
+    fault_disks = args.fault_disks or bool(active_scenarios & set(args.scenarios.split(',')))
     cluster = Cluster(runtime, output, token, args.nodes, args.memory, fault_disks)
     class Coordinator(Control):
         def dispatch(self, request):
@@ -631,5 +631,6 @@ if __name__ == '__main__':
     parser.add_argument('--time-limit', type=int, default=60)
     parser.add_argument('--final-time-limit', type=int, default=180)
     parser.add_argument('--memory', type=int, default=1024)
+    parser.add_argument('--fault-disks', action='store_true', help='Use volatile NBD devices even without an active-I/O scenario')
     parser.add_argument('--timeout', type=int, default=3600)
     raise SystemExit(run(parser.parse_args()))
