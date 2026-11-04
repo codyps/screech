@@ -97,6 +97,7 @@ struct Worker<S> {
     pulls: VecDeque<Pull>,
     observer: Arc<RwLock<Option<Interest>>>,
     interests: Arc<RwLock<Vec<String>>>,
+    quorum_observed: bool,
 }
 impl Handle {
     pub fn start<S: Store + 'static>(store: S) -> Result<Self, durable::Error> {
@@ -143,6 +144,7 @@ impl Handle {
                 pulls: VecDeque::new(),
                 observer: worker_observer,
                 interests: worker_interests,
+                quorum_observed: false,
             };
             let mut deferred = None;
             let mut idle_wait = Duration::from_millis(10);
@@ -176,6 +178,9 @@ impl Handle {
                     rx.recv_timeout(idle_wait)
                 });
                 poll_after_reply = false;
+                // A fresh client request must obtain its own observation. Only
+                // requests already in flight in this turn can share a commit.
+                worker.quorum_observed = false;
                 match next {
                     Ok(req) if worker.groupable(&req.message) => {
                         crate::fault::group_gate();
@@ -709,11 +714,13 @@ impl<S: Store> Worker<S> {
         ingress: &std_mpsc::Receiver<Request>,
         deferred: &mut Option<Request>,
     ) {
-        if let Err(error) = self.engine.read_barrier() {
-            for request in requests {
-                let _ = request.response.send(Err(error.to_string()));
+        if self.engine.replicas() == 1 {
+            if let Err(error) = self.engine.read_barrier() {
+                for request in requests {
+                    let _ = request.response.send(Err(error.to_string()));
+                }
+                return;
             }
-            return;
         }
         let pulls_before = self.engine.voter_progress().map(|_| self.pulls.clone());
         match self.engine.begin_group() {
@@ -764,7 +771,11 @@ impl<S: Store> Worker<S> {
         }
         let plan = self.plan.take().unwrap();
         let multiple = plan.len() > 1;
-        let mut committed = self.commit_plan(plan);
+        let mut committed = if plan.is_empty() && self.engine.replicas() > 1 {
+            self.barrier().and_then(|()| self.commit_plan(plan))
+        } else {
+            self.commit_plan(plan)
+        };
         if committed.is_err() {
             if let Some(pulls) = pulls_before {
                 self.pulls = pulls;
@@ -843,11 +854,21 @@ impl<S: Store> Worker<S> {
             plan.commit(event).map_err(|e| e.to_string())?;
             self.commit_plan(plan)
         } else {
-            self.engine.commit(event).map_err(|e| e.to_string())
+            self.engine.commit(event).map_err(|e| e.to_string())?;
+            self.quorum_observed = true;
+            Ok(())
         }
     }
     fn commit_plan(&mut self, plan: durable::GroupPlan) -> Result<(), String> {
-        self.engine.commit_group(plan).map_err(|e| e.to_string())
+        let changed = !plan.is_empty();
+        self.engine.commit_group(plan).map_err(|e| e.to_string())?;
+        self.quorum_observed |= changed;
+        Ok(())
+    }
+    fn barrier(&mut self) -> Result<(), String> {
+        self.engine.read_barrier().map_err(|e| e.to_string())?;
+        self.quorum_observed = true;
+        Ok(())
     }
     fn expire(&mut self) -> Result<(), String> {
         let time = self.time();
@@ -900,8 +921,10 @@ impl<S: Store> Worker<S> {
         Ok(())
     }
     fn handle(&mut self, msg: Message) -> Result<bool, String> {
-        if self.plan.is_none() {
-            self.engine.read_barrier().map_err(|e| e.to_string())?;
+        if self.plan.is_none()
+            && (self.engine.replicas() == 1 || msg.subject.starts_with("$JS.API."))
+        {
+            self.barrier()?;
         }
         if self.engine.is_poisoned() {
             return Err("Storage failed: restart required".into());
@@ -964,6 +987,9 @@ impl<S: Store> Worker<S> {
             return Ok(false);
         };
         if let Some(seq) = self.state().streams[&stream].duplicate(&msg.headers, self.time()) {
+            if self.plan.is_none() && self.engine.replicas() > 1 {
+                self.barrier()?;
+            }
             if let Some(reply) = msg.reply {
                 self.emit(response(
                     reply,
@@ -1009,6 +1035,9 @@ impl<S: Store> Worker<S> {
                 }
             }
             Err(e) => {
+                if self.plan.is_none() && self.engine.replicas() > 1 {
+                    self.barrier()?;
+                }
                 if let Some(reply) = msg.reply {
                     self.emit(response(reply, err("pub_ack", &e.to_string())))?;
                 }
@@ -1715,11 +1744,13 @@ impl<S: Store> Worker<S> {
         replied
     }
     fn ack_requests(&mut self, mut requests: Vec<Request>) -> (bool, Vec<Request>) {
-        if let Err(error) = self.engine.read_barrier() {
-            for request in requests.drain(..) {
-                let _ = request.response.send(Err(error.to_string()));
+        if self.engine.replicas() == 1 {
+            if let Err(error) = self.engine.read_barrier() {
+                for request in requests.drain(..) {
+                    let _ = request.response.send(Err(error.to_string()));
+                }
+                return (false, requests);
             }
-            return (false, requests);
         }
         if requests.len() == 1 {
             // A standalone ACK needs neither an event list nor a valid-request list.
@@ -1764,11 +1795,12 @@ impl<S: Store> Worker<S> {
             self.engine.checkpoint().map_err(|e| e.to_string())?;
         }
         if self.plan.is_none()
+            && (self.engine.replicas() == 1 || !self.quorum_observed)
             && (!self.pulls.is_empty()
                 || self.has_push()
                 || self.state().expiration_needed(self.time()))
         {
-            self.engine.read_barrier().map_err(|e| e.to_string())?;
+            self.barrier()?;
         }
         self.engine
             .flush_consumer_state(false)
