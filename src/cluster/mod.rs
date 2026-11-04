@@ -808,8 +808,14 @@ async fn run_runtime(
     let clients = TcpListener::bind(peer.client).await?;
     let db = Arc::new(Mutex::new(database));
     let (tx, rx) = mpsc::sync_channel(256);
-    let _page_checkpointer = if let Some(path) = db.lock().unwrap().conn.path() {
-        Some(storage::PageCheckpointer::start(path.into(), tx.clone())?)
+    let checkpoint_path = db.lock().unwrap().conn.path().map(std::path::PathBuf::from);
+    let _page_checkpointer = if let Some(path) = checkpoint_path {
+        let fault = tx.clone();
+        Some(
+            tokio::task::spawn_blocking(move || storage::PageCheckpointer::start(path, fault))
+                .await
+                .map_err(error)??,
+        )
     } else {
         None
     };
@@ -818,25 +824,31 @@ async fn run_runtime(
     let incarnation = db.lock().unwrap().incarnation;
     let out = network(&config, tx.clone(), stop_rx.clone(), incarnation).await;
     let log = LogStorage { db: db.clone() };
-    let raft_config = raft::Config {
-        id: config.node_id,
-        election_tick: 15,
-        heartbeat_tick: 2,
-        check_quorum: true,
-        pre_vote: true,
-        max_size_per_msg: 1024 * 1024,
-        max_inflight_msgs: 8,
-        applied: db.lock().unwrap().hard()?.commit,
-        ..Default::default()
-    };
-    let logger = slog::Logger::root(slog::Discard, slog::o!());
-    let mut node = RawNode::new(&raft_config, log, &logger).map_err(error)?;
+    let member = config.node_id;
+    let mut node = tokio::task::spawn_blocking(move || {
+        let raft_config = raft::Config {
+            id: member,
+            election_tick: 15,
+            heartbeat_tick: 2,
+            check_quorum: true,
+            pre_vote: true,
+            max_size_per_msg: 1024 * 1024,
+            max_inflight_msgs: 8,
+            applied: log.db.lock().unwrap().hard()?.commit,
+            ..Default::default()
+        };
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+        RawNode::new(&raft_config, log, &logger).map_err(error)
+    })
+    .await
+    .map_err(error)??;
     let active_session = Arc::new(AtomicU64::new(0));
     hub.install(startup::Active {
         config: config.clone(),
         tx: tx.clone(),
         role: role.clone(),
         db: db.clone(),
+        incarnation,
         session: active_session.clone(),
     });
     let actor_session = active_session.clone();
@@ -1520,6 +1532,8 @@ mod tests {
               CREATE TABLE projection_parent(id INTEGER PRIMARY KEY);
               CREATE TABLE projection_guard(id INTEGER REFERENCES projection_parent(id) DEFERRABLE INITIALLY DEFERRED);
               CREATE TRIGGER fail_projection AFTER INSERT ON cluster_meta WHEN NEW.key='view'
+              BEGIN INSERT INTO projection_guard VALUES(99); END;
+              CREATE TRIGGER fail_projection_update AFTER UPDATE ON cluster_meta WHEN NEW.key='view'
               BEGIN INSERT INTO projection_guard VALUES(99); END;").unwrap();
             db.view().unwrap()
         };

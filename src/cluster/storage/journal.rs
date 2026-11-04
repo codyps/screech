@@ -301,6 +301,9 @@ impl Watermark {
         signed.extend_from_slice(&(body.len() as u64).to_le_bytes());
         signed.extend_from_slice(&body);
         let hash = self.journal_mac(b"accepted", &signed);
+        // The signed suffix is also the complete on-disk record. Send its
+        // length, body and digest together, retaining the same sync barrier.
+        signed.extend_from_slice(&hash);
         let generation = j
             .generation
             .checked_add(1)
@@ -318,9 +321,7 @@ impl Watermark {
         }
         crate::fault::point("before_cluster_watermark");
         j.file.seek(SeekFrom::Start(j.seal.end))?;
-        j.file.write_all(&(body.len() as u64).to_le_bytes())?;
-        j.file.write_all(&body)?;
-        j.file.write_all(&hash)?;
+        j.file.write_all(&signed[16 + 8 + 32..])?;
         j.file
             .seek(SeekFrom::Start(generation % 2 * SLOT_BYTES as u64))?;
         j.file.write_all(&frame)?;
@@ -437,7 +438,7 @@ impl Database {
             None,
         )?;
         tx.execute(
-            "INSERT OR REPLACE INTO cluster_meta VALUES('hard',?1)",
+            "INSERT INTO cluster_meta VALUES('hard',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             [hard.write_to_bytes().map_err(error)?],
         )
         .map_err(error)?;
@@ -459,7 +460,7 @@ impl Database {
             // are allowed until this root and its journal are both published.
             self.commit_transaction(true, |tx| {
                 tx.execute(
-                    "INSERT OR REPLACE INTO cluster_meta VALUES('journal_root',?1)",
+                    "INSERT INTO cluster_meta VALUES('journal_root',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     [&root],
                 )
                 .map_err(error)?;

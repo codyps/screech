@@ -213,7 +213,7 @@ impl Database {
         db.conn.execute_batch("DELETE FROM event_index;DELETE FROM body_index;DELETE FROM cluster_meta WHERE key='view';").map_err(error)?;
         db.conn
             .execute(
-                "INSERT OR REPLACE INTO cluster_meta VALUES('view',?1)",
+                "INSERT INTO cluster_meta VALUES('view',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 [base.to_le_bytes().as_slice()],
             )
             .map_err(error)?;
@@ -373,7 +373,7 @@ impl Database {
                 }
             }
             if let Some(h) = hard {
-                tx.prepare_cached("INSERT OR REPLACE INTO cluster_meta VALUES('hard',?1)")
+                tx.prepare_cached("INSERT INTO cluster_meta VALUES('hard',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
                     .map_err(error)?
                     .execute([h.write_to_bytes().map_err(error)?])
                     .map_err(error)?;
@@ -441,7 +441,7 @@ impl Database {
                 }
                 results.push((entry.context.to_vec(), end));
             }
-            tx.prepare_cached("INSERT OR REPLACE INTO cluster_meta VALUES('view',?1)")
+            tx.prepare_cached("INSERT INTO cluster_meta VALUES('view',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
                 .map_err(error)?
                 .execute([commit.to_le_bytes().as_slice()])
                 .map_err(error)?;

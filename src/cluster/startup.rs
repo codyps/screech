@@ -38,6 +38,7 @@ pub(super) struct Active {
     pub tx: mpsc::SyncSender<Input>,
     pub role: watch::Receiver<Role>,
     pub db: Arc<Mutex<Database>>,
+    pub incarnation: [u8; 16],
     pub session: Arc<AtomicU64>,
 }
 #[derive(Clone)]
@@ -152,6 +153,12 @@ fn save(config: &ClusterConfig, path: &Path, record: &Record) -> io::Result<()> 
     crate::fault::point("after_cluster_startup_manifest");
     Ok(())
 }
+async fn save_record(config: &ClusterConfig, path: &Path, record: &Record) -> io::Result<()> {
+    let (config, path, record) = (config.clone(), path.to_path_buf(), record.clone());
+    tokio::task::spawn_blocking(move || save(&config, &path, &record))
+        .await
+        .map_err(error)?
+}
 impl Hub {
     pub fn install(&self, active: Active) {
         self.0.write().unwrap().active = Some(active);
@@ -200,8 +207,9 @@ impl Hub {
                         session: active.session.load(Ordering::Acquire),
                         active_session: active.session,
                     };
-                    // This is a logged observation, never a cached leader hint.
-                    client.propose(Vec::new())?;
+                    // Establish a fresh quorum observation without appending
+                    // another entry for every recovery status poll.
+                    client.barrier()?;
                     if let Some((slot, member, nonce)) = action {
                         if active_config.peers.contains_key(&member)
                             || u64::from_le_bytes(nonce[..8].try_into().unwrap()) != slot
@@ -477,7 +485,7 @@ pub async fn run(
     lock.try_lock_exclusive()?;
     let manifest = store.with_extension("node-state");
     let mut record = record_for(&config, &store, &manifest)?;
-    save(&config, &manifest, &record)?;
+    save_record(&config, &manifest, &record).await?;
     let hub = Hub(Arc::new(RwLock::new(Shared {
         record: record.clone(),
         active: None,
@@ -524,15 +532,18 @@ pub async fn run(
                 if let Some(proof) = proof {
                     // Persist the formation agreement before any Raft voting.
                     record.certificate = Some(proof);
-                    save(&config, &manifest, &record)?;
+                    save_record(&config, &manifest, &record).await?;
                     hub.update(&record);
-                    let db = open_genesis(&config, &store)?;
+                    let (opening, path) = (config.clone(), store.clone());
+                    let db = tokio::task::spawn_blocking(move || open_genesis(&opening, &path))
+                        .await
+                        .map_err(error)??;
                     record.instance = Some(Instance {
                         member: config.node_id,
                         path: store.clone(),
                     });
                     record.virgin = false;
-                    save(&config, &manifest, &record)?;
+                    save_record(&config, &manifest, &record).await?;
                     hub.update(&record);
                     database = Some(db);
                 }
@@ -541,10 +552,13 @@ pub async fn run(
             // A live quorum authorizes a new incarnation, even for a valid but
             // stale local image. Never vote using state that the quorum supersedes.
             existing.take();
-            let (instance, db) = new_instance(&config, &store)?;
+            let (opening, path) = (config.clone(), store.clone());
+            let (instance, db) = tokio::task::spawn_blocking(move || new_instance(&opening, &path))
+                .await
+                .map_err(error)??;
             record.instance = Some(instance);
             record.virgin = false;
-            save(&config, &manifest, &record)?;
+            save_record(&config, &manifest, &record).await?;
             hub.update(&record);
             database = Some(db);
         }
@@ -566,20 +580,29 @@ pub async fn run(
                     result=&mut task=>{hub.clear();if let Ok(Err(e))=result{tracing::error!(%e,"node restarting in recovery mode");}break;}
                     _=tokio::time::sleep(Duration::from_millis(300))=>{
                         let active = hub.0.read().unwrap().active.clone();
-                        let enrolled = active.as_ref().is_some_and(|a| {
+                        let enrolled = if let Some(a) = active {
+                            let member = instance.member;
+                            tokio::task::spawn_blocking(move || {
                             if a.role.borrow().leader == 0 { return false; }
-                            let db = a.db.lock().unwrap();
+                            // This is an advisory recovery poll. Never stop
+                            // socket progress behind the owner's disk sync.
+                            let db = match a.db.try_lock() {
+                                Ok(db) => db,
+                                Err(std::sync::TryLockError::WouldBlock) => return true,
+                                Err(std::sync::TryLockError::Poisoned(_)) => return false,
+                            };
                             let Ok(conf) = db.conf() else { return false; };
                             let Ok(state) = db.membership() else { return false; };
-                            conf.voters.iter().chain(&conf.learners).chain(&conf.voters_outgoing).any(|id| *id == instance.member)
-                                && state.identities.get(&instance.member).copied().unwrap_or([0;16]) == db.incarnation
-                        });
+                            conf.voters.iter().chain(&conf.learners).chain(&conf.voters_outgoing).any(|id| *id == member)
+                                && state.identities.get(&member).copied().unwrap_or([0;16]) == db.incarnation
+                            }).await.unwrap_or(false)
+                        } else { false };
                         // Healthy members already exchange Raft heartbeats. Only
-                        // formation/recovery needs the logged discovery barrier.
+                        // formation/recovery needs the quorum discovery barrier.
                         if enrolled { continue; }
                         let statuses=inspect(&config).await;
                         if let Some((leader_slot,view))=statuses.iter().find_map(|s|s.leader.as_ref().map(|v|(s.slot,v))) {
-                            let nonce=hub.0.read().unwrap().active.as_ref().map(|a|a.db.lock().unwrap().incarnation);
+                            let nonce=hub.0.read().unwrap().active.as_ref().map(|a|a.incarnation);
                             let active_here=view.voters.iter().chain(&view.learners).chain(&view.outgoing).any(|id|*id==instance.member && view.identities.get(id).copied().unwrap_or([0;16])==nonce.unwrap_or([255;16]));
                             if !active_here {
                                 if config.peers.contains_key(&instance.member) || view.retired.contains_key(&instance.member) {

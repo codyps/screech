@@ -190,17 +190,17 @@ impl Database {
         }
         self.commit_transaction(false, |tx| {
             tx.execute(
-                "INSERT OR REPLACE INTO cluster_meta VALUES('conf',?1)",
+                "INSERT INTO cluster_meta VALUES('conf',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 [conf.write_to_bytes().map_err(error)?],
             )
             .map_err(error)?;
             tx.execute(
-                "INSERT OR REPLACE INTO cluster_meta VALUES('conf_index',?1)",
+                "INSERT INTO cluster_meta VALUES('conf_index',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 [index.to_le_bytes().as_slice()],
             )
             .map_err(error)?;
             tx.execute(
-                "INSERT OR REPLACE INTO cluster_meta VALUES('membership',?1)",
+                "INSERT INTO cluster_meta VALUES('membership',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 [postcard::to_allocvec(&state).map_err(error)?],
             )
             .map_err(error)?;
@@ -234,17 +234,17 @@ pub(crate) fn apply_configuration(node: &mut RawNode<LogStorage>, commit: u64) -
             Database::note_change(&mut state, &e)?;
             db.commit_transaction(false, |tx| {
                 tx.execute(
-                    "INSERT OR REPLACE INTO cluster_meta VALUES('conf',?1)",
+                    "INSERT INTO cluster_meta VALUES('conf',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     [conf.write_to_bytes().map_err(error)?],
                 )
                 .map_err(error)?;
                 tx.execute(
-                    "INSERT OR REPLACE INTO cluster_meta VALUES('conf_index',?1)",
+                    "INSERT INTO cluster_meta VALUES('conf_index',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     [e.index.to_le_bytes().as_slice()],
                 )
                 .map_err(error)?;
                 tx.execute(
-                    "INSERT OR REPLACE INTO cluster_meta VALUES('membership',?1)",
+                    "INSERT INTO cluster_meta VALUES('membership',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     [postcard::to_allocvec(&state).map_err(error)?],
                 )
                 .map_err(error)?;

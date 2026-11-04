@@ -319,7 +319,7 @@ impl Database {
                 ("journal_root", root),
             ] {
                 tx.execute(
-                    "INSERT OR REPLACE INTO cluster_meta VALUES(?1,?2)",
+                    "INSERT INTO cluster_meta VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     params![key, value],
                 )
                 .map_err(error)?;
@@ -328,7 +328,7 @@ impl Database {
             crc.update(&image.sequence.to_le_bytes());
             crc.update(&image.model);
             tx.execute(
-                "INSERT OR REPLACE INTO cluster_meta VALUES('app_crc',?1)",
+                "INSERT INTO cluster_meta VALUES('app_crc',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 [crc.finalize().to_le_bytes().as_slice()],
             )
             .map_err(error)?;
