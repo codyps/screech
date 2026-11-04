@@ -14,7 +14,7 @@ func concurrentScenario(s string) bool {
 
 // Each connection uses ordinary synchronous publish, Fetch(1), and AckSync calls.
 // No Screech-specific batching or protocol extension is used.
-func runConcurrent(url, scenario, subject string, count, size int, options []nats.Option) (time.Duration, int64, []float64, error) {
+func runConcurrent(url, scenario, subject string, count, size, replicas int, options []nats.Option) (time.Duration, int64, []float64, error) {
 	control, err := nats.Connect(url, options...)
 	if err != nil {
 		return 0, 0, nil, err
@@ -46,13 +46,16 @@ func runConcurrent(url, scenario, subject string, count, size int, options []nat
 		if consuming {
 			retention = nats.WorkQueuePolicy
 		}
-		if _, err = js.AddStream(&nats.StreamConfig{Name: names[i], Subjects: []string{subjects[i]}, Storage: nats.FileStorage, Replicas: 1, Retention: retention}); err != nil {
+		if _, err = addStream(js, &nats.StreamConfig{Name: names[i], Subjects: []string{subjects[i]}, Storage: nats.FileStorage, Replicas: replicas, Retention: retention}); err != nil {
 			return 0, 0, nil, err
 		}
 		defer js.DeleteStream(names[i])
 		if consuming {
-			_, err = js.AddConsumer(names[i], &nats.ConsumerConfig{Durable: "D", AckPolicy: nats.AckExplicitPolicy, AckWait: 30 * time.Second, MaxAckPending: 256, FilterSubject: subjects[i]})
+			info, err := js.AddConsumer(names[i], &nats.ConsumerConfig{Durable: "D", Replicas: replicas, AckPolicy: nats.AckExplicitPolicy, AckWait: 30 * time.Second, MaxAckPending: 256, FilterSubject: subjects[i]})
 			if err != nil {
+				return 0, 0, nil, err
+			}
+			if err = checkConsumer(info, replicas); err != nil {
 				return 0, 0, nil, err
 			}
 		}
@@ -239,12 +242,8 @@ func runConcurrent(url, scenario, subject string, count, size int, options []nat
 			return 0, 0, nil, fmt.Errorf("stream highwater mismatch")
 		}
 		if consuming {
-			ci, e := js.ConsumerInfo(name, "D")
-			if e != nil {
+			if e = checkConsumed(js, name, uint64(expected), 0, replicas); e != nil {
 				return 0, 0, nil, e
-			}
-			if info.State.Msgs != 0 || ci.NumAckPending != 0 || ci.AckFloor.Consumer != uint64(expected) {
-				return 0, 0, nil, fmt.Errorf("concurrent ACK/retention mismatch: %+v", ci)
 			}
 		} else if info.State.Msgs != uint64(expected) {
 			return 0, 0, nil, fmt.Errorf("stored count mismatch")

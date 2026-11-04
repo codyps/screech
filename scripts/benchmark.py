@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Reproducible checked workloads against both servers; raw JSON, no speed claims."""
+from contextlib import contextmanager
+from benchmark_cluster import BenchmarkCluster
 import argparse
 import json
 import os
@@ -40,6 +42,36 @@ def start(binary, label, durable, directory):
     except BaseException:
         process.kill();process.wait();log.close();raise
 
+@contextmanager
+def running(binary, label, durable, directory, args, commands):
+    if args.cluster_voters > 1:
+        cluster = BenchmarkCluster(binary, label.startswith('screech'), args.cluster_voters, directory)
+        commands.append(dict(server=label, durable=True, commands=cluster.commands, configs=cluster.configs))
+        (args.output.parent/f'{args.output.stem}-{label}-launch.json').write_text(json.dumps(commands[-1],indent=2)+'\n')
+        try:
+            cluster.start()
+            yield cluster.processes, cluster.port
+            cluster.assert_alive()
+        finally:
+            cluster.close()
+            cluster.save_logs(args.output, label)
+    else:
+        process, port, log, command = start(binary, label, durable, directory)
+        commands.append(dict(server=label, durable=durable, command=command))
+        try:
+            yield [process], port
+            if process.poll() is not None:
+                raise RuntimeError('benchmark server exited')
+        finally:
+            process.kill();process.wait();log.close()
+            shutil.copy2(directory/'server.log',args.output.parent/f'{args.output.stem}-{label}-{"durable" if durable else "core"}-server.log')
+
+
+def total_usage(processes):
+    values = [usage(process.pid) for process in processes]
+    return {key: sum(v[key] for v in values) if all(v[key] is not None for v in values) else None
+            for key in ('rss_kib', 'cpu_seconds')}
+
 def filesystem_type(path):
     try:
         return subprocess.check_output(['stat','-f','-c','%T',str(path)],text=True,stderr=subprocess.DEVNULL).strip()
@@ -63,47 +95,63 @@ def main(args):
     for interval in args.nats_sync_interval:
         if not re.fullmatch(r'(?:[0-9]+(?:\.[0-9]+)?(?:ns|us|ms|s|m|h))+',interval): raise ValueError('invalid NATS sync interval')
     if len(set(args.nats_sync_interval)) != len(args.nats_sync_interval): raise ValueError('duplicate sync intervals')
+    if args.cluster_messages <= 0: raise ValueError('cluster messages must be positive')
+    if args.cluster_voters > 1 and (args.screech_unsafe_ack or args.screech_before or args.nats_default or args.nats_sync_interval):
+        raise ValueError('cluster campaigns use strict Screech and NATS always only')
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.with_suffix('.jsonl').write_text('')
     core=[('fanout',8,1,2000000),('wildcard',128,1,2000000),('fanout',128,1,2000000),('fanout',1024,1,1000000),('fanout',128,4,1000000),('queue',128,4,2000000),('request',128,1,50000),('core-subject-churn',128,1,1000000),('core-many-subscriptions',128,1,1000000),('core-churn-many-subscriptions',128,1,1000000)]
     for durable in (False,True):
+        if args.cluster_voters > 1 and not durable: continue
         cases=JETSTREAM_CASES if durable else core
         if args.scale_only:
             if not durable: continue
             cases=CONCURRENT_CASES
+        if args.scenario: cases=[case for case in cases if case[0] in args.scenario]
+        if args.cluster_voters > 1:
+            cases=[(scenario,size,subs,args.cluster_messages) for scenario,size,subs,n in cases]
+        if not cases: continue
         # Alternate server order each invocation with --reverse for larger campaigns.
         servers=[('screech',args.screech),('nats-main',args.nats)]
         if durable and args.nats_default:servers.append(('nats-default',args.nats))
         if durable: servers.extend(('nats-sync-'+interval,args.nats) for interval in args.nats_sync_interval)
         if durable and args.screech_before:servers.append(('screech-before',args.screech_before))
         if durable and args.screech_unsafe_ack:servers.append(('screech-unsafe-ack',args.screech))
+        if args.cluster_voters > 1:
+            servers=[(f'screech-cluster-{args.cluster_voters}',args.screech), (f'nats-cluster-{args.cluster_voters}-always',args.nats)]
         if args.reverse:servers.reverse()
         for label,binary in servers:
             with tempfile.TemporaryDirectory(prefix='screech-bench-') as tmp:
-                directory=Path(tmp);process,port,log,cmd=start(binary,label,durable,directory);commands.append({'server':label,'durable':durable,'command':cmd})
-                try:
+                directory=Path(tmp)
+                with running(binary,label,durable,directory,args,commands) as (processes,port):
                     for scenario,size,subs,n in cases:
-                        base=[args.driver,'-url',f'nats://127.0.0.1:{port}','-scenario',scenario,'-size',str(size),'-subscribers',str(subs)]
-                        subprocess.run(base+['-n','1000' if not durable else '20'],check=True,text=True,timeout=45,stdout=subprocess.DEVNULL)
-                        for trial in range(args.trials):
-                            before=usage(process.pid)
-                            result=subprocess.run(base+['-n',str(n)],check=True,capture_output=True,text=True,timeout=60)
-                            after=usage(process.pid)
-                            row=json.loads(result.stdout);row.update(server=label,trial=trial,server_rss_kib=after['rss_kib'],server_cpu_seconds=(after['cpu_seconds']-before['cpu_seconds']) if after['cpu_seconds'] is not None and before['cpu_seconds'] is not None else None)
-                            rows.append(row);print(json.dumps(row),flush=True)
-                            args.output.with_suffix('.jsonl').open('a').write(json.dumps(row)+'\n')
-                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
-                    print(f"Checked workload failed: {label} {scenario} size={size} subscribers={subs}",file=sys.stderr)
-                    if error.stdout:print(error.stdout,file=sys.stderr)
-                    if error.stderr:print(error.stderr,file=sys.stderr)
-                    raise
-                finally:
-                    process.kill();process.wait();log.close()
-                    shutil.copy2(directory/'server.log',args.output.parent/f'{args.output.stem}-{label}-{"durable" if durable else "core"}-server.log')
+                        base=[args.driver,'-url',f'nats://127.0.0.1:{port}','-scenario',scenario,'-size',str(size),'-subscribers',str(subs),'-replicas',str(args.cluster_voters)]
+                        try:
+                            subprocess.run(base+['-n','1000' if not durable else '20'],check=True,text=True,timeout=60,stdout=subprocess.DEVNULL)
+                            for trial in range(args.trials):
+                                before=total_usage(processes)
+                                result=subprocess.run(base+['-n',str(n)],check=True,capture_output=True,text=True,timeout=180 if args.cluster_voters > 1 else 60)
+                                after=total_usage(processes)
+                                row=json.loads(result.stdout)
+                                if row.get('checked') is not True or row.get('stream_replicas') != args.cluster_voters:
+                                    raise ValueError('unchecked or incorrectly replicated workload')
+                                row.update(server=label,trial=trial,voters=args.cluster_voters,server_rss_kib=after['rss_kib'],server_cpu_seconds=(after['cpu_seconds']-before['cpu_seconds']) if after['cpu_seconds'] is not None and before['cpu_seconds'] is not None else None)
+                                rows.append(row);print(json.dumps(row),flush=True)
+                                with args.output.with_suffix('.jsonl').open('a') as journal:
+                                    journal.write(json.dumps(row)+'\n')
+                        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+                            print(f"Checked workload failed: {label} {scenario} size={size} subscribers={subs}",file=sys.stderr)
+                            if error.stdout:print(error.stdout,file=sys.stderr)
+                            if error.stderr:print(error.stderr,file=sys.stderr)
+                            raise
     cpu=next((x.split(':',1)[1].strip() for x in Path('/proc/cpuinfo').read_text().splitlines() if x.startswith('model name')),platform.processor())
-    output={'environment':{'recorded_at':datetime.now(timezone.utc).isoformat(),'nats_sync_intervals':['always']+(['default 2m'] if args.nats_default else [])+args.nats_sync_interval,'kernel':platform.release(),'cpu':cpu,'logical_cpus':os.cpu_count(),'store_filesystem':filesystem_type(tempfile.gettempdir()),'server_workers':2,'transport':'loopback TCP','durability':'SQLite WAL FULL by default; screech-unsafe-ack buffers consumer state for a 50ms flush target, publication ACKs remain FULL; nats-main sync_interval always; optional nats-default uses default 2m','nats_commit':args.nats_commit,'screech_binary_sha256':__import__('hashlib').sha256(Path(args.screech).read_bytes()).hexdigest(),'screech_before_binary_sha256':__import__('hashlib').sha256(Path(args.screech_before).read_bytes()).hexdigest() if args.screech_before else None,'nats_binary_sha256':__import__('hashlib').sha256(Path(args.nats).read_bytes()).hexdigest(),'rustc':subprocess.check_output(['rustc','--version'],text=True).strip(),'nats_version':subprocess.check_output([args.nats,'--version'],text=True).strip(),'concurrent_test_workloads':False},'commands':commands,'rows':rows}
+    output={'environment':{'recorded_at':datetime.now(timezone.utc).isoformat(),'nats_sync_intervals':['always']+(['default 2m'] if args.nats_default else [])+args.nats_sync_interval,'kernel':platform.release(),'cpu':cpu,'logical_cpus':os.cpu_count(),'store_filesystem':filesystem_type(tempfile.gettempdir()),'server_workers_per_voter':2,'voters':args.cluster_voters,'resource_scope':'sum of all voter processes','transport':'loopback TCP; voters share one host and filesystem' if args.cluster_voters > 1 else 'loopback TCP','durability':'SQLite WAL FULL by default; screech-unsafe-ack buffers consumer state for a 50ms flush target, publication ACKs remain FULL; nats-main sync_interval always; optional nats-default uses default 2m','cluster_durability':'Screech synchronous FULL quorum; NATS replicated file streams/consumers with sync_interval always; persistence contracts differ' if args.cluster_voters > 1 else None,'nats_commit':args.nats_commit,'driver_binary_sha256':__import__('hashlib').sha256(Path(args.driver).read_bytes()).hexdigest(),'screech_binary_sha256':__import__('hashlib').sha256(Path(args.screech).read_bytes()).hexdigest(),'screech_before_binary_sha256':__import__('hashlib').sha256(Path(args.screech_before).read_bytes()).hexdigest() if args.screech_before else None,'nats_binary_sha256':__import__('hashlib').sha256(Path(args.nats).read_bytes()).hexdigest(),'rustc':subprocess.check_output(['rustc','--version'],text=True).strip(),'nats_version':subprocess.check_output([args.nats,'--version'],text=True).strip(),'concurrent_test_workloads':False},'commands':commands,'rows':rows}
     args.output.write_text(json.dumps(output,indent=2)+'\n')
 if __name__=='__main__':
     p=argparse.ArgumentParser()
     for key in ('screech','nats','driver'):p.add_argument('--'+key,required=True,type=lambda x:str(Path(x).resolve()))
     p.add_argument('--screech-unsafe-ack',action='store_true',help='Also benchmark explicitly unsafe consumer ACK durability');p.add_argument('--nats-sync-interval',action='append',default=[],help='Additional NATS stream sync interval, e.g. 10ms (repeatable)');p.add_argument('--scale-only',action='store_true');p.add_argument('--screech-before',type=lambda x:str(Path(x).resolve()));p.add_argument('--nats-default',action='store_true');p.add_argument('--nats-commit',required=True);p.add_argument('--trials',type=int,default=3);p.add_argument('--reverse',action='store_true');p.add_argument('--output',type=Path,required=True)
+    p.add_argument('--cluster-voters',type=int,choices=(1,3,5),default=1,help='Separate strict clustered campaign; skips transient Core cases')
+    p.add_argument('--cluster-messages',type=int,default=1000,help='Publications per clustered trial (default: 1000)')
+    p.add_argument('--scenario',action='append',choices=sorted(set(c[0] for c in JETSTREAM_CASES)),help='Run selected JetStream cases only (repeatable)')
     main(p.parse_args())

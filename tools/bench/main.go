@@ -22,6 +22,7 @@ func main() {
 }
 func run() error {
 	url := flag.String("url", "nats://127.0.0.1:4222", "server URL")
+	replicas := flag.Int("replicas", 1, "durable stream and consumer replicas (1, 3 or 5)")
 	scenario := flag.String("scenario", "fanout", "fanout, wildcard, queue, core-subject-churn, core-many-subscriptions, core-churn-many-subscriptions, request, durable, consume, consume-one, consume-parallel, consume-ack-window, consume-limits, consume-next, dedup, durable-parallel, consume-one-parallel, mixed-parallel, mixed-streams, core-stream")
 	n := flag.Int("n", 100000, "publishes")
 	size := flag.Int("size", 128, "payload bytes, at least 8")
@@ -35,11 +36,11 @@ func run() error {
 			return fmt.Errorf("profile gate requires a consumer scenario")
 		}
 	}
-	if *n <= 0 || *size < 8 || *subscribers <= 0 {
+	if *n <= 0 || *size < 8 || *subscribers <= 0 || (*replicas != 1 && *replicas != 3 && *replicas != 5) {
 		return fmt.Errorf("invalid workload")
 	}
 	var asyncError atomic.Value
-	options := []nats.Option{nats.NoReconnect(), nats.Timeout(10 * time.Second), nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, e error) { asyncError.Store(e.Error()) })}
+	options := []nats.Option{nats.NoReconnect(), nats.IgnoreDiscoveredServers(), nats.Timeout(10 * time.Second), nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, e error) { asyncError.Store(e.Error()) })}
 	pub, e := nats.Connect(*url, options...)
 	if e != nil {
 		return e
@@ -61,13 +62,13 @@ func run() error {
 	}
 	subject := fmt.Sprintf("bench.%d", time.Now().UnixNano())
 	if *scenario == "core-stream" {
-		elapsed, latencies, durableLatencies, e = runCoreStream(*url, subject, *n, *size, options)
+		elapsed, latencies, durableLatencies, e = runCoreStream(*url, subject, *n, *size, *replicas, options)
 		if e != nil {
 			return e
 		}
 		deliveries = int64(*n)
 	} else if concurrentScenario(*scenario) {
-		elapsed, deliveries, latencies, e = runConcurrent(*url, *scenario, subject, *n, *size, options)
+		elapsed, deliveries, latencies, e = runConcurrent(*url, *scenario, subject, *n, *size, *replicas, options)
 		if e != nil {
 			return e
 		}
@@ -108,7 +109,7 @@ func run() error {
 			return e
 		}
 		name := fmt.Sprintf("CONSUME_%d", time.Now().UnixNano())
-		_, e = js.AddStream(&nats.StreamConfig{Name: name, Subjects: []string{subject}, Storage: nats.FileStorage, Replicas: 1, Retention: func() nats.RetentionPolicy {
+		_, e = addStream(js, &nats.StreamConfig{Name: name, Subjects: []string{subject}, Storage: nats.FileStorage, Replicas: *replicas, Retention: func() nats.RetentionPolicy {
 			if *scenario == "consume-limits" {
 				return nats.LimitsPolicy
 			}
@@ -128,15 +129,22 @@ func run() error {
 		if *scenario == "consume-ack-window" {
 			maxPending = 4096
 		}
-		sub, e := js.PullSubscribe(subject, "D", nats.BindStream(name), nats.AckExplicit(), nats.MaxAckPending(maxPending), nats.AckWait(30*time.Second))
+		sub, e := js.PullSubscribe(subject, "D", nats.BindStream(name), nats.AckExplicit(), nats.ConsumerReplicas(*replicas), nats.MaxAckPending(maxPending), nats.AckWait(30*time.Second))
 		if e != nil {
 			return e
 		}
 		defer sub.Unsubscribe()
+		info, e := sub.ConsumerInfo()
+		if e != nil {
+			return e
+		}
+		if e = checkConsumer(info, *replicas); e != nil {
+			return e
+		}
 		var ackClients []*nats.Conn
 		if *scenario == "consume-parallel" || *scenario == "consume-ack-window" {
 			for i := 0; i < 16; i++ {
-				c, e := nats.Connect(*url)
+				c, e := nats.Connect(*url, options...)
 				if e != nil {
 					return e
 				}
@@ -234,23 +242,12 @@ func run() error {
 			return e
 		}
 		deliveries = int64(received)
-		ci, e := js.ConsumerInfo(name, "D")
-		if e != nil {
-			return e
-		}
-		if ci.NumAckPending != 0 || ci.AckFloor.Consumer != uint64(*n) {
-			return fmt.Errorf("durable ACK floor mismatch: %+v", ci)
-		}
-		si, e := js.StreamInfo(name)
-		if e != nil {
-			return e
-		}
 		expectedStored := uint64(0)
 		if *scenario == "consume-limits" {
 			expectedStored = uint64(*n)
 		}
-		if si.State.Msgs != expectedStored {
-			return fmt.Errorf("retention has %d messages, expected %d", si.State.Msgs, expectedStored)
+		if e = checkConsumed(js, name, uint64(*n), expectedStored, *replicas); e != nil {
+			return e
 		}
 	} else if *scenario == "dedup" {
 		js, e := pub.JetStream(nats.MaxWait(15 * time.Second))
@@ -258,7 +255,7 @@ func run() error {
 			return e
 		}
 		name := fmt.Sprintf("DEDUP_%d", time.Now().UnixNano())
-		_, e = js.AddStream(&nats.StreamConfig{Name: name, Subjects: []string{subject}, Storage: nats.FileStorage, Replicas: 1, Duplicates: 120 * time.Second})
+		_, e = addStream(js, &nats.StreamConfig{Name: name, Subjects: []string{subject}, Storage: nats.FileStorage, Replicas: *replicas, Duplicates: 120 * time.Second})
 		if e != nil {
 			return e
 		}
@@ -293,7 +290,7 @@ func run() error {
 			return e
 		}
 		name := fmt.Sprintf("BENCH_%d", time.Now().UnixNano())
-		_, e = js.AddStream(&nats.StreamConfig{Name: name, Subjects: []string{subject}, Storage: nats.FileStorage, Replicas: 1})
+		_, e = addStream(js, &nats.StreamConfig{Name: name, Subjects: []string{subject}, Storage: nats.FileStorage, Replicas: *replicas})
 		if e != nil {
 			return e
 		}
@@ -505,7 +502,7 @@ func run() error {
 	if e := asyncError.Load(); e != nil {
 		return fmt.Errorf("asynchronous error: %v", e)
 	}
-	result := map[string]any{"scenario": *scenario, "publishes": *n, "payload_bytes": *size, "subscribers": *subscribers, "deliveries": deliveries, "seconds": elapsed.Seconds(), "publishes_per_second": float64(*n) / elapsed.Seconds(), "deliveries_per_second": float64(deliveries) / elapsed.Seconds(), "checked": true}
+	result := map[string]any{"scenario": *scenario, "stream_replicas": *replicas, "publishes": *n, "payload_bytes": *size, "subscribers": *subscribers, "deliveries": deliveries, "seconds": elapsed.Seconds(), "publishes_per_second": float64(*n) / elapsed.Seconds(), "deliveries_per_second": float64(deliveries) / elapsed.Seconds(), "checked": true}
 	switch *scenario {
 	case "consume", "consume-one", "consume-parallel", "consume-ack-window", "consume-limits":
 		result["latency_scope"] = "confirmed ACK only; Fetch excluded from latency"

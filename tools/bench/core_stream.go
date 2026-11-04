@@ -9,7 +9,7 @@ import (
 )
 
 // Measure live Core callback latency and durable publish ACK latency separately.
-func runCoreStream(url, subject string, count, size int, options []nats.Option) (time.Duration, []float64, []float64, error) {
+func runCoreStream(url, subject string, count, size, replicas int, options []nats.Option) (time.Duration, []float64, []float64, error) {
 	publisher, err := nats.Connect(url, options...)
 	if err != nil {
 		return 0, nil, nil, err
@@ -20,7 +20,7 @@ func runCoreStream(url, subject string, count, size int, options []nats.Option) 
 		return 0, nil, nil, err
 	}
 	name := fmt.Sprintf("LIVE_%d", time.Now().UnixNano())
-	if _, err = js.AddStream(&nats.StreamConfig{Name: name, Subjects: []string{subject}, Storage: nats.FileStorage, Replicas: 1}); err != nil {
+	if _, err = addStream(js, &nats.StreamConfig{Name: name, Subjects: []string{subject}, Storage: nats.FileStorage, Replicas: replicas}); err != nil {
 		return 0, nil, nil, err
 	}
 	defer js.DeleteStream(name)
