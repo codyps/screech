@@ -686,11 +686,11 @@ fn dispatch_messages(
     Ok(())
 }
 #[derive(Serialize, Deserialize)]
-struct Envelope {
-    cluster: String,
+struct Envelope<'a> {
+    cluster: &'a str,
     from: u64,
-    body: Vec<u8>,
-    mac: Vec<u8>,
+    body: &'a [u8],
+    mac: &'a [u8],
     incarnation: [u8; 16],
 }
 fn authenticate(secret: &str, cluster: &str, from: u64, body: &[u8]) -> Hmac<Sha256> {
@@ -703,12 +703,12 @@ fn authenticate(secret: &str, cluster: &str, from: u64, body: &[u8]) -> Hmac<Sha
     mac
 }
 #[derive(Serialize, Deserialize)]
-struct Chunk {
+struct Chunk<'a> {
     nonce: [u8; 16],
     offset: u64,
     total: u64,
     hash: [u8; 32],
-    data: Vec<u8>,
+    data: &'a [u8],
     snapshot: bool,
 }
 async fn send_message(
@@ -730,18 +730,18 @@ async fn send_message(
             offset: (n * 1024 * 1024) as u64,
             total: body.len() as u64,
             hash,
-            data: data.to_vec(),
+            data,
             snapshot: message.get_msg_type() == raft::eraftpb::MessageType::MsgSnapshot,
         };
         let body = postcard::to_allocvec(&chunk).map_err(error)?;
         let mut auth = authenticate(&config.secret, &config.cluster_id, config.node_id, &body);
         auth.update(&incarnation);
-        let mac = auth.finalize().into_bytes().to_vec();
+        let mac = auth.finalize().into_bytes();
         let envelope = postcard::to_allocvec(&Envelope {
-            cluster: config.cluster_id.clone(),
+            cluster: &config.cluster_id,
             from: config.node_id,
-            body,
-            mac,
+            body: &body,
+            mac: &mac,
             incarnation,
         })
         .map_err(error)?;
@@ -778,13 +778,13 @@ async fn receive_message<R: AsyncRead + Unpin>(
         }
         let mut auth = authenticate(
             &config.secret,
-            &envelope.cluster,
+            envelope.cluster,
             envelope.from,
-            &envelope.body,
+            envelope.body,
         );
         auth.update(&envelope.incarnation);
-        auth.verify_slice(&envelope.mac).map_err(error)?;
-        let chunk: Chunk = postcard::from_bytes(&envelope.body).map_err(error)?;
+        auth.verify_slice(envelope.mac).map_err(error)?;
+        let chunk: Chunk = postcard::from_bytes(envelope.body).map_err(error)?;
         if chunk.total > (storage::MAX_SNAPSHOT + MAX_FRAME) as u64
             || chunk.total == 0
             || chunk.data.is_empty()
@@ -806,7 +806,7 @@ async fn receive_message<R: AsyncRead + Unpin>(
         if identity != Some(expected) {
             return Err(error("transfer identity changed"));
         }
-        data.extend_from_slice(&chunk.data);
+        data.extend_from_slice(chunk.data);
         if chunk.snapshot {
             crate::fault::point("after_cluster_snapshot_chunk");
         }
@@ -1361,6 +1361,60 @@ async fn run_runtime(
 mod tests {
     use super::*;
     use crate::storage::Append;
+    #[test]
+    fn borrowed_peer_frames_remain_compatible_with_owned_wire_format() {
+        #[derive(Serialize, Deserialize)]
+        struct OwnedEnvelope {
+            cluster: String,
+            from: u64,
+            body: Vec<u8>,
+            mac: Vec<u8>,
+            incarnation: [u8; 16],
+        }
+        #[derive(Serialize, Deserialize)]
+        struct OwnedChunk {
+            nonce: [u8; 16],
+            offset: u64,
+            total: u64,
+            hash: [u8; 32],
+            data: Vec<u8>,
+            snapshot: bool,
+        }
+        for size in [1, 127, 128, 1024 * 1024] {
+            let chunk = OwnedChunk {
+                nonce: [3; 16],
+                offset: 128,
+                total: size as u64 + 128,
+                hash: [4; 32],
+                data: vec![255; size],
+                snapshot: size > 128,
+            };
+            let old_chunk = postcard::to_allocvec(&chunk).unwrap();
+            let borrowed: Chunk = postcard::from_bytes(&old_chunk).unwrap();
+            assert_eq!(postcard::to_allocvec(&borrowed).unwrap(), old_chunk);
+            let envelope = OwnedEnvelope {
+                cluster: "wire-compatibility".into(),
+                from: 300,
+                body: old_chunk,
+                mac: vec![5; 32],
+                incarnation: [6; 16],
+            };
+            let old_frame = postcard::to_allocvec(&envelope).unwrap();
+            let borrowed: Envelope = postcard::from_bytes(&old_frame).unwrap();
+            assert_eq!(postcard::to_allocvec(&borrowed).unwrap(), old_frame);
+            let new_frame = postcard::to_allocvec(&Envelope {
+                cluster: &envelope.cluster,
+                from: envelope.from,
+                body: &envelope.body,
+                mac: &envelope.mac,
+                incarnation: envelope.incarnation,
+            })
+            .unwrap();
+            let decoded: OwnedEnvelope = postcard::from_bytes(&new_frame).unwrap();
+            assert_eq!(decoded.body, envelope.body);
+            assert_eq!(decoded.mac, envelope.mac);
+        }
+    }
     pub(super) fn config(id: u64) -> ClusterConfig {
         config_size(id, 3)
     }
