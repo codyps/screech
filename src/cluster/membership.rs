@@ -306,10 +306,10 @@ pub(crate) fn advance_replacement(node: &mut RawNode<LogStorage>) -> io::Result<
     }
     let db = node.store().db.lock().unwrap();
     let state = db.membership()?;
-    let conf = db.conf()?;
     let Some(replacement) = state.replacing else {
         return Ok(());
     };
+    let conf = db.conf()?;
     let commit = db.hard()?.commit;
     drop(db);
     let (cc, stage) = if !conf.voters_outgoing.is_empty() {

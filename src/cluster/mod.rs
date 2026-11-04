@@ -490,16 +490,14 @@ fn pump(
         dispatch_messages(node, early, out, routes)?;
         // Applying the durable hard-state prefix builds the application indexes.
         // Raft's committed entry lists may be split across Ready and LightReady.
-        let commit = node.store().db.lock().unwrap().hard()?.commit;
-        membership::apply_configuration(node, commit)?;
-        let replies = {
-            let mut db = node.store().db.lock().unwrap();
-            let commit = db.hard()?.commit;
-            db.apply(commit)?
-        };
-        for (key, end) in replies {
-            if let Some(request) = pending.remove(&key) {
-                let _ = request.reply.send(Ok(end));
+        let commit = node.raft.raft_log.committed;
+        if commit > node.raft.raft_log.applied {
+            membership::apply_configuration(node, commit)?;
+            let replies = node.store().db.lock().unwrap().apply(commit)?;
+            for (key, end) in replies {
+                if let Some(request) = pending.remove(&key) {
+                    let _ = request.reply.send(Ok(end));
+                }
             }
         }
         let mut light = node.advance(ready);
@@ -523,7 +521,9 @@ fn pump(
                 request.read_index = Some(state.index);
             }
         }
-        let view = node.store().db.lock().unwrap().view()?;
+        // advance_apply follows completed projection writes above. Heartbeats
+        // and ReadIndex responses do not need to reread an unchanged SQL view.
+        let view = node.raft.raft_log.applied;
         pending.retain(|_, request| {
             if request.read_index.is_some_and(|index| index <= view) {
                 let _ = request.reply.send(Ok(view));
@@ -542,12 +542,17 @@ fn dispatch_messages(
     routes: &BTreeMap<u64, u64>,
 ) -> io::Result<()> {
     if !messages.is_empty() {
-        let identities = node.store().db.lock().unwrap().membership()?.identities;
+        let mut identities = None;
         for message in messages {
             let route = if out.contains_key(&message.to) {
                 message.to
             } else {
+                if identities.is_none() {
+                    identities = Some(node.store().db.lock().unwrap().membership()?.identities);
+                }
                 identities
+                    .as_ref()
+                    .unwrap()
                     .get(&message.to)
                     .map(|n| u64::from_le_bytes(n[..8].try_into().unwrap()))
                     .or_else(|| routes.get(&message.to).copied())
