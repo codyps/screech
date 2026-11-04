@@ -3,14 +3,35 @@ import socket
 import struct
 import time
 import unittest
+from http.client import IncompleteRead
+from types import SimpleNamespace
 from unittest.mock import patch
 import voter_guest
 
 from ethernet import Hub, receive_exact
-from mixed_faults import blocked_edges
+from mixed_faults import blocked_edges, Witness
 
 
 class Network(unittest.TestCase):
+    def test_truncated_guest_response_does_not_hide_conflicting_confirmations(self):
+        def voter(node):
+            def call(op, **payload):
+                if payload['action'] == 'write' and node == 'n3':
+                    raise IncompleteRead(b'', 88)
+                return dict(service_node=node, outcome='ok', **(
+                    {'seq': 2} if payload['action'] == 'write' else {'last_seq': 2}))
+            return SimpleNamespace(process=SimpleNamespace(poll=lambda: None), call=call, client_port=1)
+        cluster = SimpleNamespace(vms={n: voter(n) for n in ('n1', 'n2', 'n3')})
+        case = dict(stream='T', seed='initial', survivors=['n1', 'n2'], targets=['n3'], rounds=[])
+        witness = Witness(cluster, case)
+        witness.phase = 'healed'
+        with patch('mixed_faults.Client') as client, patch.object(witness, 'save'):
+            client.return_value.request.return_value = {'state': {'last_seq': 1}}
+            with self.assertRaisesRegex(AssertionError, 'split brain'):
+                witness.round()
+        self.assertEqual(2, sum(w['outcome'] == 'ok' for w in case['rounds'][0]['writes']))
+        self.assertEqual('unknown', case['rounds'][0]['writes'][2]['outcome'])
+
     def test_expected_service_unavailability_does_not_masquerade_as_control_failure(self):
         with patch.multiple(voter_guest, NODE='n1'), patch('voter_guest.Path.exists', return_value=True), \
              patch('voter_guest.Client', side_effect=ConnectionRefusedError('no local leader')):

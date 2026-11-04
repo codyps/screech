@@ -5,6 +5,7 @@ links independently; no Raft messages or application responses are synthesized.
 """
 from concurrent.futures import ThreadPoolExecutor
 import copy
+from http.client import IncompleteRead
 import json
 from pathlib import Path
 import sys
@@ -97,7 +98,7 @@ class Witness:
             result = vm.call('cas', rpc_timeout=8, stream=self.case['stream'], action=action, **payload)
             assert result['service_node'] == node, 'conditional probe reached the wrong guest'
             return dict(payload, node=node, **result)
-        except OSError as error:
+        except (OSError, EOFError, IncompleteRead) as error:
             return dict(payload, node=node, outcome='unknown', error=str(error))
 
     def round(self):
