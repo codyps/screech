@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import socketserver
@@ -29,6 +30,8 @@ BOOT_ID = None
 FRESH_DISK = False
 NET_RECEIVED = set()
 NET_LOCK = threading.Lock()
+IO_TRACE = None
+IO_TRACE_PATH = None
 DURABLE = b'durable-canary-v1'
 STABLE = b'stable-before-unsynced-overwrite'
 
@@ -169,6 +172,7 @@ def cas_probe(request):
 
 
 def act(request):
+    global IO_TRACE, IO_TRACE_PATH
     assert Path('/run/screech-voter-vm').exists()
     op = request['op']
     if op == 'status':
@@ -197,8 +201,33 @@ def act(request):
         return {'extents': file_extents()}
     if op == 'io-errors':
         output = subprocess.check_output(['dmesg'], text=True)
+        trace = IO_TRACE_PATH.read_text() if IO_TRACE_PATH is not None else ''
         return {'errors': [line for line in output.splitlines()
-                           if 'I/O error' in line or 'I/O Error' in line]}
+                           if 'I/O error' in line or 'I/O Error' in line],
+                'sync_errors': [line for line in trace.splitlines()
+                                if re.search(r'\b(?:fsync|fdatasync)(?:\(| resumed>).*\)\s+= -1 EIO\b', line)],
+                'boot_id': BOOT_ID, 'pid': SERVER.pid if SERVER is not None else None}
+    if op == 'trace-sync':
+        assert SERVER is not None and SERVER.poll() is None
+        if IO_TRACE is not None and IO_TRACE.poll() is None:
+            IO_TRACE.terminate()
+            IO_TRACE.wait(timeout=5)
+        # tmpfs only: writing diagnostic output must not use the faulted disk.
+        IO_TRACE_PATH = Path('/run') / ('sync-' + BOOT_ID + '-' + str(time.monotonic_ns()))
+        with Path(str(IO_TRACE_PATH) + '.log').open('w') as log:
+            IO_TRACE = subprocess.Popen(['strace', '-f', '-qq', '-yy', '-e', 'trace=fsync,fdatasync',
+                                         '-o', str(IO_TRACE_PATH), '-p', str(SERVER.pid)],
+                                        stdout=log, stderr=log)
+        deadline = time.monotonic() + 5
+        while True:
+            assert IO_TRACE.poll() is None, Path(str(IO_TRACE_PATH) + '.log').read_text()
+            states = list(Path(f'/proc/{SERVER.pid}/task').glob('*/status'))
+            if states and all(int(p.read_text().split('TracerPid:', 1)[1].splitlines()[0]) == IO_TRACE.pid
+                              for p in states):
+                break
+            assert time.monotonic() < deadline, 'sync tracer did not attach to voter threads'
+            time.sleep(.01)
+        return {'boot_id': BOOT_ID, 'pid': SERVER.pid, 'tracer_pid': IO_TRACE.pid}
     if op == 'leader':
         try:
             client = Client((f'10.0.1.{NODE[1:]}', 7500), timeout=2)

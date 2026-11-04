@@ -299,6 +299,7 @@ class Cluster:
         targets = [leader] + [n for n in self.vms if n != leader][:len(self.vms)//2-1]
         members = {n: replicas[n]['member'] for n in targets}
         extents = self.vms[leader].call('extents')['extents']
+        trace = self.vms[leader].call('trace-sync') if mode == 'eio' else None
         block = self.vms[leader].block
         block.arm(mode, operation, lambda: self.pending_requests(kind), extents)
         assert block.hit.wait(45), f'no real {operation} while {kind} was in flight'
@@ -317,8 +318,12 @@ class Cluster:
             proof['subsequent_io_held'] = block.proof['subsequent_io_held']
             deadline = time.monotonic() + 5
             while True:
-                proof['guest_errors'] = self.vms[leader].call('io-errors')['errors']
-                if proof['guest_errors']:
+                observed = self.vms[leader].call('io-errors')
+                assert observed['boot_id'] == trace['boot_id'] and observed['pid'] == trace['pid']
+                proof['guest_errors'] = observed['errors']
+                proof['guest_sync_errors'] = observed['sync_errors']
+                proof['sync_trace'] = trace
+                if proof['guest_errors'] or proof['guest_sync_errors']:
                     break
                 assert time.monotonic() < deadline, 'guest never reported the injected disk I/O error'
                 time.sleep(.02)

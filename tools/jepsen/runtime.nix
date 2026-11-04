@@ -6,7 +6,7 @@ let
   tools = pkgs.symlinkJoin {
     name = "screech-jepsen-tools";
     paths = with pkgs; [ qemu leiningen iproute2 iptables fuse3 gnuplot graphviz
-                        cmake pkg-config gtest spdlog tomlplusplus zstd git getent ];
+                        cmake pkg-config gtest spdlog tomlplusplus zstd git getent strace ];
   };
 in pkgs.writeText "screech-jepsen-runtime.json" (builtins.toJSON {
   tools = "${tools}";

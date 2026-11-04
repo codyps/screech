@@ -129,6 +129,22 @@
     (is (false? (cli/active-proof? nodes (assoc-in proof [:io_faults 0 :error_after_canary] false) :vm-eio-flush)))
     (is (false? (cli/active-proof? nodes (assoc-in proof [:io_faults 0 :subsequent_io_held] false) :vm-eio-flush)))))
 
+(deftest syscall-eio-evidence-must-be-from-the-voter-and-the-crashed-boot
+  (let [proof (update active-proof :io_faults
+                      #(mapv (fn [f] (assoc f :mode "eio" :operation "flush" :errno 5 :reply_sent true
+                                            :error_after_canary true :subsequent_io_held true
+                                            :guest_errors []
+                                            :sync_trace {:pid 50 :tracer_pid 60 :boot_id "old-n1"}
+                                            :guest_sync_errors ["51 <... fdatasync resumed>) = -1 EIO (Input/output error)"])) %))]
+    (is (true? (cli/active-proof? nodes proof :vm-eio-flush)))
+    (doseq [[path value] [[[:sync_trace :pid] nil] [[:sync_trace :tracer_pid] 0]
+                         [[:sync_trace :boot_id] "another-boot"]
+                         [[:guest_sync_errors] []]
+                         [[:guest_sync_errors] ["write(5, x, 1) = -1 EIO (Input/output error)"]]
+                         [[:guest_sync_errors] ["fsync(5) = 0"]]]]
+      (is (false? (cli/active-proof? nodes (assoc-in proof (into [:io_faults 0] path) value) :vm-eio-flush))
+          (str path)))))
+
 (deftest active-windows-must-match-history-attempts-and-completed-recovery-cycles
   (let [history (concat
                   [{:type :info :f :exercise
