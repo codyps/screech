@@ -123,8 +123,10 @@ leader commits a current-term observation before exposing the recovered model.
 Indexes expose only the committed prefix; the accepted suffix remains available
 for conflict replacement. Standalone storage keeps its existing FULL behavior.
 Input validation, Raft storage reads and projection updates share one transaction
-per Raft input; client replies wait for
-that transaction's successful completion. A committed membership position is
+for already queued Raft inputs (at most eight, with a 100 µs admission budget and
+no wait for more input). Each input applies committed configuration changes before
+the next is authenticated. Client replies wait for successful transaction completion
+and publication of the committed service epoch. A committed membership position is
 sealed before applying the new voter configuration, so lost SQL projection writes
 cannot resurrect a removed voter.
 Passive SQLite page checkpoints run on a separate connection after 16,384 committed

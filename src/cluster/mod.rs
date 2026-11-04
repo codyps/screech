@@ -197,9 +197,10 @@ impl Client {
             .map_err(error)?;
         rx.recv_timeout(RPC_TIMEOUT)
             .map_err(|_| error("quorum read timeout"))??;
-        // A service can be replaced while ReadIndex is in flight, including in
-        // the same Raft term. Check both the published and durable epochs.
-        self.read(|_| Ok(()))
+        // The owner checks its durable epoch and publishes the committed role
+        // before releasing ReadIndex replies. Reject a replaced service without
+        // another SQL round trip on the application worker.
+        self.current()
     }
     fn propose(&self, data: Vec<u8>) -> io::Result<u64> {
         self.request(data, false)
@@ -477,13 +478,16 @@ fn pump(
     if !node.has_ready() {
         return Ok(());
     }
-    project(node, |node, completed| {
-        pump_ready(node, pending, out, routes, completed)
-    })
+    project(
+        node,
+        |node, completed| pump_ready(node, pending, out, routes, completed),
+        |_| {},
+    )
 }
 fn project<R>(
     node: &mut RawNode<LogStorage>,
     step: impl FnOnce(&mut RawNode<LogStorage>, &mut Vec<(Reply, u64)>) -> io::Result<R>,
+    publish: impl FnOnce(&R),
 ) -> io::Result<R> {
     let gate = node.store().db.lock().unwrap().gate.clone();
     let _gate = gate.lock().unwrap();
@@ -509,6 +513,7 @@ fn project<R>(
             let _ = reply.send(Err(error(failure)));
         }
     } else {
+        publish(result.as_ref().unwrap());
         // Complete the query projection before exposing replies. The accepted
         // payload and promises synced independently before replication ACKs.
         for (reply, end) in completed {
@@ -587,6 +592,13 @@ fn pump_ready(
         // advance_apply follows completed projection writes above. Heartbeats
         // and ReadIndex responses do not need to reread an unchanged SQL view.
         let view = node.raft.raft_log.applied;
+        if pending
+            .values()
+            .any(|request| request.read_index.is_some_and(|index| index <= view))
+            && node.store().db.lock().unwrap().hard()?.term != node.raft.term
+        {
+            return Err(error("durable read epoch does not match Raft"));
+        }
         pending.retain(|_, request| {
             if request.read_index.is_some_and(|index| index <= view) {
                 completed.push((request.reply.clone(), view));
@@ -907,7 +919,7 @@ async fn run_runtime(
                 (db.sender_policy()?, db.conf_index()?)
             };
             loop {
-                let input = rx.recv_timeout(Duration::from_millis(20));
+                let mut input = rx.recv_timeout(Duration::from_millis(20));
                 if matches!(&input, Ok(Input::Stop) | Err(mpsc::RecvTimeoutError::Disconnected)) {
                     break;
                 }
@@ -915,11 +927,15 @@ async fn run_runtime(
                     return Err(error("replica storage failed; quarantined"));
                 }
                 let mut incoming_lease = None;
+                let mut stopped = false;
                 // Include input validation, Raft storage reads and role metadata
                 // in the same projection transaction as this input's Ready work.
-                let configuration = project(&mut node, |node, completed| {
+                project(&mut node, |node, completed| {
+                let started = Instant::now();
+                let mut processed = 0;
+                loop {
                 match input {
-                    Ok(Input::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => unreachable!(),
+                    Ok(Input::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => { stopped = true; break; },
                     Ok(Input::SnapshotSent(id, ok)) => node.report_snapshot(
                         id,
                         if ok {
@@ -928,7 +944,7 @@ async fn run_runtime(
                             raft::SnapshotStatus::Failure
                         },
                     ),
-                    Ok(Input::Fault) => unreachable!(),
+                    Ok(Input::Fault) => return Err(error("replica storage failed; quarantined")),
                     Ok(Input::Message(message, nonce, permit)) => {
                         incoming_lease = Some(permit);
                         if policy.accepts(&message, nonce) {
@@ -1095,34 +1111,37 @@ async fn run_runtime(
                     tick = Instant::now();
                 }
                 pump_ready(node, &mut pending, &out, &routes, completed)?;
-                let configuration = {
+                {
                     let db = node.store().db.lock().unwrap();
                     let index = db.conf_index()?;
                     if index != policy_index {
                         policy = db.sender_policy()?;
                         policy_index = index;
                     }
-                    index
-                };
+                }
                 if policy.replacement_pending() {
                     membership::advance_replacement(node)?;
                 }
-                Ok(configuration)
+                processed += 1;
+                if processed >= 8 || started.elapsed() >= Duration::from_micros(100) { break; }
+                match rx.try_recv() {
+                    Ok(next) => input = Ok(next),
+                    Err(_) => break,
+                }
+                }
+                Ok(Role { leader: node.raft.leader_id, term: node.raft.term, configuration: policy_index })
+                }, |role| {
+                    role_tx.send_if_modified(|old| {
+                        if *old != *role {
+                            *old = *role;
+                            true
+                        } else {
+                            false
+                        }
+                    });
                 })?;
                 drop(incoming_lease);
-                let role = Role {
-                    leader: node.raft.leader_id,
-                    term: node.raft.term,
-                    configuration,
-                };
-                role_tx.send_if_modified(|old| {
-                    if *old != role {
-                        *old = role;
-                        true
-                    } else {
-                        false
-                    }
-                });
+                if stopped { break; }
                 pending.retain(|_, request| {
                     if node.raft.state != StateRole::Leader || request.started.elapsed() > RPC_TIMEOUT {
                         let _ = request.reply.send(Err(error(
@@ -1630,13 +1649,29 @@ mod tests {
         while let Ok(message) = sim.receive[0].try_recv() {
             sim.nodes[0].step(message).unwrap();
         }
-        assert!(pump(
+        let (second, second_rx) = mpsc::sync_channel(1);
+        let mut published = false;
+        assert!(project(
             &mut sim.nodes[0],
-            &mut sim.pending[0],
-            &sim.send,
-            &BTreeMap::new()
+            |node, completed| {
+                pump_ready(
+                    node,
+                    &mut sim.pending[0],
+                    &sim.send,
+                    &BTreeMap::new(),
+                    completed,
+                )?;
+                completed.push((second, before));
+                Ok(())
+            },
+            |_| published = true,
         )
         .is_err());
+        assert!(!published, "failed SQL commit published a new epoch");
+        assert!(
+            second_rx.try_recv().unwrap().is_err(),
+            "late failure released another success"
+        );
         assert!(
             rx.try_recv().unwrap().is_err(),
             "COMMIT failure produced success"
@@ -2021,6 +2056,76 @@ mod checkpoint_tests {
 #[cfg(test)]
 mod application_failure_tests {
     use super::*;
+    #[test]
+    fn read_reply_observes_the_committed_epoch_before_returning_to_an_old_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut client, requests) = client(dir.path());
+        let database = client.db.clone();
+        let (roles, role) = watch::channel(Role {
+            leader: 1,
+            term: 1,
+            configuration: 0,
+        });
+        client.role = role;
+        let (done, result) = mpsc::channel();
+        let caller = std::thread::spawn(move || done.send(client.barrier()).unwrap());
+        let Input::Read { reply, .. } = requests.recv_timeout(Duration::from_secs(1)).unwrap()
+        else {
+            panic!("expected a fresh quorum read");
+        };
+        let mut node = RawNode::new(
+            &raft::Config {
+                id: 1,
+                applied: 1,
+                ..Default::default()
+            },
+            LogStorage {
+                db: database.clone(),
+            },
+            &slog::Logger::root(slog::Discard, slog::o!()),
+        )
+        .unwrap();
+        project(
+            &mut node,
+            |node, completed| {
+                let mut db = node.store().db.lock().unwrap();
+                let mut hard = db.hard()?;
+                hard.term = 2;
+                hard.vote = 2;
+                db.persist(&[], Some(&hard))?;
+                completed.push((reply, 0));
+                Ok(Role {
+                    leader: 2,
+                    term: 2,
+                    configuration: 0,
+                })
+            },
+            |epoch| {
+                let db = database.lock().unwrap();
+                assert!(db.conn.is_autocommit(), "epoch published before SQL commit");
+                assert_eq!(db.hard().unwrap().term, 2);
+                drop(db);
+                assert!(
+                    matches!(
+                        result.recv_timeout(Duration::from_millis(100)),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    ),
+                    "read reply escaped before epoch publication"
+                );
+                roles.send_replace(*epoch);
+            },
+        )
+        .unwrap();
+        assert!(result
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .is_err());
+        caller.join().unwrap();
+        assert!(
+            !database.lock().unwrap().failed,
+            "legitimate epoch change quarantined the voter"
+        );
+    }
     #[test]
     fn content_reader_waits_for_projection_commit_and_cannot_see_a_rolled_back_prefix() {
         let dir = tempfile::tempdir().unwrap();
