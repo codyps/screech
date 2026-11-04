@@ -347,9 +347,11 @@ positive hub forwarding/drop counters. The control repeats after the minority
 reboots, requiring new kernel IDs only on those targets and the same link policy.
 A final control requires every directed edge to work after healing.
 
-The untouched majority must confirm conditional writes before the cut, while the
-minority is off, after its damaged disks restart behind the partition, and after
-healing. Each phase requires two successful rounds. The power cut uses the existing
+The quorum must confirm conditional writes before the cut, while the minority is
+off, after its damaged disks restart behind the partition, and after healing.
+Each phase requires two successful conditional-write rounds and two successful
+local-service read rounds. During separation these successes must come from the
+untouched majority; after healing any admitted voter may lead. The power cut uses the existing
 thread-pause/cold-boot controls; the other voters keep running. Maintenance boots
 then either corrupt both the active database and WAL when present (`bitflip`) or
 erase the entire store, including identity/watermark files (`wipe`). No voter runs

@@ -80,3 +80,16 @@
     (is (false? (m/recovery? nodes :vm-send-wipe [])))
     (is (true? (m/recovery? nodes :vm-send-wipe
                             (for [node nodes] {:f :exercise :type :ok :value {:node node :recovery true}}))))))
+
+(deftest local-reads-must-have-coverage-and-recovered-voters-may-lead-after-healing
+  (let [p (fixture :vm-send-wipe)
+        no-reads (update-in p [:network_faults 0 :rounds]
+                           #(mapv (fn [r] (update r :reads (fn [reads] (mapv (fn [v] (assoc v :outcome "unknown")) reads)))) %))
+        recovered-leader
+        (update-in p [:network_faults 0 :rounds]
+                   #(mapv (fn [r]
+                            (if (= "healed" (:phase r))
+                              (-> r (assoc-in [:writes 0 :outcome] "ok") (assoc-in [:writes 1 :outcome] "unknown")
+                                    (assoc-in [:reads 0 :outcome] "ok") (assoc-in [:reads 1 :outcome] "unknown")) r)) %))]
+    (is (false? (m/proof? nodes no-reads :vm-send-wipe)))
+    (is (true? (m/proof? nodes recovered-leader :vm-send-wipe)))))

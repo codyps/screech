@@ -156,10 +156,13 @@ class Witness:
         while True:
             if self.error:
                 raise self.error
+            eligible = set(self.cluster.vms) if phase == 'healed' else set(self.case['survivors'])
             with self.lock:
-                count = sum(r['phase'] == phase and any(w['outcome'] == 'ok' and w['node'] in self.case['survivors']
+                count = sum(r['phase'] == phase and any(w['outcome'] == 'ok' and w['node'] in eligible
                                                        for w in r['writes']) for r in self.case['rounds'])
-            if count >= 2:
+                reads = sum(r['phase'] == phase and any(v['outcome'] == 'ok' and v['node'] in eligible
+                                                       for v in r['reads']) for r in self.case['rounds'])
+            if count >= 2 and reads >= 2:
                 return
             assert time.monotonic() < deadline, 'no surviving-quorum progress during ' + phase
             time.sleep(.05)

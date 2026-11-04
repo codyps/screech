@@ -54,8 +54,12 @@
         known (:known result)]
     (and result (= known (number-map (:confirmed c)))
          (every? (fn [phase]
-                   (<= 2 (count (filter #(and (= phase (:phase %))
-                                              (some (fn [w] (and (= "ok" (:outcome w)) (survivors (:node w)))) (:writes %))) rounds))))
+                   (let [eligible (if (= "healed" phase) (set nodes) survivors)
+                         observed (fn [field]
+                                    (count (filter #(and (= phase (:phase %))
+                                                         (some (fn [w] (and (= "ok" (:outcome w)) (eligible (:node w))))
+                                                               (field %))) rounds)))]
+                     (and (<= 2 (observed :writes)) (<= 2 (observed :reads)))))
                  ["partitioned" "powered-off" "restarted-partitioned" "healed"])
          (= (set nodes) (set (keys (node-map (:audits c)))))
          (every? #(= known (number-map %)) (vals (:audits c))))))
