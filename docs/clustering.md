@@ -58,7 +58,11 @@ between checkpoint installation and journal rotation. Legacy FULL stores upgrade
 automatically. This replaces the initial two-sync SQLite-plus-fence path after
 measurements identified its sequential write latency. ReadIndex replaces logged
 read barriers, and persistence-independent leader replication overlaps local and
-follower flushes. Commit notifications and query indexes persist asynchronously.
+follower flushes. Even a single clustered pull stages its output: a committed
+delivery reservation supplies its fresh quorum observation, while an empty or
+error-only plan obtains a new ReadIndex before releasing replies. Requests can
+join a group only before its consensus operation starts. Standalone scheduling
+is unchanged. Commit notifications and query indexes persist asynchronously.
 Retired or wrong-incarnation senders
 are fenced before voting; untrustworthy old state never bootstraps the replacement.
 Committed leader removal explicitly steps down the old leader. Application writer

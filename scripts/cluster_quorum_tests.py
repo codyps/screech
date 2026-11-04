@@ -22,7 +22,7 @@ def wait_for(predicate, description):
     raise TimeoutError(description)
 
 
-def run_case(binary, count, kind):
+def run_case(binary, count, kind, clients_count=2):
     with tempfile.TemporaryDirectory(prefix='screech-quorum-') as tmp:
         root = Path(tmp)
         gate = root/'gate'
@@ -42,10 +42,12 @@ def run_case(binary, count, kind):
                 message = client.pull()
                 if kind != 'consumer-ack':
                     client.ack(message)
+                if kind == 'pull-delivery':
+                    assert client.publish(b'awaiting-delivery') == 2
             finally:
                 client.close()
 
-            clients = [cluster.client(leader) for _ in range(2)]
+            clients = [cluster.client(leader) for _ in range(clients_count)]
             def attempt(client):
                 try:
                     if kind == 'duplicate':
@@ -54,6 +56,8 @@ def run_case(binary, count, kind):
                     if kind == 'empty-pull':
                         reply = client.request_message('$JS.API.CONSUMER.MSG.NEXT.T.D', b'{"batch":1,"no_wait":true}')
                         return reply['status'] in (None, 404)
+                    if kind == 'pull-delivery':
+                        return client.pull()['payload'] == b'awaiting-delivery'
                     if kind == 'consumer-ack':
                         reply = client.request_message(message['reply'], b'+ACK')
                         return reply['status'] is None
@@ -70,7 +74,7 @@ def run_case(binary, count, kind):
                     cluster.kill(slot)
                 return victims
 
-            with ThreadPoolExecutor(max_workers=2) as pool:
+            with ThreadPoolExecutor(max_workers=clients_count) as pool:
                 if kind == 'api-read':
                     victims = lose_quorum()
                     futures = [pool.submit(attempt, client) for client in clients]
@@ -80,8 +84,8 @@ def run_case(binary, count, kind):
                     release.unlink()
                     futures = [pool.submit(attempt, client) for client in clients]
                     try:
-                        wait_for(lambda: ready.exists() and ingress.exists() and ingress.stat().st_size >= before+2,
-                                 'two requests were not admitted behind the scheduling gate')
+                        wait_for(lambda: ready.exists() and ingress.exists() and ingress.stat().st_size >= before+clients_count,
+                                 'requests were not admitted behind the scheduling gate')
                         victims = lose_quorum()
                     finally:
                         release.touch()
@@ -98,6 +102,8 @@ def run_case(binary, count, kind):
                 try:
                     client = cluster.client(cluster.wait_leader())
                     assert client.get(1) == b'confirmed-payload'
+                    if kind == 'pull-delivery':
+                        assert client.get(2) == b'awaiting-delivery'
                     duplicate = client.publish_with_id(b'ignored', 'stable')
                     assert duplicate['duplicate'] and duplicate['seq'] == 1
                     if kind != 'consumer-ack':
@@ -115,7 +121,7 @@ def run_case(binary, count, kind):
         finally:
             release.touch()
             cluster.close()
-    return dict(voters=count, test=kind, rejected=2, recovered=True, passed=True)
+    return dict(voters=count, test=kind, rejected=clients_count, recovered=True, passed=True)
 
 
 if __name__ == '__main__':
@@ -123,8 +129,9 @@ if __name__ == '__main__':
     parser.add_argument('binary', type=lambda path: str(Path(path).resolve()))
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
-    results = [run_case(args.binary, count, kind) for count in (3, 5)
-               for kind in ('duplicate', 'empty-pull', 'consumer-ack', 'api-read')]
+    results = [run_case(args.binary, count, kind, clients_count) for count in (3, 5)
+               for clients_count in (1, 2)
+               for kind in ('duplicate', 'empty-pull', 'pull-delivery', 'consumer-ack', 'api-read')]
     text = json.dumps(results, indent=2)+'\n'
     print(text)
     if args.output:

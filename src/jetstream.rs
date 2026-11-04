@@ -219,7 +219,9 @@ impl Handle {
                             request_scratch = scratch;
                             poll_after_reply = replied && worker.engine.buffers_consumer_state();
                         } else if worker.engine.supports_groups()
-                            && (requests.len() > 1 || active_consumers)
+                            && (requests.len() > 1
+                                || active_consumers
+                                || worker.engine.replicas() > 1)
                         {
                             worker.group_requests(requests, &rx, &mut deferred);
                         } else {
