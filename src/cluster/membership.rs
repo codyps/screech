@@ -19,6 +19,41 @@ pub(crate) struct Change {
     pub replacement: Replacement,
     pub stage: u8,
 }
+/// Authentication uses committed membership, just like Raft's progress tracker.
+/// The actor reloads this policy after applying configuration changes or snapshots.
+pub(crate) struct SenderPolicy {
+    state: Membership,
+    conf: raft::eraftpb::ConfState,
+    node_id: u64,
+    incarnation: [u8; 16],
+}
+impl SenderPolicy {
+    pub fn replacement_pending(&self) -> bool {
+        self.state.replacing.is_some()
+    }
+    pub fn accepts(&self, message: &Message, nonce: [u8; 16]) -> bool {
+        let expected = self
+            .state
+            .identities
+            .get(&message.from)
+            .copied()
+            .unwrap_or([0; 16]);
+        let joining =
+            self.incarnation != [0; 16] && !self.state.identities.contains_key(&self.node_id);
+        let enrolled = self.conf.voters.contains(&message.from)
+            || self.conf.voters_outgoing.contains(&message.from)
+            || self.conf.learners.contains(&message.from)
+            || self.conf.learners_next.contains(&message.from);
+        let replication = matches!(
+            message.get_msg_type(),
+            raft::eraftpb::MessageType::MsgAppend
+                | raft::eraftpb::MessageType::MsgHeartbeat
+                | raft::eraftpb::MessageType::MsgSnapshot
+        );
+        !self.state.retired.contains_key(&message.from)
+            && ((enrolled && expected == nonce) || (joining && replication))
+    }
+}
 impl Database {
     pub(crate) fn validate_voter_count(&self, conf: &raft::eraftpb::ConfState) -> io::Result<()> {
         // This implementation replaces voters one-for-one. General resizing is
@@ -43,7 +78,7 @@ impl Database {
         }
         Ok(())
     }
-    pub fn accepts_sender(&self, message: &Message, nonce: [u8; 16]) -> io::Result<bool> {
+    pub fn sender_policy(&self) -> io::Result<SenderPolicy> {
         // Check both records in one SQLite read snapshot and lock acquisition.
         let (state, conf) = self
             .conn
@@ -68,24 +103,12 @@ impl Database {
             .map(|b| raft::eraftpb::ConfState::parse_from_bytes(&b).map_err(error))
             .transpose()?
             .unwrap_or_default();
-        let expected = state
-            .identities
-            .get(&message.from)
-            .copied()
-            .unwrap_or([0; 16]);
-        let joining = self.incarnation != [0; 16] && !state.identities.contains_key(&self.node_id);
-        let enrolled = conf.voters.contains(&message.from)
-            || conf.voters_outgoing.contains(&message.from)
-            || conf.learners.contains(&message.from)
-            || conf.learners_next.contains(&message.from);
-        let replication = matches!(
-            message.get_msg_type(),
-            raft::eraftpb::MessageType::MsgAppend
-                | raft::eraftpb::MessageType::MsgHeartbeat
-                | raft::eraftpb::MessageType::MsgSnapshot
-        );
-        Ok(!state.retired.contains_key(&message.from)
-            && ((enrolled && expected == nonce) || (joining && replication)))
+        Ok(SenderPolicy {
+            state,
+            conf,
+            node_id: self.node_id,
+            incarnation: self.incarnation,
+        })
     }
     pub fn membership(&self) -> io::Result<Membership> {
         self.meta("membership")?
@@ -563,12 +586,13 @@ mod tests {
             msg_type: raft::eraftpb::MessageType::MsgRequestVote,
             ..Default::default()
         };
-        assert!(db.accepts_sender(&vote, [7; 16]).unwrap());
-        assert!(!db.accepts_sender(&vote, [8; 16]).unwrap());
+        let policy = db.sender_policy().unwrap();
+        assert!(policy.accepts(&vote, [7; 16]));
+        assert!(!policy.accepts(&vote, [8; 16]));
         vote.from = 3;
-        assert!(!db.accepts_sender(&vote, [0; 16]).unwrap());
+        assert!(!policy.accepts(&vote, [0; 16]));
         vote.from = 5;
-        assert!(!db.accepts_sender(&vote, [0; 16]).unwrap());
+        assert!(!policy.accepts(&vote, [0; 16]));
     }
 }
 

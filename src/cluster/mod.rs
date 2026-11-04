@@ -879,6 +879,10 @@ async fn run_runtime(
             // are transport hints only; membership still gates every message.
             let mut routes = BTreeMap::new();
             let mut tick = Instant::now();
+            let (mut policy, mut policy_index) = {
+                let db = node.store().db.lock().unwrap();
+                (db.sender_policy()?, db.conf_index()?)
+            };
             loop {
                 let mut incoming_lease = None;
                 match rx.recv_timeout(Duration::from_millis(20)) {
@@ -894,10 +898,7 @@ async fn run_runtime(
                     Ok(Input::Fault) => return Err(error("replica storage failed; quarantined")),
                     Ok(Input::Message(message, nonce, permit)) => {
                         incoming_lease = Some(permit);
-                        let db = node.store().db.lock().unwrap();
-                        let allowed = db.accepts_sender(&message, nonce)?;
-                        drop(db);
-                        if allowed {
+                        if policy.accepts(&message, nonce) {
                             tracing::trace!(from=message.from,to=message.to,kind=?message.get_msg_type(),index=message.index,commit=message.commit,"authenticated peer message");
                             if let Some(slot) = actor_config.slot_for(message.from, &BTreeMap::from([(message.from,nonce)])) {
                                 routes.insert(message.from,slot);
@@ -1062,8 +1063,18 @@ async fn run_runtime(
                 }
                 pump(&mut node, &mut pending, &out, &routes)?;
                 drop(incoming_lease);
-                membership::advance_replacement(&mut node)?;
-                let configuration = node.store().db.lock().unwrap().conf_index()?;
+                let configuration = {
+                    let db = node.store().db.lock().unwrap();
+                    let index = db.conf_index()?;
+                    if index != policy_index {
+                        policy = db.sender_policy()?;
+                        policy_index = index;
+                    }
+                    index
+                };
+                if policy.replacement_pending() {
+                    membership::advance_replacement(&mut node)?;
+                }
                 let role = Role {
                     leader: node.raft.leader_id,
                     term: node.raft.term,
