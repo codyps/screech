@@ -163,7 +163,7 @@ share a FULL transaction. A donor may purge data or publish a newer image while 
 older transfer is in flight; the already-constructed transfer retains its bytes.
 Snapshot retries restart the transfer rather than trusting an incomplete image.
 
-The leader checkpoints automatically after 256 Raft positions, when the log uses
+The leader checkpoints automatically after 8,192 Raft positions, when the log uses
 more than half its byte budget, or after a configuration change. An operator can
 request `$JS.API.SCREECH.CLUSTER.COMPACT` to checkpoint immediately. Free SQLite
 pages are reused; the database file can retain its physical high-water size.

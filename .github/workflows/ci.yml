@@ -77,6 +77,7 @@ jobs:
           python3 scripts/cluster_recovery_tests.py target/debug/screech-server --output results/cluster-recovery-tests.json
           python3 scripts/cluster_nats_regression_tests.py target/debug/screech-server --shim ./sqlite-io-fault.so --output results/cluster-nats-regressions.json
           python3 scripts/cluster_quorum_tests.py target/debug/screech-server --output results/cluster-quorum-tests.json
+          python3 scripts/cluster_checkpoint_tests.py target/debug/screech-server --output results/cluster-checkpoint-tests.json
       - name: Unsafe consumer ACK buffering and durable publication fences
         run: python3 scripts/unsafe_ack_tests.py target/debug/screech-server --shim ./sqlite-io-fault.so --output results/unsafe-ack-tests.json
       - name: Retained content exceeds process memory budget

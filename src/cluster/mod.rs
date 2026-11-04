@@ -308,7 +308,7 @@ impl Store for ClusterStore {
         self.client
             .read(|db| {
                 Ok(db.log_bytes()? > db.max_log_bytes / 2
-                    || db.view()?.saturating_sub(db.snapshot_base()?.0) >= 256
+                    || db.view()?.saturating_sub(db.snapshot_base()?.0) >= 8192
                     || db.conf_index()? > db.snapshot_base()?.0)
             })
             .map_err(StoreError::from)

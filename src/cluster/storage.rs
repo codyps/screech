@@ -74,6 +74,13 @@ impl Database {
             .map_err(error)?;
         conn.pragma_update(None, "synchronous", "FULL")
             .map_err(error)?;
+        // Match the standalone WAL budget. Snapshotting retained payloads and
+        // SQLite's page checkpoint are separate work; avoid forcing both into
+        // short admission bursts. FULL commits still sync every accepted entry.
+        conn.pragma_update(None, "wal_autocheckpoint", 4096)
+            .map_err(error)?;
+        conn.pragma_update(None, "journal_size_limit", 32 * 1024 * 1024)
+            .map_err(error)?;
         let initialized: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='cluster_meta')",
