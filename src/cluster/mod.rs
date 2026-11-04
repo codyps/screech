@@ -526,6 +526,29 @@ fn project<R>(
     }
     result
 }
+fn next_batch_input(
+    rx: &mpsc::Receiver<Input>,
+    deferred: &mut Option<Input>,
+    over_budget: bool,
+    term: u64,
+) -> Option<Input> {
+    let input = rx.try_recv().ok()?;
+    // A synchronous accepted-journal flush can consume the time budget while
+    // its quorum acknowledgements arrive. Drain those already queued replies
+    // before COMMIT so acceptance and its projection can share one transaction.
+    // Never wait, skip an earlier input, admit another append past the budget,
+    // or carry a new term across this boundary.
+    let quorum_reply = matches!(&input, Input::Message(message, _, _)
+        if message.term == term && matches!(message.get_msg_type(),
+            raft::eraftpb::MessageType::MsgAppendResponse |
+            raft::eraftpb::MessageType::MsgHeartbeatResponse));
+    if over_budget && !quorum_reply {
+        *deferred = Some(input);
+        None
+    } else {
+        Some(input)
+    }
+}
 fn start_read(node: &mut RawNode<LogStorage>, context: &[u8], round: usize) {
     node.read_index(context.to_vec());
     let conf = node.raft.prs().conf().to_conf_state();
@@ -968,8 +991,10 @@ async fn run_runtime(
                 let db = node.store().db.lock().unwrap();
                 (db.sender_policy()?, db.conf_index()?, db.membership_revision)
             };
+            let mut deferred_input = None;
             loop {
-                let mut input = rx.recv_timeout(Duration::from_millis(20));
+                let mut input = deferred_input.take().map(Ok)
+                    .unwrap_or_else(|| rx.recv_timeout(Duration::from_millis(20)));
                 if matches!(&input, Ok(Input::Stop) | Err(mpsc::RecvTimeoutError::Disconnected)) {
                     break;
                 }
@@ -1178,10 +1203,11 @@ async fn run_runtime(
                     membership::advance_replacement(node)?;
                 }
                 processed += 1;
-                if processed >= 8 || started.elapsed() >= Duration::from_micros(100) { break; }
-                match rx.try_recv() {
-                    Ok(next) => input = Ok(next),
-                    Err(_) => break,
+                if processed >= 8 { break; }
+                match next_batch_input(&rx, &mut deferred_input,
+                    started.elapsed() >= Duration::from_micros(100), node.raft.term) {
+                    Some(next) => input = Ok(next),
+                    None => break,
                 }
                 }
                 Ok(Role { leader: node.raft.leader_id, term: node.raft.term, configuration: policy_index })
@@ -1388,6 +1414,49 @@ async fn run_runtime(
 mod tests {
     use super::*;
     use crate::storage::Append;
+    #[test]
+    fn queued_quorum_replies_cross_the_time_budget_without_skipping_inputs_or_terms() {
+        use raft::eraftpb::MessageType;
+        let message = |kind, term| {
+            Input::Message(
+                Message {
+                    from: 2,
+                    to: 1,
+                    msg_type: kind,
+                    term,
+                    ..Default::default()
+                },
+                [0; 16],
+                Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+            )
+        };
+        let (tx, rx) = mpsc::sync_channel(8);
+        let mut deferred = None;
+        tx.send(message(MessageType::MsgAppendResponse, 3)).unwrap();
+        tx.send(message(MessageType::MsgHeartbeatResponse, 3))
+            .unwrap();
+        tx.send(message(MessageType::MsgAppend, 3)).unwrap();
+        tx.send(message(MessageType::MsgAppendResponse, 3)).unwrap();
+        for _ in 0..2 {
+            assert!(next_batch_input(&rx, &mut deferred, true, 3).is_some());
+            assert!(deferred.is_none());
+        }
+        assert!(next_batch_input(&rx, &mut deferred, true, 3).is_none());
+        assert!(
+            matches!(deferred.take(), Some(Input::Message(m,_,_)) if m.get_msg_type()==MessageType::MsgAppend)
+        );
+        assert!(next_batch_input(&rx, &mut deferred, true, 3).is_some());
+        tx.send(message(MessageType::MsgAppendResponse, 4)).unwrap();
+        assert!(next_batch_input(&rx, &mut deferred, true, 3).is_none());
+        assert!(matches!(deferred.take(), Some(Input::Message(m,_,_)) if m.term==4));
+        tx.send(Input::Stop).unwrap();
+        assert!(next_batch_input(&rx, &mut deferred, false, 3).is_some());
+        assert!(next_batch_input(&rx, &mut deferred, true, 3).is_none());
+        assert!(
+            deferred.is_none(),
+            "empty queue must not create deferred work"
+        );
+    }
     #[test]
     fn borrowed_peer_frames_remain_compatible_with_owned_wire_format() {
         #[derive(Serialize, Deserialize)]
