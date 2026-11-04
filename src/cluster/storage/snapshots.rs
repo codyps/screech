@@ -310,6 +310,7 @@ impl Database {
         .map_err(error)?;
         crate::fault::point("before_cluster_snapshot_install");
         tx.commit().map_err(error)?;
+        self.refresh_log_bytes()?;
         self.snapshot_position = (index, snapshot.get_metadata().term, image.sequence);
         self.seal()?;
         crate::fault::point("after_cluster_snapshot_install");

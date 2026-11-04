@@ -57,6 +57,10 @@ def damage_store(cluster,slot,damage):
         with sqlite3.connect(path) as db:db.execute("UPDATE cluster_meta SET value=?1 WHERE key='incarnation'",[bytes([123])*16])
     elif damage=='watermark-missing':path.with_suffix('.cluster-watermark').unlink()
     elif damage=='watermark-corrupt':path.with_suffix('.cluster-watermark').write_bytes(b'broken recovery seal')
+    elif damage in ('watermark-slot-0','watermark-slot-1'):
+        seal=path.with_suffix('.cluster-watermark');data=bytearray(seal.read_bytes())
+        assert len(data)==8192,'expected two authenticated recovery-fence records'
+        data[int(damage[-1])*4096+128]^=0x80;seal.write_bytes(data)
     elif damage=='manifest-corrupt':
         (cluster.root/str(slot)/'db.node-state').write_bytes(b'broken startup identity')
     elif damage=='all-local-state-missing':
@@ -121,9 +125,13 @@ def run(binary):
                 cluster.kill(victim);cluster.start(victim);wait_healed(cluster,victim);verify(cluster,expected)
                 results.append(dict(test='SIGKILL at '+point+' preserves snapshot recovery',passed=True))
 
-            for damage in ['missing','blank','garbage','snapshot-corrupt','snapshot-body-missing','log-tail-missing','wal-only','incarnation-corrupt','stale','watermark-missing','watermark-corrupt','manifest-corrupt','all-local-state-missing']:
+            for damage in ['missing','blank','garbage','snapshot-corrupt','snapshot-body-missing','log-tail-missing','wal-only','incarnation-corrupt','stale','watermark-missing','watermark-corrupt','watermark-slot-0','watermark-slot-1','manifest-corrupt','all-local-state-missing']:
                 compact(cluster);old=cluster.wait_leader();cluster.await_equal()
                 previous=cluster.member(old);node=cluster.root/str(old);dbfile=cluster.store_path(old)
+                if damage=='log-tail-missing':
+                    # ReadIndex does not manufacture a log tail after compaction.
+                    # Remove an actual confirmed application transition instead.
+                    c=cluster.client(old);seq=c.publish(b'confirmed-tail-before-damage');expected[seq]=b'confirmed-tail-before-damage';c.close();cluster.await_equal()
                 if damage=='stale':
                     with sqlite3.connect(dbfile) as source,sqlite3.connect(node/'stale') as dest:source.backup(dest)
                     c=cluster.client(old);seq=c.publish(b'newer-than-backup');expected[seq]=b'newer-than-backup';c.close()
@@ -176,7 +184,7 @@ def run(binary):
             verify(cluster,{1:b'learner-state'},acked=False)
             results.append(dict(test='destroyed learner is automatically retired and replaced during recovery',passed=True))
         finally:cluster.close()
-    for point in ['before_cluster_startup_manifest','after_cluster_startup_manifest','before_cluster_watermark','after_cluster_watermark']:
+    for point in ['before_cluster_startup_manifest','after_cluster_startup_manifest','before_cluster_watermark','after_cluster_watermark_write','after_cluster_watermark']:
         with tempfile.TemporaryDirectory(prefix='screech-startup-fault-') as tmp:
             cluster=Cluster(binary,Path(tmp))
             try:

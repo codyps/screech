@@ -1,6 +1,7 @@
-//! Authoritative Raft entries and committed application indexes share one FULL
-//! SQLite transaction domain. Indexes point into entries; payloads have no second
-//! durability path. Accepted suffixes are never exposed through the Store view.
+//! Authoritative Raft entries, terms and votes use FULL SQLite transactions.
+//! Commit notifications and reconstructible application indexes may use NORMAL:
+//! Raft does not require commit-index updates to sync. Payloads remain in FULL
+//! accepted entries; startup reconstructs indexes before exposing committed data.
 use super::{error, Batch, ClusterConfig};
 mod snapshots;
 mod watermark;
@@ -33,6 +34,7 @@ pub(crate) struct Database {
     pub genesis: ConfState,
     pub max_log_bytes: u64,
     pub snapshot_position: (u64, u64, u64),
+    entries_bytes: u64,
     _lock: File,
     watermark: watermark::Watermark,
 }
@@ -148,12 +150,14 @@ impl Database {
             _lock: lock,
             failed: false,
             snapshot_position: (0, 0, 0),
+            entries_bytes: 0,
             gate: Arc::new(Mutex::new(())),
             node_id: config.node_id,
             incarnation,
             genesis: genesis.clone(),
             max_log_bytes: config.max_log_bytes,
         };
+        db.refresh_log_bytes()?;
         if db.meta("conf")?.is_none() {
             db.conn
                 .execute(
@@ -202,9 +206,9 @@ impl Database {
     }
     pub fn meta(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
         self.conn
-            .query_row("SELECT value FROM cluster_meta WHERE key=?1", [key], |r| {
-                r.get(0)
-            })
+            .prepare_cached("SELECT value FROM cluster_meta WHERE key=?1")
+            .map_err(error)?
+            .query_row([key], |r| r.get(0))
             .optional()
             .map_err(error)
     }
@@ -233,14 +237,19 @@ impl Database {
             .and_then(|n| Ok(n.max(self.snapshot_base()?.2)))
     }
     pub fn log_bytes(&self) -> io::Result<u64> {
-        self.conn
+        Ok(self.entries_bytes)
+    }
+    fn refresh_log_bytes(&mut self) -> io::Result<()> {
+        self.entries_bytes = self
+            .conn
             .query_row(
                 "SELECT coalesce(sum(length(data)),0) FROM entries",
                 [],
                 |r| r.get::<_, i64>(0),
             )
             .map_err(error)
-            .and_then(|n| u64::try_from(n).map_err(error))
+            .and_then(|n| u64::try_from(n).map_err(error))?;
+        Ok(())
     }
     pub fn entry(&self, idx: u64) -> io::Result<Entry> {
         if self.failed {
@@ -248,11 +257,9 @@ impl Database {
         }
         let (bytes, crc): (Vec<u8>, u32) = self
             .conn
-            .query_row(
-                "SELECT data,crc FROM entries WHERE idx=?1",
-                [sql(idx)?],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .prepare_cached("SELECT data,crc FROM entries WHERE idx=?1")
+            .map_err(error)?
+            .query_row([sql(idx)?], |r| Ok((r.get(0)?, r.get(1)?)))
             .map_err(error)?;
         if crc32fast::hash(&bytes) != crc {
             return Err(error("Raft entry checksum mismatch"));
@@ -267,7 +274,12 @@ impl Database {
         if self.failed {
             return Err(error("replica quarantined"));
         }
+        if entries.is_empty() && hard.is_none() {
+            return Ok(());
+        }
         let old = self.hard()?;
+        let durable =
+            !entries.is_empty() || hard.is_some_and(|h| h.term != old.term || h.vote != old.vote);
         let last = self.last()?;
         if let Some(first) = entries.first() {
             if first.index > last + 1 || entries.windows(2).any(|p| p[1].index != p[0].index + 1) {
@@ -286,34 +298,58 @@ impl Database {
                 return Err(error("invalid durable hard state"));
             }
         }
-        let tx = self.conn.transaction().map_err(error)?;
-        if let Some(first) = entries.first() {
-            tx.execute("DELETE FROM entries WHERE idx>=?1", [sql(first.index)?])
-                .map_err(error)?;
-            for entry in entries {
-                let bytes = entry.write_to_bytes().map_err(error)?;
+        let removed = if let Some(first) = entries.first().filter(|first| first.index <= last) {
+            self.conn
+                .query_row(
+                    "SELECT coalesce(sum(length(data)),0) FROM entries WHERE idx>=?1",
+                    [sql(first.index)?],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(error)
+                .and_then(|n| u64::try_from(n).map_err(error))?
+        } else {
+            0
+        };
+        let mut added = 0u64;
+        self.commit_transaction(durable, |tx| {
+            if let Some(first) = entries.first() {
+                tx.execute("DELETE FROM entries WHERE idx>=?1", [sql(first.index)?])
+                    .map_err(error)?;
+                for entry in entries {
+                    let bytes = entry.write_to_bytes().map_err(error)?;
+                    added = added
+                        .checked_add(bytes.len() as u64)
+                        .ok_or_else(|| error("log size overflow"))?;
+                    tx.execute(
+                        "INSERT INTO entries VALUES(?1,?2,?3,?4)",
+                        params![
+                            sql(entry.index)?,
+                            sql(entry.term)?,
+                            bytes,
+                            crc32fast::hash(&bytes)
+                        ],
+                    )
+                    .map_err(error)?;
+                }
+            }
+            if let Some(h) = hard {
                 tx.execute(
-                    "INSERT INTO entries VALUES(?1,?2,?3,?4)",
-                    params![
-                        sql(entry.index)?,
-                        sql(entry.term)?,
-                        bytes,
-                        crc32fast::hash(&bytes)
-                    ],
+                    "INSERT OR REPLACE INTO cluster_meta VALUES('hard',?1)",
+                    [h.write_to_bytes().map_err(error)?],
                 )
                 .map_err(error)?;
             }
+            crate::fault::point("before_cluster_persist");
+            Ok(())
+        })?;
+        self.entries_bytes = self
+            .entries_bytes
+            .checked_sub(removed)
+            .and_then(|n| n.checked_add(added))
+            .ok_or_else(|| error("invalid cached log size"))?;
+        if durable {
+            self.seal()?;
         }
-        if let Some(h) = hard {
-            tx.execute(
-                "INSERT OR REPLACE INTO cluster_meta VALUES('hard',?1)",
-                [h.write_to_bytes().map_err(error)?],
-            )
-            .map_err(error)?;
-        }
-        crate::fault::point("before_cluster_persist");
-        tx.commit().map_err(error)?;
-        self.seal()?;
         crate::fault::point("after_cluster_persist");
         Ok(())
     }
@@ -341,40 +377,68 @@ impl Database {
             };
             decoded.push((entry, batch));
         }
-        let tx = self.conn.transaction().map_err(error)?;
-        let mut results = Vec::new();
-        for (entry, batch) in decoded {
-            if let Some(batch) = batch {
-                for (ordinal, _) in batch.records.iter().enumerate() {
-                    end += 1;
-                    tx.execute(
-                        "INSERT INTO event_index VALUES(?1,?2,?3)",
-                        params![sql(end)?, sql(entry.index)?, ordinal as i64],
-                    )
-                    .map_err(error)?;
+        self.commit_transaction(false, |tx| {
+            let mut results = Vec::new();
+            for (entry, batch) in decoded {
+                if let Some(batch) = batch {
+                    for (ordinal, _) in batch.records.iter().enumerate() {
+                        end += 1;
+                        tx.execute(
+                            "INSERT INTO event_index VALUES(?1,?2,?3)",
+                            params![sql(end)?, sql(entry.index)?, ordinal as i64],
+                        )
+                        .map_err(error)?;
+                    }
+                    for (ordinal, c) in batch.contents.iter().enumerate() {
+                        tx.execute(
+                            "INSERT INTO body_index VALUES(?1,?2,?3,?4)",
+                            params![
+                                sql(c.key.generation)?,
+                                sql(c.key.sequence)?,
+                                sql(entry.index)?,
+                                ordinal as i64
+                            ],
+                        )
+                        .map_err(error)?;
+                    }
                 }
-                for (ordinal, c) in batch.contents.iter().enumerate() {
-                    tx.execute(
-                        "INSERT INTO body_index VALUES(?1,?2,?3,?4)",
-                        params![
-                            sql(c.key.generation)?,
-                            sql(c.key.sequence)?,
-                            sql(entry.index)?,
-                            ordinal as i64
-                        ],
-                    )
-                    .map_err(error)?;
-                }
+                results.push((entry.context.to_vec(), end));
             }
-            results.push((entry.context.to_vec(), end));
+            tx.execute(
+                "INSERT OR REPLACE INTO cluster_meta VALUES('view',?1)",
+                [commit.to_le_bytes().as_slice()],
+            )
+            .map_err(error)?;
+            Ok(results)
+        })
+    }
+    fn commit_transaction<T>(
+        &mut self,
+        durable: bool,
+        apply: impl FnOnce(&rusqlite::Transaction<'_>) -> io::Result<T>,
+    ) -> io::Result<T> {
+        if !durable {
+            self.conn
+                .pragma_update(None, "synchronous", "NORMAL")
+                .map_err(error)?;
         }
-        tx.execute(
-            "INSERT OR REPLACE INTO cluster_meta VALUES('view',?1)",
-            [commit.to_le_bytes().as_slice()],
-        )
-        .map_err(error)?;
-        tx.commit().map_err(error)?;
-        Ok(results)
+        let result = (|| {
+            let tx = self.conn.transaction().map_err(error)?;
+            let value = apply(&tx)?;
+            tx.commit().map_err(error)?;
+            Ok(value)
+        })();
+        // Never leave a path that can persist a vote or accepted payload at
+        // NORMAL. A FULL commit also flushes all preceding NORMAL WAL frames.
+        let restored = if !durable {
+            self.conn
+                .pragma_update(None, "synchronous", "FULL")
+                .map_err(error)
+        } else {
+            Ok(())
+        };
+        restored?;
+        result
     }
     pub fn record(&self, sequence: u64) -> io::Result<Option<Record>> {
         let pos: Option<(i64, i64)> = self
@@ -503,6 +567,73 @@ impl Storage for LogStorage {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cached_log_budget_survives_suffix_replacement_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let c = config();
+        let mut db = Database::open(&path, &c, true).unwrap();
+        let mut a = Entry {
+            index: 1,
+            term: 1,
+            ..Default::default()
+        };
+        a.data = vec![7; 64].into();
+        let mut b = Entry {
+            index: 2,
+            term: 1,
+            ..Default::default()
+        };
+        b.data = vec![8; 128].into();
+        db.persist(
+            &[a.clone(), b.clone()],
+            Some(&HardState {
+                term: 1,
+                vote: 1,
+                commit: 0,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            db.log_bytes().unwrap(),
+            u64::from(a.compute_size() + b.compute_size())
+        );
+        b.term = 2;
+        b.data = vec![9; 16].into();
+        db.persist(
+            &[b.clone()],
+            Some(&HardState {
+                term: 2,
+                vote: 1,
+                commit: 0,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        let expected = u64::from(a.compute_size() + b.compute_size());
+        assert_eq!(db.log_bytes().unwrap(), expected);
+        assert!(db
+            .persist(
+                &[Entry {
+                    index: 4,
+                    term: 2,
+                    ..Default::default()
+                }],
+                None
+            )
+            .is_err());
+        assert_eq!(db.log_bytes().unwrap(), expected);
+        drop(db);
+        assert_eq!(
+            Database::open(&path, &c, false)
+                .unwrap()
+                .log_bytes()
+                .unwrap(),
+            expected
+        );
+    }
+
     use super::*;
     use crate::{
         cluster::{Batch, Peer},
