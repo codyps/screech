@@ -98,6 +98,7 @@ struct Worker<S> {
     observer: Arc<RwLock<Option<Interest>>>,
     interests: Arc<RwLock<Vec<String>>>,
     quorum_observed: bool,
+    checkpoint_checked: Option<u64>,
 }
 impl Handle {
     pub fn start<S: Store + 'static>(store: S) -> Result<Self, durable::Error> {
@@ -110,7 +111,10 @@ impl Handle {
         Self::start_engine(Engine::recover_single_voter(store)?)
     }
     fn start_engine<S: Store + 'static>(engine: Engine<S>) -> Result<Self, durable::Error> {
-        let direct_output = engine.voter_progress().is_none();
+        // Cluster persistence has its own Raft owner. Its application worker
+        // can use the existing synchronous Core adapter without blocking that
+        // owner. Keep the fixed single-voter driver's output isolation.
+        let direct_output = engine.voter_progress().is_none() || engine.replicas() > 1;
         let interests = Arc::new(RwLock::new(
             engine
                 .state()
@@ -145,6 +149,7 @@ impl Handle {
                 observer: worker_observer,
                 interests: worker_interests,
                 quorum_observed: false,
+                checkpoint_checked: None,
             };
             let mut deferred = None;
             let mut idle_wait = Duration::from_millis(10);
@@ -1791,8 +1796,17 @@ impl<S: Store> Worker<S> {
         if self.engine.is_poisoned() {
             return Ok(false);
         }
-        if self.plan.is_none() && self.engine.checkpoint_needed().map_err(|e| e.to_string())? {
-            self.engine.checkpoint().map_err(|e| e.to_string())?;
+        let applied = self.engine.voter_progress().map(|p| p.applied);
+        if self.plan.is_none()
+            && (self.engine.replicas() == 1 || self.checkpoint_checked != applied)
+        {
+            // Pure reads cannot add accepted bytes. A new application position
+            // needs a pressure check; a new leader/configuration gets a fresh
+            // worker and an initial check. Keep standalone polling unchanged.
+            if self.engine.checkpoint_needed().map_err(|e| e.to_string())? {
+                self.engine.checkpoint().map_err(|e| e.to_string())?;
+            }
+            self.checkpoint_checked = applied;
         }
         if self.plan.is_none()
             && (self.engine.replicas() == 1 || !self.quorum_observed)
