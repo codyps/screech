@@ -132,6 +132,11 @@ struct Role {
     configuration: u64,
 }
 type Reply = mpsc::SyncSender<io::Result<u64>>;
+struct Pending {
+    started: Instant,
+    reply: Reply,
+    read_index: Option<u64>,
+}
 enum Input {
     Message(Message, [u8; 16], tokio::sync::OwnedSemaphorePermit),
     Propose {
@@ -140,6 +145,12 @@ enum Input {
         session: u64,
         activate: bool,
         data: Vec<u8>,
+        reply: Reply,
+    },
+    Read {
+        term: u64,
+        configuration: u64,
+        session: u64,
         reply: Reply,
     },
     Stop,
@@ -173,6 +184,23 @@ struct Client {
     active_session: Arc<AtomicU64>,
 }
 impl Client {
+    fn barrier(&self) -> io::Result<()> {
+        self.current()?;
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.tx
+            .try_send(Input::Read {
+                term: self.term,
+                configuration: self.configuration,
+                session: self.session,
+                reply,
+            })
+            .map_err(error)?;
+        rx.recv_timeout(RPC_TIMEOUT)
+            .map_err(|_| error("quorum read timeout"))??;
+        // A service can be replaced while ReadIndex is in flight, including in
+        // the same Raft term. Check both the published and durable epochs.
+        self.read(|_| Ok(()))
+    }
     fn propose(&self, data: Vec<u8>) -> io::Result<u64> {
         self.request(data, false)
     }
@@ -300,10 +328,7 @@ impl Store for ClusterStore {
     // A complete durable snapshot replaces the covered committed prefix. The
     // accepted suffix remains authoritative until consensus commits or replaces it.
     fn read_barrier(&self) -> Result<(), StoreError> {
-        self.client
-            .propose(Vec::new())
-            .map(|_| ())
-            .map_err(StoreError::from)
+        self.client.barrier().map_err(StoreError::from)
     }
     fn append(&mut self, s: &str, h: &[u8], p: &[u8]) -> Result<u64, StoreError> {
         self.append_with_content(
@@ -431,7 +456,7 @@ impl Store for ClusterStore {
 }
 fn pump(
     node: &mut RawNode<LogStorage>,
-    pending: &mut BTreeMap<Vec<u8>, (Instant, Reply)>,
+    pending: &mut BTreeMap<Vec<u8>, Pending>,
     out: &BTreeMap<u64, tokio::sync::mpsc::Sender<Message>>,
     routes: &BTreeMap<u64, u64>,
 ) -> io::Result<()> {
@@ -439,6 +464,19 @@ fn pump(
         let gate = node.store().db.lock().unwrap().gate.clone();
         let _gate = gate.lock().unwrap();
         let mut ready = node.ready();
+        let read_states = ready.take_read_states();
+        let old = node.store().db.lock().unwrap().hard()?;
+        let epoch_change = !ready.snapshot().is_empty()
+            || ready
+                .hs()
+                .is_some_and(|hard| hard.term != old.term || hard.vote != old.vote);
+        let mut early = ready.take_messages();
+        if !epoch_change {
+            // Raft marks leader replication messages as independent of local
+            // entry persistence. Followers can flush in parallel with us; our
+            // own durable acceptance and every follower ACK remain fenced.
+            dispatch_messages(node, std::mem::take(&mut early), out, routes)?;
+        }
         {
             let mut db = node.store().db.lock().unwrap();
             if ready.snapshot().is_empty() {
@@ -447,8 +485,8 @@ fn pump(
                 db.install_snapshot(ready.snapshot(), ready.hs(), ready.entries(), false)?;
             }
         }
-        let mut messages = ready.take_messages();
-        messages.extend(ready.take_persisted_messages());
+        early.extend(ready.take_persisted_messages());
+        dispatch_messages(node, early, out, routes)?;
         // Applying the durable hard-state prefix builds the application indexes.
         // Raft's committed entry lists may be split across Ready and LightReady.
         let commit = node.store().db.lock().unwrap().hard()?.commit;
@@ -459,8 +497,8 @@ fn pump(
             db.apply(commit)?
         };
         for (key, end) in replies {
-            if let Some((_, reply)) = pending.remove(&key) {
-                let _ = reply.send(Ok(end));
+            if let Some(request) = pending.remove(&key) {
+                let _ = request.reply.send(Ok(end));
             }
         }
         let mut light = node.advance(ready);
@@ -471,14 +509,38 @@ fn pump(
             membership::apply_configuration(node, commit)?;
             let mut db = node.store().db.lock().unwrap();
             for (key, end) in db.apply(commit)? {
-                if let Some((_, reply)) = pending.remove(&key) {
-                    let _ = reply.send(Ok(end));
+                if let Some(request) = pending.remove(&key) {
+                    let _ = request.reply.send(Ok(end));
                 }
             }
         }
-        messages.extend(light.take_messages());
+        dispatch_messages(node, light.take_messages(), out, routes)?;
         // The application is represented by its committed indexes, advanced above.
         node.advance_apply();
+        for state in read_states {
+            if let Some(request) = pending.get_mut(&state.request_ctx) {
+                request.read_index = Some(state.index);
+            }
+        }
+        let view = node.store().db.lock().unwrap().view()?;
+        pending.retain(|_, request| {
+            if request.read_index.is_some_and(|index| index <= view) {
+                let _ = request.reply.send(Ok(view));
+                false
+            } else {
+                true
+            }
+        });
+    }
+    Ok(())
+}
+fn dispatch_messages(
+    node: &RawNode<LogStorage>,
+    messages: Vec<Message>,
+    out: &BTreeMap<u64, tokio::sync::mpsc::Sender<Message>>,
+    routes: &BTreeMap<u64, u64>,
+) -> io::Result<()> {
+    if !messages.is_empty() {
         let identities = node.store().db.lock().unwrap().membership()?.identities;
         for message in messages {
             let route = if out.contains_key(&message.to) {
@@ -525,7 +587,7 @@ struct Chunk {
 }
 async fn send_message(
     config: &ClusterConfig,
-    address: SocketAddr,
+    stream: &mut TcpStream,
     message: &Message,
     incarnation: [u8; 16],
 ) -> io::Result<()> {
@@ -536,7 +598,6 @@ async fn send_message(
     let hash: [u8; 32] = Sha256::digest(&body).into();
     let mut nonce = [0; 16];
     getrandom::fill(&mut nonce).map_err(error)?;
-    let mut stream = TcpStream::connect(address).await?;
     for (n, data) in body.chunks(1024 * 1024).enumerate() {
         let chunk = Chunk {
             nonce,
@@ -558,8 +619,10 @@ async fn send_message(
             incarnation,
         })
         .map_err(error)?;
-        stream.write_u32(envelope.len() as u32).await?;
-        stream.write_all(&envelope).await?;
+        let mut frame = Vec::with_capacity(4 + envelope.len());
+        frame.extend_from_slice(&(envelope.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&envelope);
+        stream.write_all(&frame).await?;
     }
     Ok(())
 }
@@ -654,12 +717,33 @@ async fn network(
             let mut stop = stop.clone();
             let tx = tx.clone();
             tokio::spawn(async move {
+                // A replacement and its retiring voter share one physical
+                // address. Their authenticated destinations need independent
+                // streams: rejecting an old ID must not drop the new ID's next
+                // frame. Bound the cache across repeated replacements.
+                let mut streams: BTreeMap<u64, (TcpStream, Instant)> = BTreeMap::new();
                 loop {
                     tokio::select! {
                         _=stop.changed()=>break,
                         message=receive.recv()=>{let Some(message)=message else{break};
                             let snapshot=message.get_msg_type()==raft::eraftpb::MessageType::MsgSnapshot;
-                            let result=tokio::time::timeout(Duration::from_secs(30),send_message(&config,address,&message,incarnation)).await;
+                            let result=tokio::select! {
+                                _=stop.changed()=>break,
+                                result=tokio::time::timeout(Duration::from_secs(30),async {
+                                    if !streams.contains_key(&message.to) {
+                                        if streams.len()>=4 {
+                                            if let Some(oldest)=streams.iter().min_by_key(|(_,(_,used))|*used).map(|(id,_)|*id) {streams.remove(&oldest);}
+                                        }
+                                        let connected=TcpStream::connect(address).await?;
+                                        connected.set_nodelay(true)?;
+                                        streams.insert(message.to,(connected,Instant::now()));
+                                    }
+                                    let (stream,used)=streams.get_mut(&message.to).unwrap();
+                                    *used=Instant::now();
+                                    send_message(&config,stream,&message,incarnation).await
+                                })=>result,
+                            };
+                            if !matches!(result,Ok(Ok(()))) { streams.remove(&message.to); }
                             if snapshot {let _=tx.try_send(Input::SnapshotSent(message.to,matches!(result,Ok(Ok(())))));}
                         }
                     }
@@ -715,7 +799,7 @@ async fn run_runtime(
     let actor = std::thread::Builder::new()
         .name("screech-raft".into())
         .spawn(move || -> io::Result<()> {
-            let mut pending: BTreeMap<Vec<u8>, (Instant, Reply)> = BTreeMap::new();
+            let mut pending: BTreeMap<Vec<u8>, Pending> = BTreeMap::new();
             let mut nonce = [0u8; 16];
             getrandom::fill(&mut nonce).map_err(error)?;
             let mut serial = 0u64;
@@ -743,13 +827,14 @@ async fn run_runtime(
                         let allowed = db.accepts_sender(&message, nonce)?;
                         drop(db);
                         if allowed {
+                            tracing::trace!(from=message.from,to=message.to,kind=?message.get_msg_type(),index=message.index,commit=message.commit,"authenticated peer message");
                             if let Some(slot) = actor_config.slot_for(message.from, &BTreeMap::from([(message.from,nonce)])) {
                                 routes.insert(message.from,slot);
                             }
                             if message.get_msg_type() == raft::eraftpb::MessageType::MsgSnapshot {
                                 tracing::debug!(from=message.from,to=message.to,index=message.get_snapshot().get_metadata().index, conf=?message.get_snapshot().get_metadata().get_conf_state(),"received snapshot");
                             }
-                            let _ = node.step(message);
+                            if let Err(error)=node.step(message) {tracing::debug!(%error,"peer Raft step rejected");}
                         } else {
                             tracing::debug!(from=message.from,to=message.to,kind=?message.get_msg_type(),"fenced peer message");
                         }
@@ -840,6 +925,21 @@ async fn run_runtime(
                             let _ = reply.send(result.map(|_| 0));
                         }
                     }
+                    Ok(Input::Read {term,configuration,session,reply}) => {
+                        if node.raft.state != StateRole::Leader
+                            || node.raft.term != term
+                            || configuration != node.store().db.lock().unwrap().conf_index()?
+                            || session != actor_session.load(Ordering::Acquire)
+                        {
+                            let _ = reply.send(Err(error("not current leader")));
+                        } else {
+                            serial = serial.checked_add(1).ok_or_else(|| error("proposal IDs exhausted"))?;
+                            let mut context = nonce.to_vec();
+                            context.extend_from_slice(&serial.to_le_bytes());
+                            node.read_index(context.clone());
+                            pending.insert(context, Pending {started: Instant::now(),reply,read_index:None});
+                        }
+                    }
                     Ok(Input::Propose {
                         term,
                         configuration,
@@ -856,19 +956,8 @@ async fn run_runtime(
                         {
                             let _ = reply.send(Err(error("not current leader")));
                         } else {
-                            let used: i64 = node
-                                .store()
-                                .db
-                                .lock()
-                                .unwrap()
-                                .conn
-                                .query_row(
-                                    "SELECT coalesce(sum(length(data)),0) FROM entries",
-                                    [],
-                                    |r| r.get(0),
-                                )
-                                .map_err(error)?;
-                            if used as u64 + data.len() as u64 + 256 > actor_config.max_log_bytes {
+                            let used = node.store().db.lock().unwrap().log_bytes()?;
+                            if used + data.len() as u64 + 256 > actor_config.max_log_bytes {
                                 let _ = reply
                                     .send(Err(error("cluster log budget reached; writes paused")));
                             } else {
@@ -882,7 +971,7 @@ async fn run_runtime(
                                         if activate {
                                             actor_session.store(session, Ordering::Release);
                                         }
-                                        pending.insert(context, (Instant::now(), reply));
+                                        pending.insert(context, Pending {started: Instant::now(),reply,read_index:None});
                                     }
                                     Err(e) => {
                                         let _ = reply.send(Err(error(e)));
@@ -914,9 +1003,9 @@ async fn run_runtime(
                         false
                     }
                 });
-                pending.retain(|_, (start, reply)| {
-                    if node.raft.state != StateRole::Leader || start.elapsed() > RPC_TIMEOUT {
-                        let _ = reply.send(Err(error(
+                pending.retain(|_, request| {
+                    if node.raft.state != StateRole::Leader || request.started.elapsed() > RPC_TIMEOUT {
+                        let _ = request.reply.send(Err(error(
                             "leadership lost or quorum timeout; outcome unknown",
                         )));
                         false
@@ -1046,7 +1135,7 @@ async fn run_runtime(
             _=shutdown.changed()=>break,
             result=actor_status.changed()=>{if result.is_err(){break;}},
             accepted=clients.accept()=>{
-                let (mut incoming,_)=accepted?;let Ok(slot)=slots.clone().try_acquire_owned() else{continue};
+                let (mut incoming,_)=accepted?;incoming.set_nodelay(true)?;let Ok(slot)=slots.clone().try_acquire_owned() else{continue};
                 let mut role=role.clone();let peers=config.peers.clone();let route_db=db.clone();let mut stop=stop_rx.clone();
                 tokio::spawn(async move {
                     let _slot=slot;
@@ -1054,7 +1143,7 @@ async fn run_runtime(
                         loop {
                             let current=*role.borrow_and_update();
                             let leader_slot=if peers.contains_key(&current.leader){current.leader}else{route_db.lock().unwrap().membership().ok().and_then(|m|m.identities.get(&current.leader).map(|n|u64::from_le_bytes(n[..8].try_into().unwrap()))).unwrap_or(0)};
-                            if let Some(peer)=peers.get(&leader_slot) {if let Ok(stream)=TcpStream::connect(peer.service).await{return Ok::<_,io::Error>((current,stream));}}
+                            if let Some(peer)=peers.get(&leader_slot) {if let Ok(stream)=TcpStream::connect(peer.service).await{stream.set_nodelay(true)?;return Ok::<_,io::Error>((current,stream));}}
                             tokio::select!{_=role.changed()=>{},_=tokio::time::sleep(Duration::from_millis(50))=>{}}
                         }
                     }).await;
@@ -1108,6 +1197,7 @@ mod tests {
     }
     struct Simulation {
         nodes: Vec<RawNode<LogStorage>>,
+        pending: Vec<BTreeMap<Vec<u8>, Pending>>,
         receive: Vec<tokio::sync::mpsc::Receiver<Message>>,
         send: BTreeMap<u64, tokio::sync::mpsc::Sender<Message>>,
     }
@@ -1143,6 +1233,7 @@ mod tests {
                 );
             }
             Self {
+                pending: (0..voters).map(|_| BTreeMap::new()).collect(),
                 nodes,
                 receive,
                 send,
@@ -1152,8 +1243,8 @@ mod tests {
             // Reverse and duplicate messages to exercise the real implementation's
             // ordering/idempotency rather than simulating an ideal transport.
             for _ in 0..100 {
-                for node in &mut self.nodes {
-                    pump(node, &mut BTreeMap::new(), &self.send, &BTreeMap::new()).unwrap();
+                for (node, pending) in self.nodes.iter_mut().zip(&mut self.pending) {
+                    pump(node, pending, &self.send, &BTreeMap::new()).unwrap();
                 }
                 let mut messages = Vec::new();
                 for rx in &mut self.receive {
@@ -1182,6 +1273,23 @@ mod tests {
                 }
                 self.settle(isolated);
             }
+        }
+        fn quorum_read(
+            &mut self,
+            leader: usize,
+            context: Vec<u8>,
+        ) -> mpsc::Receiver<io::Result<u64>> {
+            let (reply, rx) = mpsc::sync_channel(1);
+            self.nodes[leader].read_index(context.clone());
+            self.pending[leader].insert(
+                context,
+                Pending {
+                    started: Instant::now(),
+                    reply,
+                    read_index: None,
+                },
+            );
+            rx
         }
         fn propose(&mut self, node: usize, key: u64, body: &'static [u8]) {
             let batch = Batch {
@@ -1220,10 +1328,15 @@ mod tests {
         assert_eq!(sim.nodes[0].store().db.lock().unwrap().end().unwrap(), 1);
         sim.nodes[1].campaign().unwrap();
         sim.settle(Some(1));
-        sim.ticks(20, Some(1));
-        let leader = (1..3)
-            .find(|&n| sim.nodes[n].raft.state == StateRole::Leader)
-            .unwrap();
+        // Election timeouts are randomized; the first round can legitimately
+        // split the two surviving votes. Require bounded recovery, not a lucky
+        // timeout draw in exactly twenty ticks.
+        let leader = (0..100)
+            .find_map(|_| {
+                sim.ticks(1, Some(1));
+                (1..3).find(|&n| sim.nodes[n].raft.state == StateRole::Leader)
+            })
+            .expect("surviving quorum failed to elect a leader");
         sim.propose(leader, 2, b"replacement");
         sim.settle(Some(1));
         sim.ticks(30, None);
@@ -1291,6 +1404,29 @@ mod tests {
         sim.settle(None);
         assert_eq!(sim.nodes[0].raft.state, StateRole::Follower);
         assert!(!membership::step_down_removed(&mut sim.nodes[0]));
+    }
+    #[test]
+    fn quorum_reads_wait_for_majority_without_appending_or_advancing_durable_history() {
+        for count in [3, 5] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut sim = Simulation::with_voters(dir.path(), count);
+            sim.nodes[0].campaign().unwrap();
+            sim.settle(None);
+            let before = {
+                let db = sim.nodes[0].store().db.lock().unwrap();
+                (db.last().unwrap(), db.hard().unwrap(), db.view().unwrap())
+            };
+            let rx = sim.quorum_read(0, b"partitioned-read".to_vec());
+            sim.settle(Some(1));
+            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            sim.ticks(3, None);
+            assert_eq!(rx.try_recv().unwrap().unwrap(), before.2);
+            let db = sim.nodes[0].store().db.lock().unwrap();
+            assert_eq!(
+                (db.last().unwrap(), db.hard().unwrap(), db.view().unwrap()),
+                before
+            );
+        }
     }
     #[test]
     fn old_term_majority_cannot_commit_before_a_current_term_entry() {
@@ -1490,6 +1626,57 @@ mod tests {
         assert!(authenticate("wrong", "cluster", 1, b"entry")
             .verify_slice(&mac)
             .is_err());
+    }
+    #[tokio::test]
+    async fn peer_stream_frames_multiple_messages_and_chunked_snapshots_without_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut snapshot = Message {
+            from: 1,
+            to: 2,
+            msg_type: raft::eraftpb::MessageType::MsgSnapshot,
+            ..Default::default()
+        };
+        snapshot.mut_snapshot().data = vec![42; 2 * 1024 * 1024 + 13].into();
+        let messages = vec![
+            Message {
+                from: 1,
+                to: 2,
+                msg_type: raft::eraftpb::MessageType::MsgHeartbeat,
+                ..Default::default()
+            },
+            snapshot,
+            Message {
+                from: 1,
+                to: 2,
+                msg_type: raft::eraftpb::MessageType::MsgHeartbeatResponse,
+                ..Default::default()
+            },
+        ];
+        let expected = messages.clone();
+        let receiving = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            for message in expected {
+                let (actual, nonce, _permit) = receive_message(
+                    &config(2),
+                    &mut stream,
+                    Arc::new(Semaphore::new(MAX_FRAME)),
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(actual, message);
+                assert_eq!(nonce, [7; 16]);
+            }
+        });
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream.set_nodelay(true).unwrap();
+        for message in messages {
+            send_message(&config(1), &mut stream, &message, [7; 16])
+                .await
+                .unwrap();
+        }
+        receiving.await.unwrap();
     }
 }
 

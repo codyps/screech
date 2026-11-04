@@ -314,21 +314,28 @@ async fn listener(
             accepted=listener.accept()=>{
                 let Ok((mut stream,_))=accepted else{break};let Ok(slot)=slots.clone().try_acquire_owned() else{continue};
                 let config=config.clone();let hub=hub.clone();let bytes=bytes.clone();
-                tokio::spawn(async move{let _slot=slot;let _=tokio::time::timeout(Duration::from_secs(30),async {
-                    let first=stream.read_u32().await?;
+                tokio::spawn(async move{let _slot=slot;let result=async {
+                    stream.set_nodelay(true)?;
+                    let first=tokio::time::timeout(Duration::from_secs(30),stream.read_u32()).await??;
                     if first==MAGIC {
+                        tokio::time::timeout(Duration::from_secs(30),async {
                         let request:Request=decode(&config,0x52514553,&read_frame(&mut stream).await?)?;
                         let result=hub.answer(&config,&request).await.map_err(|e|e.to_string());
                         write_frame(&mut stream,&encode(&config,0x5253504e,&Response{challenge:request.challenge,result})?).await?;
+                        Ok::<_,io::Error>(())
+                        }).await??;
                     }else{
+                        let mut first=first;
+                        loop {
                         let active=hub.0.read().unwrap().active.clone();
-                        if let Some(active)=active {
-                            let (message,nonce,permit)=receive_message(&active.config,&mut stream,bytes,Some(first)).await?;
+                        let Some(active)=active else {return Ok(());};
+                            let (message,nonce,permit)=tokio::time::timeout(Duration::from_secs(30),receive_message(&active.config,&mut stream,bytes.clone(),Some(first))).await??;
                             active.tx.try_send(Input::Message(message,nonce,permit)).map_err(error)?;
+                            first=tokio::time::timeout(Duration::from_secs(30),stream.read_u32()).await??;
                         }
                     }
                     Ok::<_,io::Error>(())
-                }).await;});
+                }.await;if let Err(error)=result {tracing::debug!(%error,"cluster peer connection ended");}});
             }
         }
     }

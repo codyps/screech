@@ -402,11 +402,20 @@ def stalled_ack_remains_recoverable(binary, shim):
             client.close()
             client = cluster.client(replacement)
             info = client.request('$JS.API.CONSUMER.INFO.T.D', {})
-            assert info['ack_floor']['consumer_seq'] == 0 and info['num_ack_pending'] == 1, info
-            retried = client.pull()
-            assert retried['payload'] == b'stalled-ack'
-            assert int(retried['reply'].split('.')[6]) >= 2
-            client.ack(original)  # A late ACK remains valid after redelivery/election.
+            uncertain_committed = info['ack_floor']['consumer_seq'] == 1
+            if uncertain_committed:
+                # Persistence-independent leader Append messages can reach a
+                # durable follower quorum before its own fsync stalls. The next
+                # leader may commit this unconfirmed operation; it must settle
+                # as a complete ACK/retention transition, not a hybrid state.
+                assert info['num_ack_pending'] == 0 and info['num_pending'] == 0, info
+                assert client.pull() is None
+            else:
+                assert info['ack_floor']['consumer_seq'] == 0 and info['num_ack_pending'] == 1, info
+                retried = client.pull()
+                assert retried['payload'] == b'stalled-ack'
+                assert int(retried['reply'].split('.')[6]) >= 2
+                client.ack(original)
             assert client.get(1) is None
             info = client.request('$JS.API.CONSUMER.INFO.T.D', {})
             assert info['num_ack_pending'] == 0, info
@@ -416,11 +425,29 @@ def stalled_ack_remains_recoverable(binary, shim):
             wait_recovery(cluster, leader, previous)
             client = cluster.client(cluster.wait_leader())
             assert client.get(1) is None
-            assert client.publish(b'after-stall') == 2
+            # Always exercise an actually unacknowledged reservation too,
+            # regardless of how the earlier ambiguous ACK settled.
+            assert client.publish(b'late-ack-after-stall') == 2
+            pending = client.pull()
+            victim = cluster.wait_leader()
+            previous = cluster.member(victim)
+            client.close()
+            cluster.kill(victim)
+            client = cluster.client(cluster.wait_leader())
+            retried = client.pull()
+            assert retried['payload'] == b'late-ack-after-stall'
+            assert int(retried['reply'].split('.')[6]) >= 2
+            client.ack(pending)
+            assert client.get(2) is None
+            client.close()
+            cluster.start(victim)
+            wait_recovery(cluster, victim, previous)
+            client = cluster.client(cluster.wait_leader())
+            assert client.publish(b'after-stall') == 3
             client.close()
         finally:
             cluster.close()
-    return {'test': 'stalled ACK never confirms early; redelivery and late ACK survive election and automatic repair', 'passed': True}
+    return {'test': 'stalled ACK never confirms early; uncertain outcomes, redelivery and late ACK survive election and automatic repair', 'uncertain_ack_committed': uncertain_committed, 'passed': True}
 
 
 def run(binary, shim=None):
