@@ -128,6 +128,28 @@ request even if a later request times out. Final audits check every public node,
 including old ACK tokens replayed against the recreated consumer. Use
 `--workloads queue,consumer-lifecycle` for both suites.
 
+For independent kernel/page-cache loss, use one native-ext4 VM per voter:
+
+```sh
+python3 tools/jepsen/cluster_vm.py \
+  --runtime results/jepsen-runtime/runtime.json \
+  --output results/jepsen-native-five --nodes 5 \
+  --time-limit 45 --final-time-limit 180
+```
+
+Its default consumer matrix cuts a majority/all VMs simultaneously, corrupts or
+truncates minority database/WAL files, wipes whole voter stores and provisions
+blank replacement volumes. Every cut must demonstrate a fresh kernel, loss of an
+unsynced overwrite and preservation of a fsynced canary. It checks that all targets
+are paused before dispatching all SIGKILLs, with no waits between kill signals.
+Maintenance boots inject disk damage without starting a voter; ordinary starts
+must repair through the surviving quorum and finish membership replacement.
+Native `boots.json`, `power-events.json`, per-case host-side `convergence.json`,
+per-VM disks and mutation digests preserve fault evidence. Saved histories also
+contain the full final proof; replay revalidates it and exports the per-case JSON.
+No host root, TAP interface or bootstrap/join/repair command is
+required. `check.py` also runs the Python control tests alongside Clojure checkers.
+
 Saved consumer histories can be checked again with:
 
 ```sh
@@ -137,9 +159,9 @@ python3 tools/jepsen/check.py --recheck results/jepsen-consumer-five
 The runner exits nonzero for an invalid or incomplete campaign. Jepsen histories,
 loss plots, per-node logs, convergence evidence, runtime metadata and `results.json`
 remain under the selected ignored output directory. These histories cover
-publication and the consumer contracts above. Independent-machine power failure,
-retention count/age limits and additional stream/catalog operations remain separate
-work. See the harness README for the exact limits
+publication and the consumer contracts above, including independent guest-OS
+power cuts. Physical-host/controller failure, retention count/age limits and
+additional stream/catalog operations remain separate work. See the harness README for the exact limits
 and the checked runs.
 
 ## Benchmarks

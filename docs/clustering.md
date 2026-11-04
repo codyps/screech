@@ -478,13 +478,24 @@ The checker can also be replayed against saved histories without running servers
 The recorded three/five-voter consumer campaigns passed all twelve histories and
 all 435 confirmed ACK obligations, then passed replay against the final checker.
 
+The independent-VM runner now gives every voter a separate kernel, RAM and ext4
+block image. Its power nemesis pauses all targets and sends every QEMU SIGKILL
+before waiting for any exit. Cold-boot controls require new kernel IDs, preserved
+fsynced bytes and lost unsynced overwrites. Disk faults change both the database
+and its WAL, or erase whole stores/replace minority volumes, while retaining a
+healthy quorum. Maintenance boots only inject the faults; ordinary server starts
+must recover the confirmed consumer state and complete voter replacement.
+The completed three/five-voter native matrices passed all ten histories, preserving
+282 confirmed ACK responses across 28 grouped power cuts and 18 injected
+damaged-voter replacements. Both saved campaigns also passed checker replay.
+
 The assurance limits remain explicit. A healthy surviving quorum is required for
 repair; a consistent rollback of all local files including the watermark cannot be
 diagnosed locally. This review does not certify arbitrary storage/controller faults,
 or all network schedules. The existing guest-power-loss job exercises standalone
-mode. The LazyFS voters use separate networks and mounts in one guest kernel;
-independent-machine power-loss histories and broader consumer-option/catalog
-workloads remain production gates. The current snapshot transfer size/memory limits and
+mode. The LazyFS runner shares one guest kernel; the native runner uses separate
+voter kernels and disks on one physical host. Physical-host/controller failures
+and broader consumer-option/catalog workloads remain production gates. The current snapshot transfer size/memory limits and
 serialized SQLite I/O still apply; these correctness histories are not throughput
 or tail-latency benchmarks. MQTT, leafnodes, gateways, JWT permission rules and other
 unimplemented NATS facilities are outside this durability review.
@@ -937,8 +948,9 @@ experimental branch after the Raft baseline. Do not ship two consensus modes.
 
 The [NATS-derived Jepsen/LazyFS harness](../tools/jepsen/README.md) supplies the
 publication and consumer ACK/lifecycle workloads with real loss of unsynced writes
-and final membership and durable-position checks. Extend these to independent
-machines, additional consumer options and stream/catalog lifecycle operations.
+and final membership and durable-position checks, plus native power cuts across
+independent voter VMs. Extend these to independent physical hosts, additional
+consumer options and stream/catalog lifecycle operations.
 Check safety throughout; require liveness only after a healthy quorum, usable disks
 and bounded scheduling return.
 

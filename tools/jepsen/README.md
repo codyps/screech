@@ -241,7 +241,11 @@ missing canary, unverified cut or unfinished voter replacement fails the run.
 
 Artifacts include each VM's serial logs, its final disk, archived replacement disks,
 `boots.json` with QEMU commands/boot IDs, `power-events.json`, normal Jepsen histories,
-per-node canary/convergence records and `results.json`. Consumer histories can be
+per-node logs and `results.json`. Each `runs/<case>/convergence.json` is a host-side
+copy of the full proof, including all power canaries and disk mutations. The
+successful final `:verify` operation also preserves that proof in `history.edn`.
+Guest-side proof files are best effort: Jepsen cuts power before downloading logs,
+so recent unsynced proof writes can disappear. Consumer histories can be
 replayed with `check.py --recheck` just like LazyFS histories. Use a fresh output
 directory for every campaign. The driver defaults to a one-hour overall deadline;
 `--memory` sets guest MiB per voter and `--timeout` changes that deadline.
@@ -336,3 +340,57 @@ canaries and convergence records are retained under the ignored
 `results/jepsen-consumer-three/` and `results/jepsen-consumer-five/` directories.
 The compatibility history is in `results/jepsen-queue-compatibility/`. The runtime
 versions and single-kernel scope are the same as the queue runs.
+
+## Checked independent-VM runs
+
+Three- and five-voter native-ext4 campaigns each passed all five scenarios. Every
+voter had its own QEMU process, Linux kernel, 1 GiB RAM and sparse 2 GiB block
+image, using two TCG vCPUs and `cache=none`. Each campaign used one client per
+voter, a one-cycle/s main generator, a 45-second fault phase and a 180-second final
+audit window. Clients seed one fixture cycle each and attempt two more during
+faults.
+
+| Scenario | Three-voter confirmed ACKs | Five-voter confirmed ACKs |
+| --- | ---: | ---: |
+| `baseline` | 45 | 75 |
+| `vm-power` | 15 | 25 |
+| `vm-damage` | 16 | 25 |
+| `vm-wipe` | 15 | 26 |
+| `vm-blank` | 15 | 25 |
+
+All 120 attempted cycles passed their obligations: 282 confirmed ACK responses,
+288 acknowledged publications, retention, deduplication, consumer recreation and
+stale ACK isolation. All 40 public-address audits and ten final membership and
+durable-position checks passed. Replay of both campaigns also passed the consumer
+checker and revalidated the physical fault controls from the saved histories.
+
+The campaigns recorded 28 grouped power cuts, including the all-voter preflight
+in every scenario, and 106 successful cold-boot checks. Every check preserved the
+fsynced canary, lost the unsynced overwrite and observed a different kernel boot
+ID. All targets were paused before killing; no exit was awaited until all kill
+signals were sent. The largest measured signal dispatch skew was 0.932 ms. These
+controls bound the model described above; they do not establish arbitrary
+mid-fsync or torn-controller-write coverage.
+
+All 18 injected damaged-voter instances recovered as different, fully admitted
+voter identities through ordinary server startup. The damage schedule modifies
+both the active database and its WAL; whole-store erasure and new blank volumes
+also passed. A bring-up attempt that damaged only the main database correctly
+recovered from its intact WAL and retained its identity, so the fault injector was
+corrected to damage both files before these complete runs. Damage is confined to
+a minority while every VM loses power, preserving enough durable copies to repair.
+
+The fault-driver tests passed five Python tests and the checker suite passed nine
+Clojure tests with 76 assertions, including rejection of ineffective/reused boot
+controls. A three-voter LazyFS queue baseline also passed after the new topology
+was added. No server changes were required; the server binary SHA-256 matches the
+earlier campaigns above.
+
+The implementation is `8b53257`, with database/WAL damage coverage in `25c8c7a`
+and host-side proof retention/replay in `de5b0de`.
+Complete results, histories, runtime metadata, block images, `boots.json`,
+`power-events.json`, per-case `convergence.json` and replay reports are retained
+under the ignored `results/jepsen-native-three-complete/` and
+`results/jepsen-native-five-complete/` directories. The scope remains independent
+guest power loss on one physical host, with mountable filesystems or provisioned
+replacement volumes and a surviving durable quorum.
