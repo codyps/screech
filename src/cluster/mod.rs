@@ -29,7 +29,7 @@ use std::{
 };
 use storage::{Database, LogStorage};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
     sync::{watch, Semaphore},
 };
@@ -712,9 +712,9 @@ async fn send_message(
     }
     Ok(())
 }
-async fn receive_message(
+async fn receive_message<R: AsyncRead + Unpin>(
     config: &ClusterConfig,
-    stream: &mut TcpStream,
+    stream: &mut R,
     bytes: Arc<Semaphore>,
     mut first: Option<u32>,
 ) -> io::Result<(Message, [u8; 16], tokio::sync::OwnedSemaphorePermit)> {
@@ -1912,7 +1912,8 @@ mod tests {
         ];
         let expected = messages.clone();
         let receiving = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
             for message in expected {
                 let (actual, nonce, _permit) = receive_message(
                     &config(2),

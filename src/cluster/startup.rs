@@ -333,6 +333,10 @@ async fn listener(
                         Ok::<_,io::Error>(())
                         }).await??;
                     }else{
+                        // Keep frame prefixes and bodies in one buffered read.
+                        // The buffer belongs to this authenticated peer stream
+                        // and survives across adjacent messages and chunks.
+                        let mut stream=BufReader::new(stream);
                         let mut first=first;
                         loop {
                         let active=hub.0.read().unwrap().active.clone();
