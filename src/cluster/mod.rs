@@ -522,6 +522,35 @@ fn project<R>(
     }
     result
 }
+fn start_read(node: &mut RawNode<LogStorage>, context: &[u8], round: usize) {
+    node.read_index(context.to_vec());
+    let conf = node.raft.prs().conf().to_conf_state();
+    // During membership changes leave Raft's full joint-quorum fanout intact.
+    if !conf.voters_outgoing.is_empty()
+        || !conf.learners.is_empty()
+        || !conf.learners_next.is_empty()
+        || !conf.voters.contains(&node.raft.id)
+    {
+        return;
+    }
+    let mut peers = conf.voters;
+    peers.retain(|id| *id != node.raft.id);
+    peers.sort_unstable();
+    if peers.is_empty() {
+        return;
+    }
+    let needed = peers.len().div_ceil(2);
+    let start = round % peers.len();
+    // Suppress only this newly created round's redundant initial probes.
+    // Periodic bcast_heartbeat reissues the pending context to ALL voters,
+    // so an unavailable selected peer cannot strand a read. Raft still counts
+    // distinct current-voter acknowledgements for every fresh read context.
+    node.raft.msgs.retain(|message| {
+        message.get_msg_type() != raft::eraftpb::MessageType::MsgHeartbeat
+            || message.get_context() != context
+            || (0..needed).any(|n| peers[(start + n) % peers.len()] == message.to)
+    });
+}
 fn pump_ready(
     node: &mut RawNode<LogStorage>,
     pending: &mut BTreeMap<Vec<u8>, Pending>,
@@ -914,6 +943,7 @@ async fn run_runtime(
             let mut nonce = [0u8; 16];
             getrandom::fill(&mut nonce).map_err(error)?;
             let mut serial = 0u64;
+            let mut read_round = 0usize;
             // New learners must reply to replacement leaders before receiving
             // a snapshot containing the committed placement map. These routes
             // are transport hints only; membership still gates every message.
@@ -1062,7 +1092,8 @@ async fn run_runtime(
                             serial = serial.checked_add(1).ok_or_else(|| error("proposal IDs exhausted"))?;
                             let mut context = nonce.to_vec();
                             context.extend_from_slice(&serial.to_le_bytes());
-                            node.read_index(context.clone());
+                            start_read(node, &context, read_round);
+                            read_round = read_round.wrapping_add(1);
                             pending.insert(context, Pending {started: Instant::now(),reply,read_index:None});
                         }
                     }
@@ -1424,7 +1455,7 @@ mod tests {
             context: Vec<u8>,
         ) -> mpsc::Receiver<io::Result<u64>> {
             let (reply, rx) = mpsc::sync_channel(1);
-            self.nodes[leader].read_index(context.clone());
+            start_read(&mut self.nodes[leader], &context, 0);
             self.pending[leader].insert(
                 context,
                 Pending {
@@ -1601,6 +1632,141 @@ mod tests {
                 before
             );
         }
+    }
+    #[test]
+    fn quorum_read_falls_back_to_all_voters_when_an_initial_target_is_unavailable() {
+        for count in [3, 5] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut sim = Simulation::with_voters(dir.path(), count);
+            sim.nodes[0].campaign().unwrap();
+            sim.settle(None);
+            let before = {
+                let db = sim.nodes[0].store().db.lock().unwrap();
+                (
+                    db.last().unwrap(),
+                    db.hard().unwrap(),
+                    db.view().unwrap(),
+                    db.journal_bytes(),
+                )
+            };
+            let rx = sim.quorum_read(0, b"fresh-fallback".to_vec());
+            let targets: Vec<_> = sim.nodes[0]
+                .raft
+                .msgs
+                .iter()
+                .filter(|m| {
+                    m.get_msg_type() == raft::eraftpb::MessageType::MsgHeartbeat
+                        && m.get_context() == b"fresh-fallback"
+                })
+                .map(|m| m.to)
+                .collect();
+            assert_eq!(targets.len(), count as usize / 2);
+            let unavailable = targets[0];
+            sim.settle(Some(unavailable));
+            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            // Keep the selected peer unavailable. The ordinary heartbeat must
+            // reach the other healthy quorum without another client request.
+            sim.ticks(3, Some(unavailable));
+            assert_eq!(rx.try_recv().unwrap().unwrap(), before.2);
+            let db = sim.nodes[0].store().db.lock().unwrap();
+            assert_eq!(
+                (
+                    db.last().unwrap(),
+                    db.hard().unwrap(),
+                    db.view().unwrap(),
+                    db.journal_bytes()
+                ),
+                before
+            );
+        }
+    }
+    #[test]
+    fn initial_read_quorums_rotate_without_starving_voters() {
+        for count in [3, 5] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut sim = Simulation::with_voters(dir.path(), count);
+            sim.nodes[0].campaign().unwrap();
+            sim.settle(None);
+            let mut probes = BTreeMap::<u64, usize>::new();
+            for round in 0..count as usize - 1 {
+                let context = format!("round-{round}").into_bytes();
+                start_read(&mut sim.nodes[0], &context, round);
+                let mut selected = 0;
+                for message in sim.nodes[0].raft.msgs.drain(..) {
+                    if message.get_msg_type() == raft::eraftpb::MessageType::MsgHeartbeat
+                        && message.get_context() == context.as_slice()
+                    {
+                        *probes.entry(message.to).or_default() += 1;
+                        selected += 1;
+                    }
+                }
+                assert_eq!(selected, count as usize / 2);
+            }
+            assert_eq!(probes.len(), count as usize - 1);
+            assert!(probes.values().all(|n| *n == count as usize / 2));
+        }
+    }
+    #[test]
+    fn read_probes_keep_full_fanout_for_learners_and_joint_voters() {
+        use raft::eraftpb::{
+            ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, MessageType,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut sim = Simulation::new(dir.path());
+        sim.nodes[0].campaign().unwrap();
+        sim.settle(None);
+        sim.nodes[0]
+            .apply_conf_change(&ConfChangeV2 {
+                changes: vec![ConfChangeSingle {
+                    node_id: 4,
+                    change_type: ConfChangeType::AddLearnerNode,
+                    ..Default::default()
+                }]
+                .into(),
+                ..Default::default()
+            })
+            .unwrap();
+        start_read(&mut sim.nodes[0], b"learner-read", 0);
+        let targets: std::collections::BTreeSet<_> = sim.nodes[0]
+            .raft
+            .msgs
+            .drain(..)
+            .filter(|m| {
+                m.get_msg_type() == MessageType::MsgHeartbeat && m.get_context() == b"learner-read"
+            })
+            .map(|m| m.to)
+            .collect();
+        assert_eq!(targets, [2, 3, 4].into_iter().collect());
+        sim.nodes[0]
+            .apply_conf_change(&ConfChangeV2 {
+                transition: ConfChangeTransition::Explicit,
+                changes: vec![
+                    ConfChangeSingle {
+                        node_id: 4,
+                        change_type: ConfChangeType::AddNode,
+                        ..Default::default()
+                    },
+                    ConfChangeSingle {
+                        node_id: 3,
+                        change_type: ConfChangeType::RemoveNode,
+                        ..Default::default()
+                    },
+                ]
+                .into(),
+                ..Default::default()
+            })
+            .unwrap();
+        start_read(&mut sim.nodes[0], b"joint-read", 1);
+        let targets: std::collections::BTreeSet<_> = sim.nodes[0]
+            .raft
+            .msgs
+            .drain(..)
+            .filter(|m| {
+                m.get_msg_type() == MessageType::MsgHeartbeat && m.get_context() == b"joint-read"
+            })
+            .map(|m| m.to)
+            .collect();
+        assert_eq!(targets, [2, 3, 4].into_iter().collect());
     }
     #[test]
     fn failed_projection_commit_cannot_release_a_staged_success_reply() {
