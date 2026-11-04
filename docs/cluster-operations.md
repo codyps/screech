@@ -122,6 +122,12 @@ Commit-index notifications may persist asynchronously, as permitted by Raft. A n
 leader commits a current-term observation before exposing the recovered model.
 Indexes expose only the committed prefix; the accepted suffix remains available
 for conflict replacement. Standalone storage keeps its existing FULL behavior.
+Event and content lookup indexes use connection-local SQLite temporary tables,
+with a 4 MiB page cache and spill to disposable files. They are rebuilt from the
+committed prefix and FULL snapshot before voting or serving. Complete accepted
+entries remain in both the journal and SQLite; snapshot payloads remain in the
+FULL root. The persisted `event_sequence` metadata reports committed projection
+progress for diagnostics and does not authorize reads or voting.
 Input validation, Raft storage reads and projection updates share one transaction
 for already queued Raft inputs (at most eight, with a 100 µs admission budget and
 no wait for more input). Each input applies committed configuration changes before

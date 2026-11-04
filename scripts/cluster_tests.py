@@ -66,7 +66,8 @@ class Cluster:
                     path=self.store_path(i)
                     if not path.exists():break
                     with closing(sqlite3.connect(f'file:{path}?mode=ro',uri=True)) as db:
-                        end=db.execute('select coalesce(max(seq),0) from event_index').fetchone()[0]
+                        progress=db.execute("select value from cluster_meta where key='event_sequence'").fetchone()
+                        end=int.from_bytes(progress[0],'little') if progress else db.execute('select coalesce(max(seq),0) from event_index').fetchone()[0]
                         floor=db.execute("select value from cluster_meta where key='app_sequence'").fetchone()
                         view=db.execute("select value from cluster_meta where key='view'").fetchone()
                         values.append((max(end,int.from_bytes(floor[0],'little') if floor else 0),int.from_bytes(view[0],'little') if view else 0))

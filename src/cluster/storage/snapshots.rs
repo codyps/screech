@@ -316,6 +316,7 @@ impl Database {
                 ("conf_index", image.conf_index.to_le_bytes().to_vec()),
                 ("app_snapshot", image.model.clone()),
                 ("app_sequence", image.sequence.to_le_bytes().to_vec()),
+                ("event_sequence", image.sequence.to_le_bytes().to_vec()),
                 ("journal_root", root),
             ] {
                 tx.execute(

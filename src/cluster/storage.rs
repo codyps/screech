@@ -117,6 +117,16 @@ impl Database {
           CREATE TABLE IF NOT EXISTS event_index(seq INTEGER PRIMARY KEY,idx INTEGER NOT NULL,ordinal INTEGER NOT NULL);
           CREATE TABLE IF NOT EXISTS body_index(generation INTEGER NOT NULL,seq INTEGER NOT NULL,idx INTEGER NOT NULL,ordinal INTEGER NOT NULL,PRIMARY KEY(generation,seq));
           CREATE TABLE IF NOT EXISTS snapshot_bodies(generation INTEGER NOT NULL,seq INTEGER NOT NULL,data BLOB NOT NULL,digest BLOB NOT NULL,PRIMARY KEY(generation,seq));").map_err(error)?;
+        // These lookups are rebuilt from committed entries and the FULL
+        // snapshot before voting. Keeping them out of the durable WAL avoids
+        // writing several pages of disposable indexes for every publication.
+        // Bound their cache; larger indexes can spill to a private temp file.
+        conn.execute_batch("PRAGMA temp_store=FILE;
+          PRAGMA temp.journal_mode=MEMORY;
+          PRAGMA temp.cache_size=-4096;
+          CREATE TEMP TABLE event_index(seq INTEGER PRIMARY KEY,idx INTEGER NOT NULL,ordinal INTEGER NOT NULL);
+          CREATE TEMP TABLE body_index(generation INTEGER NOT NULL,seq INTEGER NOT NULL,idx INTEGER NOT NULL,ordinal INTEGER NOT NULL,PRIMARY KEY(generation,seq)) WITHOUT ROWID;")
+            .map_err(error)?;
         let mut stable = config.clone();
         stable.max_log_bytes = 0;
         let identity = serde_json::to_vec(&stable).map_err(error)?;
@@ -198,7 +208,7 @@ impl Database {
         }
         db.restore_snapshot_position()?;
         db.recover_journal()?;
-        let base = db.snapshot_base()?.0;
+        let (base, _, sequence) = db.snapshot_base()?;
         if base > 0 {
             // A checksum-valid but malformed model/catalog is not a safe voter.
             // Validate before RawNode can campaign or send replication messages.
@@ -215,7 +225,12 @@ impl Database {
         db.verify_watermark()?;
         db.recover_membership()?;
         // Rebuild indexes from the durable committed prefix, never the accepted tail.
-        db.conn.execute_batch("DELETE FROM event_index;DELETE FROM body_index;DELETE FROM cluster_meta WHERE key='view';").map_err(error)?;
+        db.conn.execute_batch("DELETE FROM main.event_index;DELETE FROM main.body_index;
+          DELETE FROM temp.event_index;DELETE FROM temp.body_index;DELETE FROM cluster_meta WHERE key='view';").map_err(error)?;
+        db.conn.execute(
+            "INSERT INTO cluster_meta VALUES('event_sequence',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [sequence.to_le_bytes().as_slice()],
+        ).map_err(error)?;
         db.conn
             .execute(
                 "INSERT INTO cluster_meta VALUES('view',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -449,6 +464,10 @@ impl Database {
             tx.prepare_cached("INSERT INTO cluster_meta VALUES('view',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
                 .map_err(error)?
                 .execute([commit.to_le_bytes().as_slice()])
+                .map_err(error)?;
+            tx.prepare_cached("INSERT INTO cluster_meta VALUES('event_sequence',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+                .map_err(error)?
+                .execute([end.to_le_bytes().as_slice()])
                 .map_err(error)?;
             Ok(results)
         })
@@ -768,6 +787,100 @@ mod tests {
             data: postcard::to_allocvec(&batch).unwrap().into(),
             ..Default::default()
         }
+    }
+    #[test]
+    fn disposable_indexes_rebuild_only_committed_content_and_rollback_with_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let c = config();
+        let key = ContentKey {
+            generation: 1,
+            sequence: 1,
+        };
+        let mut db = Database::open(&path, &c, true).unwrap();
+        let mut hard = HardState {
+            term: 1,
+            vote: 1,
+            commit: 1,
+            ..Default::default()
+        };
+        let mut accepted = entry(2, 1, b"accepted-only");
+        let mut batch = Batch::decode(&accepted.data).unwrap();
+        batch.contents[0].key.sequence = 2;
+        accepted.data = postcard::to_allocvec(&batch).unwrap().into();
+        db.persist(&[entry(1, 1, b"committed"), accepted.clone()], Some(&hard))
+            .unwrap();
+        db.apply(1).unwrap();
+        assert_eq!(db.content(key).unwrap().unwrap().payload, "committed");
+        assert!(db.record(1).unwrap().is_some());
+        for table in ["event_index", "body_index"] {
+            assert_eq!(
+                db.conn
+                    .query_row(&format!("SELECT count(*) FROM main.{table}"), [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        assert_eq!(
+            db.meta("event_sequence").unwrap().unwrap(),
+            1u64.to_le_bytes()
+        );
+        // A failed owner transaction must roll back both the temporary lookups
+        // and their persisted diagnostic position.
+        db.begin_projection().unwrap();
+        db.apply(2).unwrap();
+        assert_eq!(db.end().unwrap(), 2);
+        db.finish_projection(false).unwrap();
+        assert_eq!(db.end().unwrap(), 1);
+        assert_eq!(db.content(key).unwrap().unwrap().payload, "committed");
+        assert_eq!(
+            db.meta("event_sequence").unwrap().unwrap(),
+            1u64.to_le_bytes()
+        );
+        // Old binaries left persistent lookup tables. A stale cache must not
+        // expose an accepted tail or survive migration to temporary lookups.
+        db.conn
+            .execute_batch(
+                "INSERT INTO main.event_index VALUES(999,2,0);
+            INSERT INTO main.body_index VALUES(99,99,2,0);",
+            )
+            .unwrap();
+        drop(db);
+        let mut db = Database::open(&path, &c, false).unwrap();
+        assert_eq!(db.end().unwrap(), 1);
+        assert!(db.record(2).unwrap().is_none());
+        assert_eq!(db.content(key).unwrap().unwrap().payload, "committed");
+        assert_eq!(
+            db.conn
+                .query_row("SELECT count(*) FROM main.event_index", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.conn
+                .query_row("SELECT count(*) FROM main.body_index", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        // The complete accepted tail remains independently present in SQLite.
+        assert_eq!(db.entry(2).unwrap(), accepted);
+        hard.commit = 2;
+        db.persist(&[], Some(&hard)).unwrap();
+        db.apply(2).unwrap();
+        assert_eq!(db.end().unwrap(), 2);
+        assert_eq!(
+            db.content(ContentKey {
+                generation: 1,
+                sequence: 2
+            })
+            .unwrap()
+            .unwrap()
+            .payload,
+            "accepted-only"
+        );
     }
     #[test]
     fn conflicting_suffix_has_immutable_bytes_and_committed_only_visibility() {

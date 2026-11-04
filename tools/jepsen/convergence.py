@@ -25,7 +25,8 @@ def verify(root, processes, nodes, timeout=60):
                 path = Path(instance['path'])
                 assert path.is_relative_to(root / node / 'store')
                 with sqlite3.connect(f'file:{path}?mode=ro', uri=True, timeout=1) as db:
-                    end = db.execute('SELECT coalesce(max(seq),0) FROM event_index').fetchone()[0]
+                    progress = db.execute("SELECT value FROM cluster_meta WHERE key='event_sequence'").fetchone()
+                    end = int.from_bytes(progress[0], 'little') if progress else db.execute('SELECT coalesce(max(seq),0) FROM event_index').fetchone()[0]
                     floor = db.execute("SELECT value FROM cluster_meta WHERE key='app_sequence'").fetchone()
                     view = db.execute("SELECT value FROM cluster_meta WHERE key='view'").fetchone()
                     sequence = max(end, int.from_bytes(floor[0], 'little') if floor else 0)

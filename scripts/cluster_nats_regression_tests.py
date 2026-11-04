@@ -37,10 +37,18 @@ def missing_live_content(binary, kind):
                 compact(cluster)
             cluster.await_equal()
             previous = cluster.member(leader)
-            table = 'snapshot_bodies' if kind == 'snapshot' else 'body_index'
+            # Lookup indexes are connection-local. Damage the accepted payload
+            # they reference, or the FULL snapshot payload, through another connection.
+            table = 'snapshot_bodies' if kind == 'snapshot' else 'entries'
             with sqlite3.connect(cluster.store_path(leader)) as db:
                 assert db.execute(f'SELECT count(*) FROM {table}').fetchone()[0] > 0
-                db.execute(f'DELETE FROM {table}')
+                if kind == 'snapshot':
+                    db.execute('DELETE FROM snapshot_bodies')
+                else:
+                    # Preserve the log frontier so this specifically exercises
+                    # the application read of missing referenced content.
+                    deleted = db.execute('DELETE FROM entries WHERE instr(data,?)>0', (b'first',))
+                    assert deleted.rowcount == 1, deleted.rowcount
             # Missing referenced content is corruption, not a successful empty read.
             try:
                 result = client.request('$JS.API.STREAM.MSG.GET.T', {'seq': 1})
