@@ -253,18 +253,18 @@ impl Database {
     }
     pub fn last(&self) -> io::Result<u64> {
         self.conn
-            .query_row("SELECT coalesce(max(idx),0) FROM entries", [], |r| {
-                r.get::<_, i64>(0)
-            })
+            .prepare_cached("SELECT coalesce(max(idx),0) FROM entries")
+            .map_err(error)?
+            .query_row([], |r| r.get::<_, i64>(0))
             .map_err(error)
             .and_then(|n| u64::try_from(n).map_err(error))
             .and_then(|n| Ok(n.max(self.snapshot_base()?.0)))
     }
     pub fn end(&self) -> io::Result<u64> {
         self.conn
-            .query_row("SELECT coalesce(max(seq),0) FROM event_index", [], |r| {
-                r.get::<_, i64>(0)
-            })
+            .prepare_cached("SELECT coalesce(max(seq),0) FROM event_index")
+            .map_err(error)?
+            .query_row([], |r| r.get::<_, i64>(0))
             .map_err(error)
             .and_then(|n| u64::try_from(n).map_err(error))
             .and_then(|n| Ok(n.max(self.snapshot_base()?.2)))
@@ -350,31 +350,33 @@ impl Database {
         }
         let applied = self.commit_transaction(false, |tx| {
             if let Some(first) = entries.first() {
-                tx.execute("DELETE FROM entries WHERE idx>=?1", [sql(first.index)?])
-                    .map_err(error)?;
+                if first.index <= last {
+                    tx.prepare_cached("DELETE FROM entries WHERE idx>=?1")
+                        .map_err(error)?
+                        .execute([sql(first.index)?])
+                        .map_err(error)?;
+                }
                 for entry in entries {
                     let bytes = entry.write_to_bytes().map_err(error)?;
                     added = added
                         .checked_add(bytes.len() as u64)
                         .ok_or_else(|| error("log size overflow"))?;
-                    tx.execute(
-                        "INSERT INTO entries VALUES(?1,?2,?3,?4)",
-                        params![
+                    tx.prepare_cached("INSERT INTO entries VALUES(?1,?2,?3,?4)")
+                        .map_err(error)?
+                        .execute(params![
                             sql(entry.index)?,
                             sql(entry.term)?,
                             bytes,
                             crc32fast::hash(&bytes)
-                        ],
-                    )
-                    .map_err(error)?;
+                        ])
+                        .map_err(error)?;
                 }
             }
             if let Some(h) = hard {
-                tx.execute(
-                    "INSERT OR REPLACE INTO cluster_meta VALUES('hard',?1)",
-                    [h.write_to_bytes().map_err(error)?],
-                )
-                .map_err(error)?;
+                tx.prepare_cached("INSERT OR REPLACE INTO cluster_meta VALUES('hard',?1)")
+                    .map_err(error)?
+                    .execute([h.write_to_bytes().map_err(error)?])
+                    .map_err(error)?;
             }
             Ok(())
         });
@@ -420,32 +422,29 @@ impl Database {
                 if let Some(batch) = batch {
                     for (ordinal, _) in batch.records.iter().enumerate() {
                         end += 1;
-                        tx.execute(
-                            "INSERT INTO event_index VALUES(?1,?2,?3)",
-                            params![sql(end)?, sql(entry.index)?, ordinal as i64],
-                        )
-                        .map_err(error)?;
+                        tx.prepare_cached("INSERT INTO event_index VALUES(?1,?2,?3)")
+                            .map_err(error)?
+                            .execute(params![sql(end)?, sql(entry.index)?, ordinal as i64])
+                            .map_err(error)?;
                     }
                     for (ordinal, c) in batch.contents.iter().enumerate() {
-                        tx.execute(
-                            "INSERT INTO body_index VALUES(?1,?2,?3,?4)",
-                            params![
+                        tx.prepare_cached("INSERT INTO body_index VALUES(?1,?2,?3,?4)")
+                            .map_err(error)?
+                            .execute(params![
                                 sql(c.key.generation)?,
                                 sql(c.key.sequence)?,
                                 sql(entry.index)?,
                                 ordinal as i64
-                            ],
-                        )
-                        .map_err(error)?;
+                            ])
+                            .map_err(error)?;
                     }
                 }
                 results.push((entry.context.to_vec(), end));
             }
-            tx.execute(
-                "INSERT OR REPLACE INTO cluster_meta VALUES('view',?1)",
-                [commit.to_le_bytes().as_slice()],
-            )
-            .map_err(error)?;
+            tx.prepare_cached("INSERT OR REPLACE INTO cluster_meta VALUES('view',?1)")
+                .map_err(error)?
+                .execute([commit.to_le_bytes().as_slice()])
+                .map_err(error)?;
             Ok(results)
         })
     }
@@ -515,11 +514,9 @@ impl Database {
     pub fn record(&self, sequence: u64) -> io::Result<Option<Record>> {
         let pos: Option<(i64, i64)> = self
             .conn
-            .query_row(
-                "SELECT idx,ordinal FROM event_index WHERE seq=?1",
-                [sql(sequence)?],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .prepare_cached("SELECT idx,ordinal FROM event_index WHERE seq=?1")
+            .map_err(error)?
+            .query_row([sql(sequence)?], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()
             .map_err(error)?;
         pos.map(|(idx, n)| {
@@ -540,11 +537,11 @@ impl Database {
     pub fn content(&self, key: ContentKey) -> io::Result<Option<Content>> {
         let pos: Option<(i64, i64)> = self
             .conn
-            .query_row(
-                "SELECT idx,ordinal FROM body_index WHERE generation=?1 AND seq=?2",
-                params![sql(key.generation)?, sql(key.sequence)?],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .prepare_cached("SELECT idx,ordinal FROM body_index WHERE generation=?1 AND seq=?2")
+            .map_err(error)?
+            .query_row(params![sql(key.generation)?, sql(key.sequence)?], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .optional()
             .map_err(error)?;
         if pos.is_none() {

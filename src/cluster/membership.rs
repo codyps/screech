@@ -44,8 +44,30 @@ impl Database {
         Ok(())
     }
     pub fn accepts_sender(&self, message: &Message, nonce: [u8; 16]) -> io::Result<bool> {
-        let state = self.membership()?;
-        let conf = self.conf()?;
+        // Check both records in one SQLite read snapshot and lock acquisition.
+        let (state, conf) = self
+            .conn
+            .prepare_cached(
+                "SELECT
+          (SELECT value FROM cluster_meta WHERE key='membership'),
+          (SELECT value FROM cluster_meta WHERE key='conf')",
+            )
+            .map_err(error)?
+            .query_row([], |row| {
+                Ok((
+                    row.get::<_, Option<Vec<u8>>>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                ))
+            })
+            .map_err(error)?;
+        let state: Membership = state
+            .map(|b| postcard::from_bytes(&b).map_err(error))
+            .transpose()?
+            .unwrap_or_default();
+        let conf = conf
+            .map(|b| raft::eraftpb::ConfState::parse_from_bytes(&b).map_err(error))
+            .transpose()?
+            .unwrap_or_default();
         let expected = state
             .identities
             .get(&message.from)
