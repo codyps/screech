@@ -9,8 +9,16 @@ class Client:
         self.socket = socket.create_connection(address, timeout=timeout)
         self.socket.settimeout(timeout)
         self.file = self.socket.makefile('rb')
-        assert self.file.readline().startswith(b'INFO ')
-        self.send(b'CONNECT {"verbose":false,"headers":true,"no_responders":true}\r\n')
+        try:
+            greeting = self.file.readline()
+            if not greeting:
+                raise EOFError('server closed before INFO')
+            assert greeting.startswith(b'INFO '), repr(greeting)
+            self.send(b'CONNECT {"verbose":false,"headers":true,"no_responders":true}\r\n')
+        except BaseException:
+            self.file.close()
+            self.socket.close()
+            raise
         self.counter = 0
         self.inbox = "_INBOX.test." + uuid.uuid4().hex
     def close(self):
