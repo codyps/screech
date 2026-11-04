@@ -102,6 +102,25 @@ class Controls(unittest.TestCase):
             for peer in peers: peer.close()
             hub.close()
 
+    def test_damage_includes_wal_and_never_starts_a_voter(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp) / 'n1'
+            store = directory / 'store'
+            store.mkdir(parents=True)
+            base = store / 'db'
+            wal = store / 'db-wal'
+            record = {'instance': {'path': str(base), 'member': 1}}
+            (store / 'db.node-state').write_text(json.dumps({'body': list(json.dumps(record).encode())}))
+            for kind in ['bitflip', 'truncate']:
+                base.write_bytes(b'SQLite format 3' + b'x' * 4096)
+                wal.write_bytes(b'valid-wal-header' + b'y' * 8192)
+                with patch.multiple(voter_guest, DIRECTORY=directory, MAINTENANCE=True, SERVER=None), \
+                     patch('voter_guest.os.sync'), patch('voter_guest.Path.exists', return_value=True):
+                    result = voter_guest.act({'op': 'damage', 'kind': kind})
+                self.assertFalse(result['voter_started'])
+                self.assertEqual({str(base), str(wal)}, {f['path'] for f in result['files']})
+                self.assertTrue(all(f['before'] != f['after'] for f in result['files']))
+
 
 if __name__ == '__main__':
     unittest.main()

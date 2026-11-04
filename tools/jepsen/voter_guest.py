@@ -128,18 +128,37 @@ def act(request):
     if op == 'damage':
         assert MAINTENANCE and SERVER is None
         kind = request['kind']
-        before = None
-        if kind != 'wipe':
+        mutations = []
+        if kind == 'wipe':
+            damage(DIRECTORY, kind)
+        else:
             _, path = instance()
-            before = {'size': path.stat().st_size, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
-        damage(DIRECTORY, kind)
-        # Fault injection happens after the original crash in a maintenance boot;
-        # persist the injected damage before the ordinary voter boot.
+            # SQLite can reconstruct a damaged base from an intact WAL. Corrupt
+            # both authoritative files to require quorum-based voter replacement.
+            files = [path]
+            wal = Path(str(path) + '-wal')
+            if wal.exists() and wal.stat().st_size:
+                files.append(wal)
+            for target in files:
+                before = {'size': target.stat().st_size, 'sha256': hashlib.sha256(target.read_bytes()).hexdigest()}
+                with target.open('r+b', buffering=0) as file:
+                    if kind == 'bitflip':
+                        first = file.read(1)
+                        assert first
+                        file.seek(0)
+                        file.write(bytes([first[0] ^ 1]))
+                    elif kind == 'truncate':
+                        file.truncate(before['size'] // 2)
+                    else:
+                        raise ValueError(kind)
+                    os.fsync(file.fileno())
+                after = {'size': target.stat().st_size, 'sha256': hashlib.sha256(target.read_bytes()).hexdigest()}
+                assert before != after, 'disk mutation did not change bytes'
+                mutations.append({'path': str(target), 'before': before, 'after': after})
+        # This sync persists deliberately injected damage, after the original
+        # power cut; the maintenance boot never starts a voter.
         os.sync()
-        after = None if kind == 'wipe' else {'size': path.stat().st_size, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
-        if before is not None:
-            assert before != after, 'disk mutation did not change bytes'
-        return {'injected': kind, 'before': before, 'after': after, 'voter_started': False}
+        return {'injected': kind, 'files': mutations, 'voter_started': False}
     if op == 'exec':
         result = subprocess.run(['bash', '-c', request['cmd']], input=request.get('in', ''),
                                 text=True, capture_output=True, timeout=90)

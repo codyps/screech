@@ -193,7 +193,7 @@ native scenarios are the default matrix:
 | --- | --- |
 | `baseline` | Seed and audit consumer fixtures after the power-loss control. |
 | `vm-power` | Simultaneously cut power to a majority, recover, then cut power to all voters and recover. |
-| `vm-damage` | Cut all VMs; flip the active database header on a minority, restart all; later repeat with truncated active databases. |
+| `vm-damage` | Cut all VMs; flip the active database and WAL headers on a minority, restart all; later repeat with truncated active database/WAL files. |
 | `vm-wipe` | Cut all VMs, erase a minority's entire voter stores including manifests/watermarks, then restart all. |
 | `vm-blank` | Cut all VMs, archive a minority's old disk images and attach newly formatted empty ext4 disks, then restart all. |
 
@@ -221,7 +221,11 @@ required. The settings are local to the disposable guest kernels.
 
 Disk mutations happen after the original power loss in a maintenance boot of the
 affected disk. This boot checks the cold-reboot controls and never starts Screech.
-The driver persists the injected file damage before the ordinary voter boot. For
+The driver persists the injected file damage before the ordinary voter boot.
+Corruption and truncation affect both the active database and its WAL when present.
+Changing only the base file can leave the complete durable history recoverable
+from the WAL and does not necessarily require replacing a voter. Mutation proofs
+record each changed path, size and digest. For
 `vm-blank`, it preserves the original image and provisions an empty replacement.
 At most one of three or two of five stores are damaged, retaining a healthy quorum's
 history. The test records the old identities and requires every damaged slot to
