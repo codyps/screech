@@ -13,14 +13,16 @@ from benchmark_cluster import BenchmarkCluster
 from perf_control import recording
 from profile_jetstream import wait_for
 from profile_publication_io import wait_attached
+from profile_sync import summarize_sync
 
 
 @contextmanager
-def tracing(binary, processes, prefix):
+def tracing(binary, processes, prefix, sync_only=False):
     log_path = Path(str(prefix) + '.strace.log')
     with log_path.open('w') as log:
-        command = [binary, '-f', '-qq', '-c', '-w', '-e',
-                   'trace=pwrite64,write,writev,fdatasync,fsync,futex,sendto,recvfrom,connect',
+        options = ['-ttt', '-T', '-yy', '-e', 'trace=fdatasync,fsync'] if sync_only else [
+                   '-c', '-w', '-e', 'trace=pwrite64,write,writev,fdatasync,fsync,futex,sendto,recvfrom,connect']
+        command = [binary, '-f', '-qq', *options,
                    '-o', str(Path(str(prefix) + '.strace.txt'))]
         for process in processes:
             command += ['-p', str(process.pid)]
@@ -55,6 +57,8 @@ def main():
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=True)
     modes = ['check'] if args.check_only else [name for name in ('perf', 'strace') if getattr(args, name)]
+    if args.strace and not args.check_only:
+        modes.append('sync')
     for screech, binary in ((True, args.screech), (False, args.nats)):
         label = f'screech-cluster-{args.voters}' if screech else f'nats-cluster-{args.voters}-always'
         with tempfile.TemporaryDirectory(prefix='cluster-profile-') as tmp:
@@ -75,7 +79,8 @@ def main():
                                     '--call-graph', 'dwarf,8192', '-p', ','.join(str(p.pid) for p in cluster.processes),
                                     '-o', str(Path(str(prefix) + '.data'))] if mode == 'perf' else []
                                 profile = (recording(command, log) if mode == 'perf' else
-                                    tracing(args.strace, cluster.processes, prefix) if mode == 'strace' else nullcontext(None))
+                                    tracing(args.strace, cluster.processes, prefix, sync_only=mode == 'sync')
+                                    if mode in ('strace', 'sync') else nullcontext(None))
                                 with profile as process:
                                     before = total_usage(cluster.processes)
                                     Path(str(gate) + '.release').touch()
@@ -95,6 +100,11 @@ def main():
                                 phase_server_cpu_seconds=after['cpu_seconds']-before['cpu_seconds']
                                 if after['cpu_seconds'] is not None and before['cpu_seconds'] is not None else None)
                             Path(str(prefix) + '.json').write_text(json.dumps(row, indent=2) + '\n')
+                            if mode == 'sync':
+                                summary = summarize_sync(Path(str(prefix) + '.strace.txt').read_text())
+                                if not summary:
+                                    raise RuntimeError('sync profiler captured no decoded file syncs')
+                                Path(str(prefix) + '-sync-summary.json').write_text(json.dumps(summary, indent=2) + '\n')
                             if mode == 'perf':
                                 for children, suffix in ((False, '.txt'), (True, '-stacks.txt')):
                                     with Path(str(prefix) + suffix).open('w') as report:
