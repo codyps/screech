@@ -533,13 +533,24 @@ fn start_read(node: &mut RawNode<LogStorage>, context: &[u8], round: usize) {
     {
         return;
     }
+    let needed = conf.voters.len() / 2;
+    let committed = node.raft.raft_log.committed;
     let mut peers = conf.voters;
-    peers.retain(|id| *id != node.raft.id);
+    // A just-committed publication can leave other followers still persisting
+    // its entry. Their earlier replication acknowledgements only help select
+    // a fast initial quorum; this read still needs new context-bound replies.
+    peers.retain(|id| {
+        *id != node.raft.id
+            && node
+                .raft
+                .prs()
+                .get(*id)
+                .is_some_and(|progress| progress.recent_active && progress.matched >= committed)
+    });
     peers.sort_unstable();
-    if peers.is_empty() {
+    if peers.len() < needed || peers.is_empty() {
         return;
     }
-    let needed = peers.len().div_ceil(2);
     let start = round % peers.len();
     // Suppress only this newly created round's redundant initial probes.
     // Periodic bcast_heartbeat reissues the pending context to ALL voters,
@@ -1705,6 +1716,55 @@ mod tests {
             assert_eq!(probes.len(), count as usize - 1);
             assert!(probes.values().all(|n| *n == count as usize / 2));
         }
+    }
+    #[test]
+    fn initial_read_probes_prefer_caught_up_voters_without_reusing_their_acks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sim = Simulation::with_voters(dir.path(), 5);
+        sim.nodes[0].campaign().unwrap();
+        sim.settle(None);
+        // Model delayed append acknowledgements from two followers. Rotating
+        // to those peers would wait behind their outstanding persistence work.
+        for id in [4, 5] {
+            sim.nodes[0].raft.mut_prs().get_mut(id).unwrap().matched = 0;
+        }
+        start_read(&mut sim.nodes[0], b"caught-up-read", 2);
+        let targets: std::collections::BTreeSet<_> = sim.nodes[0]
+            .raft
+            .msgs
+            .drain(..)
+            .filter(|m| {
+                m.get_msg_type() == raft::eraftpb::MessageType::MsgHeartbeat
+                    && m.get_context() == b"caught-up-read"
+            })
+            .map(|m| m.to)
+            .collect();
+        assert_eq!(targets, [2, 3].into_iter().collect());
+        // Even though these voters already acknowledged the committed prefix,
+        // a newly arriving request cannot succeed before its fresh replies.
+        assert!(sim.nodes[0].raft.read_states.is_empty());
+    }
+    #[test]
+    fn initial_read_broadcasts_when_too_few_voters_are_caught_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sim = Simulation::with_voters(dir.path(), 5);
+        sim.nodes[0].campaign().unwrap();
+        sim.settle(None);
+        for id in [3, 4, 5] {
+            sim.nodes[0].raft.mut_prs().get_mut(id).unwrap().matched = 0;
+        }
+        start_read(&mut sim.nodes[0], b"broadcast-read", 0);
+        let targets: std::collections::BTreeSet<_> = sim.nodes[0]
+            .raft
+            .msgs
+            .drain(..)
+            .filter(|m| {
+                m.get_msg_type() == raft::eraftpb::MessageType::MsgHeartbeat
+                    && m.get_context() == b"broadcast-read"
+            })
+            .map(|m| m.to)
+            .collect();
+        assert_eq!(targets, [2, 3, 4, 5].into_iter().collect());
     }
     #[test]
     fn read_probes_keep_full_fanout_for_learners_and_joint_voters() {

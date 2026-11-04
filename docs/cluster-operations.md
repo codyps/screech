@@ -169,7 +169,8 @@ Read-only responses use Raft ReadIndex quorum checks, without appending empty lo
 entries. A committed mutation supplies the quorum observation for its own reply;
 duplicate replies and empty batches still require ReadIndex. These observations
 are not timed leases and are not reused for newly arriving client requests.
-Stable configurations initially probe a rotating majority. Ordinary heartbeats
+Stable configurations initially probe a rotating majority of recently active,
+caught-up voters, broadcasting when too few qualify. Ordinary heartbeats
 retry the pending context against every voter if a selected peer is unavailable.
 Joint configurations and learners retain full probe fanout. Raft still requires
 the current configuration's quorum acknowledgements for each fresh read context.
