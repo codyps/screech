@@ -252,6 +252,29 @@ impl Database {
             .get_conf_state()
             .write_to_bytes()
             .map_err(error)?;
+        let last = if local {
+            self.last()?.max(index)
+        } else {
+            index
+        };
+        let (last, last_term) = if let Some(entry) = entries.last() {
+            (entry.index, entry.term)
+        } else if last == index {
+            (last, snapshot.get_metadata().term)
+        } else {
+            (last, self.entry(last)?.term)
+        };
+        let root = self.watermark.next_root_bytes(
+            watermark::Position {
+                incarnation: self.incarnation,
+                term: next.term,
+                vote: next.vote,
+                commit: next.commit,
+                last,
+                last_term,
+            },
+            (index, snapshot.get_metadata().term, image.sequence),
+        )?;
         let tx = self.conn.transaction().map_err(error)?;
         if local {
             tx.execute("DELETE FROM entries WHERE idx<=?1", [sql(index)?])
@@ -293,6 +316,7 @@ impl Database {
             ("conf_index", image.conf_index.to_le_bytes().to_vec()),
             ("app_snapshot", image.model.clone()),
             ("app_sequence", image.sequence.to_le_bytes().to_vec()),
+            ("journal_root", root),
         ] {
             tx.execute(
                 "INSERT OR REPLACE INTO cluster_meta VALUES(?1,?2)",
@@ -454,6 +478,48 @@ mod tests {
         assert_eq!(db.end().unwrap(), 2);
         assert_eq!(db.last().unwrap(), 2);
         assert_eq!(db.content(key).unwrap().unwrap().payload, "retained");
+    }
+    #[test]
+    fn full_checkpoint_before_journal_rotation_recovers_but_an_older_root_cannot_replace_it() {
+        for restore_old_sqlite in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut db, data) = donor(dir.path());
+            let path = dir.path().join("donor");
+            db.conn
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+            let old_sqlite = std::fs::read(&path).unwrap();
+            let old_journal = std::fs::read(path.with_extension("cluster-watermark")).unwrap();
+            let key = ContentKey {
+                generation: 1,
+                sequence: 1,
+            };
+            db.compact(
+                2,
+                CheckpointImage {
+                    data,
+                    live: vec![key],
+                    imports: vec![],
+                },
+            )
+            .unwrap();
+            drop(db);
+            if restore_old_sqlite {
+                for suffix in ["-wal", "-shm"] {
+                    let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+                }
+                std::fs::write(&path, old_sqlite).unwrap();
+                assert!(Database::open(&path, &config(1), false).is_err());
+            } else {
+                // FULL SQLite committed, but the old journal still names its
+                // exact authenticated predecessor. Startup completes rotation.
+                std::fs::write(path.with_extension("cluster-watermark"), old_journal).unwrap();
+                let db = Database::open(&path, &config(1), false).unwrap();
+                assert_eq!(db.snapshot_base().unwrap(), (1, 1, 2));
+                assert_eq!(db.content(key).unwrap().unwrap().payload, "retained");
+                assert_eq!(db.journal_bytes(), 0);
+            }
+        }
     }
     #[test]
     fn invalid_model_with_valid_file_digests_cannot_resume_as_a_voter() {

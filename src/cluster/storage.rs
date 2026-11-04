@@ -1,7 +1,6 @@
-//! Authoritative Raft entries, terms and votes use FULL SQLite transactions.
-//! Commit notifications and reconstructible application indexes may use NORMAL:
-//! Raft does not require commit-index updates to sync. Payloads remain in FULL
-//! accepted entries; startup reconstructs indexes before exposing committed data.
+//! Complete accepted entries and voting promises sync in one authenticated
+//! journal. SQLite projects that history with NORMAL transactions between FULL
+//! snapshot roots. Startup replays before the node can vote or expose data.
 use super::{error, Batch, ClusterConfig};
 mod snapshots;
 mod watermark;
@@ -53,12 +52,26 @@ impl Database {
         bootstrap: bool,
         join: bool,
     ) -> io::Result<Self> {
+        Self::open_identity(path, config, bootstrap, join, None)
+    }
+    pub fn open_learner(path: &Path, config: &ClusterConfig, slot: u64) -> io::Result<Self> {
+        let mut incarnation = [0; 16];
+        getrandom::fill(&mut incarnation).map_err(error)?;
+        incarnation[..8].copy_from_slice(&slot.to_le_bytes());
+        Self::open_identity(path, config, false, true, Some(incarnation))
+    }
+    fn open_identity(
+        path: &Path,
+        config: &ClusterConfig,
+        bootstrap: bool,
+        join: bool,
+        supplied_incarnation: Option<[u8; 16]>,
+    ) -> io::Result<Self> {
         let marker = path.with_extension("cluster-lock");
         let existed = path.exists();
         if !existed && !bootstrap && !join {
             return Err(error("cluster storage is missing; startup must recover a fresh incarnation through the quorum"));
         }
-        let marker_bytes = std::fs::read(&marker).unwrap_or_default();
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -66,6 +79,7 @@ impl Database {
             .truncate(false)
             .open(&marker)?;
         lock.try_lock_exclusive()?;
+        let marker_bytes = std::fs::read(&marker).unwrap_or_default();
         if !existed && lock.metadata()?.len() > 0 {
             return Err(error("missing cluster database"));
         }
@@ -76,7 +90,7 @@ impl Database {
             .map_err(error)?;
         // Match the standalone WAL budget. Snapshotting retained payloads and
         // SQLite's page checkpoint are separate work; avoid forcing both into
-        // short admission bursts. FULL commits still sync every accepted entry.
+        // short admission bursts. The accepted journal syncs every new entry.
         conn.pragma_update(None, "wal_autocheckpoint", 4096)
             .map_err(error)?;
         conn.pragma_update(None, "journal_size_limit", 32 * 1024 * 1024)
@@ -132,8 +146,8 @@ impl Database {
         {
             bytes.try_into().map_err(|_| error("invalid incarnation"))?
         } else {
-            let mut n = [0; 16];
-            if join {
+            let mut n = supplied_incarnation.unwrap_or([0; 16]);
+            if join && supplied_incarnation.is_none() {
                 getrandom::fill(&mut n).map_err(error)?;
             }
             conn.execute(
@@ -174,6 +188,7 @@ impl Database {
                 .map_err(error)?;
         }
         db.restore_snapshot_position()?;
+        db.recover_journal()?;
         let base = db.snapshot_base()?.0;
         if base > 0 {
             // A checksum-valid but malformed model/catalog is not a safe voter.
@@ -200,9 +215,13 @@ impl Database {
             .map_err(error)?;
         db.apply(hard.commit)?;
         db.seal()?;
-        db._lock.set_len(0)?;
-        db._lock.write_all(watermark::MARKER)?;
-        db._lock.sync_all()?;
+        if marker_bytes != watermark::MARKER {
+            // Once the new format is published, a restart must not tear its
+            // downgrade fence by truncating and rewriting an identical marker.
+            db._lock.set_len(0)?;
+            db._lock.write_all(watermark::MARKER)?;
+            db._lock.sync_all()?;
+        }
         File::open(
             path.parent()
                 .filter(|p| !p.as_os_str().is_empty())
@@ -318,7 +337,11 @@ impl Database {
             0
         };
         let mut added = 0u64;
-        self.commit_transaction(durable, |tx| {
+        crate::fault::point("before_cluster_persist");
+        if durable {
+            self.accept_journal(entries, hard.unwrap_or(&old))?;
+        }
+        let applied = self.commit_transaction(false, |tx| {
             if let Some(first) = entries.first() {
                 tx.execute("DELETE FROM entries WHERE idx>=?1", [sql(first.index)?])
                     .map_err(error)?;
@@ -346,17 +369,17 @@ impl Database {
                 )
                 .map_err(error)?;
             }
-            crate::fault::point("before_cluster_persist");
             Ok(())
-        })?;
+        });
+        if let Err(failure) = applied {
+            self.failed = true;
+            return Err(failure);
+        }
         self.entries_bytes = self
             .entries_bytes
             .checked_sub(removed)
             .and_then(|n| n.checked_add(added))
             .ok_or_else(|| error("invalid cached log size"))?;
-        if durable {
-            self.seal()?;
-        }
         crate::fault::point("after_cluster_persist");
         Ok(())
     }
@@ -435,8 +458,8 @@ impl Database {
             tx.commit().map_err(error)?;
             Ok(value)
         })();
-        // Never leave a path that can persist a vote or accepted payload at
-        // NORMAL. A FULL commit also flushes all preceding NORMAL WAL frames.
+        // Never leave the FULL checkpoint/root installer at NORMAL. Accepted
+        // payloads and votes already synced in the journal before projection.
         let restored = if !durable {
             self.conn
                 .pragma_update(None, "synchronous", "FULL")
@@ -740,7 +763,7 @@ mod tests {
         assert_eq!(db.hard().unwrap(), hard);
     }
     #[test]
-    fn votes_identity_missing_and_corrupt_storage_fail_closed() {
+    fn votes_and_identity_fail_closed_while_journal_repairs_corrupt_projection() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         let c = config();
@@ -760,7 +783,9 @@ mod tests {
             .execute("UPDATE entries SET data=x'000000'", [])
             .unwrap();
         drop(db);
-        assert!(Database::open(&path, &c, true).is_err());
+        let repaired = Database::open(&path, &c, true).unwrap();
+        assert_eq!(repaired.entry(1).unwrap(), entry(1, 1, b"body"));
+        drop(repaired);
         let fresh = dir.path().join("fresh");
         drop(Database::open(&fresh, &c, true).unwrap());
         let mut other = c.clone();

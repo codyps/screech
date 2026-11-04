@@ -43,14 +43,19 @@ nonvoting incarnation. Promotion requires durable catch-up, then joint promotion
 entry. A new leader resumes committed replacement state. An abandoned learner can
 be retired automatically before enrolling another candidate. Authenticated transport
 hints let new learners reply to replacement leaders before receiving the committed
-routing map in a snapshot. A synced local recovery watermark fences stale vote,
-commit and accepted-log positions even when leader discovery cannot complete.
-Missing/corrupt watermarks force quorum repair; SQLite remains the sole log/data
-authority. Fixed-size authenticated fence records avoid per-update file allocation
-and directory syncs; either damaged record forces quorum recovery. ReadIndex
-replaces logged read barriers, and persistence-independent leader replication
-overlaps local and follower flushes. Accepted payloads and votes remain FULL;
-reconstructible indexes and commit notifications can persist asynchronously.
+routing map in a snapshot. The accepted journal and recovery fence share one file
+sync: complete entries, payloads and voting promises are durable together before
+persistence-dependent messages escape. SQLite projects the journal between FULL
+checkpoint roots. Startup replays lost projection writes before voting, while a
+missing/damaged published journal prefix or unrelated checkpoint root requires
+quorum repair. Both authenticated control records must validate; an older record
+cannot silently replace a damaged newer promise. The FULL snapshot transaction
+signs the exact predecessor journal tip so ordinary startup can finish a crash
+between checkpoint installation and journal rotation. Legacy FULL stores upgrade
+automatically. This replaces the initial two-sync SQLite-plus-fence path after
+measurements identified its sequential write latency. ReadIndex replaces logged
+read barriers, and persistence-independent leader replication overlaps local and
+follower flushes. Commit notifications and query indexes persist asynchronously.
 Retired or wrong-incarnation senders
 are fenced before voting; untrustworthy old state never bootstraps the replacement.
 Committed leader removal explicitly steps down the old leader. Application writer
@@ -429,7 +434,7 @@ corruption from structurally invalid data whose envelope checksums still match.
 
 | Upstream failure class and primary sources | Screech boundary and regression evidence |
 | --- | --- |
-| Acknowledging writes without syncing; divergent replicas after an OS crash and pauses ([#7567](https://github.com/nats-io/nats-server/issues/7567)) | SQLite WAL FULL persists entries and hard state before the pump releases protocol messages. The local watermark must also sync before success. The new process tests intercept actual leader WAL sync calls and inject errors both before and after the real sync; neither produces a publication success, and the process heals from the quorum. This tests sync failure ordering, not a guest power failure. |
+| Acknowledging writes without syncing; divergent replicas after an OS crash and pauses ([#7567](https://github.com/nats-io/nats-server/issues/7567)) | The accepted journal syncs complete entries, payloads and voting promises before persistence-dependent protocol messages. Process tests inject errors before and after its real sync; neither produces a publication success and the node heals from the quorum. Independent VM campaigns separately exercise power loss, torn writes and block I/O errors. |
 | Standalone confirmed consumer ACK preceding state installation ([#8821](https://github.com/nats-io/nats-server/issues/8821)) | Strict consumer reservations, ACKs, retention and publication dedup are transitions in the authoritative log. The existing standalone consumer crash suite and strict-mode engine/TCP tests check confirmed ACK recovery. The new empty-checkpoint/full-cluster-kill history checks consumer ACK floors and dedup as well as payloads. The explicitly unsafe standalone ACK option retains its weaker contract. |
 | Corrupt records skipped during enumeration ([#7549](https://github.com/nats-io/nats-server/issues/7549), [#8632](https://github.com/nats-io/nats-server/issues/8632)) | Entry CRCs and snapshot SHA-256 checks propagate failures. A missing required body is now also a replica fault, including in a batch. The new live-content tests require an error/disconnect, automatic fencing and recovery of both the first and subsequent messages; a damaged record is never treated as a successful empty read. |
 | Minority snapshot corruption interpreted as an empty catalog and orphan cleanup ([#7556](https://github.com/nats-io/nats-server/issues/7556)) | One replicated group owns catalog, consumers and bodies; there is no orphan-directory cleanup driven by a separate metadata group. Startup validates the complete image before voting. Tests corrupt two of five voters, including the old leader, retain their damaged files, heal both and verify catalog, payloads and ACK floors. A separate test proves a checksum-valid malformed model waits without starting Raft. |
@@ -437,7 +442,7 @@ corruption from structurally invalid data whose envelope checksums still match.
 | Stream update omitting existing consumers from an asynchronous metadata snapshot ([#7939](https://github.com/nats-io/nats-server/pull/7939), fixed in 2.12.6) | `State::apply_validated(Event::Update)` changes the stream configuration while retaining its consumer map. Checkpoint jobs capture a private persistent state root. A process history updates a stream with an ACKed and a pending delivery, checkpoints, restarts all voters and checks both consumer positions. |
 | Snapshot decode error ignored while the applied index advanced ([#7944](https://github.com/nats-io/nats-server/pull/7944)) | The event pump returns on installation failure before releasing messages or calling advance. A malformed-image test checks durable commit/view, Raft applied position and the outbound queue. Structural application recovery errors now also cause replica fencing rather than endless service-recovery retries. |
 | Committing prior-term entries by counting replicas ([#7955](https://github.com/nats-io/nats-server/pull/7955)) | Pinned raft-rs 0.7 requires the commit candidate's log term to match the current term. A five-voter test delivers actual persisted follower ACKs for an older-term majority while withholding the current-term entry: application state remains uncommitted until a current-term majority is persisted. |
-| Persisting an incremented candidate term with a stale vote ([#7956](https://github.com/nats-io/nats-server/pull/7956)) | Raft supplies one HardState; SQLite and the recovery watermark persist it before vote requests escape. A campaign/restart regression checks the durable self-vote, term, outgoing vote requests and restored group size. |
+| Persisting an incremented candidate term with a stale vote ([#7956](https://github.com/nats-io/nats-server/pull/7956)) | Raft supplies one HardState; the accepted journal persists its resulting term and vote together before vote requests escape. A campaign/restart regression checks the durable self-vote, term, outgoing vote requests and restored group size. |
 | Membership replay collapsing cluster size to one ([#7850](https://github.com/nats-io/nats-server/pull/7850)) | Snapshot configuration and committed changes reconstruct membership before actor startup. Cardinality validation now enforces the unchanged configured voter count. Tests reject a checksum-valid singleton snapshot and restart a repaired voter alone after compaction: it cannot establish a serving leader. |
 | Membership changes combined with partitions and kills losing acknowledged records ([#7545](https://github.com/nats-io/nats-server/issues/7545)) | Replacement enrolls a learner, waits for durable catch-up, then uses explicit joint promotion/removal and leave-joint; it does not shrink the quorum on timeout. Existing histories cover interrupted joint apply, lost learners, quorum refusal, stale writers and writes during repair. These are targeted schedules rather than exhaustive membership/partition exploration. |
 | Consumer deletion/recreation colliding on a shared directory ([#8793](https://github.com/nats-io/nats-server/issues/8793)) | Consumers have committed generation identities, without independently created/deleted consumer-store directories. The new clustered history recreates the same name, submits an old ACK and checks the new consumer before and after a checkpoint and election. Existing model/standalone histories cover deletion, recreation and stale tokens. |

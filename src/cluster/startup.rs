@@ -411,17 +411,9 @@ fn new_instance(config: &ClusterConfig, store: &Path) -> io::Result<(Instance, D
     let path = directory.join("store.db");
     let mut runtime = config.clone();
     runtime.node_id = member;
-    let mut db = Database::open_mode(&path, &runtime, false, true)?;
-    let mut nonce = db.incarnation;
-    nonce[..8].copy_from_slice(&config.node_id.to_le_bytes());
-    db.conn
-        .execute(
-            "UPDATE cluster_meta SET value=?1 WHERE key='incarnation'",
-            [nonce.as_slice()],
-        )
-        .map_err(error)?;
-    db.incarnation = nonce;
-    db.seal()?;
+    // Bind the physical slot before the first durable root is created. An
+    // identity cannot change inside an accepted journal's history.
+    let db = Database::open_learner(&path, &runtime, config.node_id)?;
     Ok((Instance { member, path }, db))
 }
 // The signed virgin record guarantees no actor has ever been allowed to vote.
@@ -704,6 +696,16 @@ mod tests {
         assert!(db.conf().unwrap().learners.contains(&first.member));
         assert!(!db.conf().unwrap().voters.contains(&first.member));
         assert_eq!(original.meta("sentinel").unwrap().unwrap(), vec![1]);
+        let incarnation = db.incarnation;
+        drop(db);
+        let mut runtime = config.clone();
+        runtime.node_id = first.member;
+        // A crash before enrollment/snapshot transfer must preserve the same
+        // nonvoting identity and a readable, authenticated initial journal.
+        let db = Database::open_mode(&first.path, &runtime, false, false).unwrap();
+        assert_eq!(db.incarnation, incarnation);
+        assert_eq!(db.hard().unwrap().term, 0);
+        assert!(db.conf().unwrap().learners.contains(&first.member));
     }
     #[test]
     fn startup_messages_and_manifests_are_bound_to_cluster_secret_and_domain() {

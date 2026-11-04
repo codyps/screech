@@ -97,10 +97,10 @@ def inspect():
 
 
 def file_extents():
-    """FIEMAP without FIEMAP_FLAG_SYNC: observe allocated DB/WAL sectors, no fsync."""
+    """Observe allocated journal/DB/WAL sectors without changing sync state."""
     _, base = instance()
     result = []
-    for path in [base, Path(str(base) + '-wal')]:
+    for path in [base.with_suffix('.cluster-watermark'), base, Path(str(base) + '-wal')]:
         if not path.exists():
             continue
         buffer = bytearray(struct.pack('=QQIIII', 0, 2**64-1, 0, 0, 256, 0) + bytes(56 * 256))

@@ -183,6 +183,14 @@ def minority_corruption(binary):
                         damaged = bytearray(data)
                         damaged[len(damaged) // 2] ^= 1
                         db.execute('UPDATE entries SET data=? WHERE idx=?', [bytes(damaged), index])
+                        # The journal can repair a damaged query projection.
+                        # Damage its published prefix too so this voter has
+                        # actually lost authority and must use quorum repair.
+                        journal = paths[slot].with_suffix('.cluster-watermark')
+                        accepted = bytearray(journal.read_bytes())
+                        assert len(accepted) > 8192 + 10
+                        accepted[8192 + 10] ^= 1
+                        journal.write_bytes(accepted)
             for slot in victims:
                 cluster.start(slot)
             for slot in victims:
@@ -320,7 +328,7 @@ def invalid_stored_model_waits_for_quorum(binary):
 
 
 def failed_sync_never_confirms(binary, shim, mode):
-    # NATS #7564/#7567: actual WAL synchronization precedes replication success.
+    # NATS #7564/#7567: actual authoritative journal sync precedes replication success.
     with tempfile.TemporaryDirectory(prefix='screech-nats-sync-') as tmp:
         cluster = Cluster(binary, Path(tmp))
         try:
@@ -330,7 +338,7 @@ def failed_sync_never_confirms(binary, shim, mode):
                     'LD_PRELOAD': str(shim), 'SCREECH_IO_MODE': mode,
                     'SCREECH_IO_ARM': str(node / 'arm'),
                     'SCREECH_IO_HIT': str(node / 'sync-fault'),
-                    'SCREECH_IO_SUFFIX': '-wal',
+                    'SCREECH_IO_SUFFIX': '.cluster-watermark',
                 })
             leader = cluster.wait_leader()
             client = cluster.client(leader)
@@ -357,7 +365,7 @@ def failed_sync_never_confirms(binary, shim, mode):
             cluster.await_equal()
         finally:
             cluster.close()
-    return {'test': f'{mode} on leader WAL never releases a success ACK and heals without process restart', 'passed': True}
+    return {'test': f'{mode} on leader journal never releases a success ACK and heals without process restart', 'passed': True}
 
 
 def stalled_ack_remains_recoverable(binary, shim):
@@ -371,7 +379,7 @@ def stalled_ack_remains_recoverable(binary, shim):
                     'LD_PRELOAD': str(shim), 'SCREECH_IO_MODE': 'sync-hang-before',
                     'SCREECH_IO_ARM': str(node / 'arm'),
                     'SCREECH_IO_HIT': str(node / 'sync-fault'),
-                    'SCREECH_IO_SUFFIX': '-wal',
+                    'SCREECH_IO_SUFFIX': '.cluster-watermark',
                 })
             leader = cluster.wait_leader()
             client = cluster.client(leader)

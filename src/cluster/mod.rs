@@ -308,6 +308,7 @@ impl Store for ClusterStore {
         self.client
             .read(|db| {
                 Ok(db.log_bytes()? > db.max_log_bytes / 2
+                    || db.journal_bytes() > db.max_log_bytes / 2
                     || db.view()?.saturating_sub(db.snapshot_base()?.0) >= 8192
                     || db.conf_index()? > db.snapshot_base()?.0)
             })
@@ -956,7 +957,10 @@ async fn run_runtime(
                         {
                             let _ = reply.send(Err(error("not current leader")));
                         } else {
-                            let used = node.store().db.lock().unwrap().log_bytes()?;
+                            let used = {
+                                let db = node.store().db.lock().unwrap();
+                                db.log_bytes()?.max(db.journal_bytes())
+                            };
                             if used + data.len() as u64 + 256 > actor_config.max_log_bytes {
                                 let _ = reply
                                     .send(Err(error("cluster log budget reached; writes paused")));

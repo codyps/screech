@@ -1,24 +1,24 @@
-//! A restart fence, never an application recovery root. SQLite remains the only
-//! log/data authority. Before releasing persistence-dependent protocol messages,
-//! seal the voting/log history outside the replaceable database. A stale database
-//! then fails closed even when no leader is reachable. A database ahead of its
-//! seal is safe: a crash may occur between its FULL commit and publishing the seal.
+//! Authenticated accepted journal and restart fence. Complete entry bytes and
+//! voting promises share one sync; SQLite is replayable between FULL roots.
+//! Legacy metadata-only fences are verified before the automatic format upgrade.
 use super::*;
 use hmac::Mac;
 use serde::{Deserialize, Serialize};
 use std::io::Seek;
 use std::path::PathBuf;
+#[path = "journal.rs"]
+mod journal;
 const DOMAIN: u64 = 0x57415445524d4152;
 const LEGACY: &[u8] = b"screech-cluster-v1\n";
-pub(super) const MARKER: &[u8] = b"screech-cluster-v2\n";
+pub(super) const MARKER: &[u8] = b"screech-cluster-v3\n";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct Position {
-    incarnation: [u8; 16],
-    term: u64,
-    vote: u64,
-    commit: u64,
-    last: u64,
-    last_term: u64,
+pub(super) struct Position {
+    pub(super) incarnation: [u8; 16],
+    pub(super) term: u64,
+    pub(super) vote: u64,
+    pub(super) commit: u64,
+    pub(super) last: u64,
+    pub(super) last_term: u64,
 }
 #[derive(Serialize, Deserialize)]
 struct Signed {
@@ -37,6 +37,7 @@ pub(super) struct Watermark {
     sealed: Option<Position>,
     file: Option<File>,
     generation: u64,
+    journal: Option<journal::Journal>,
 }
 impl Watermark {
     pub fn open(
@@ -54,7 +55,19 @@ impl Watermark {
             sealed: None,
             file: None,
             generation: 0,
+            journal: None,
         };
+        if let Ok(mut file) = File::open(&watermark.path) {
+            use std::io::Read;
+            let mut magic = [0; 8];
+            if file.read_exact(&mut magic).is_ok() && &magic == b"SCSEAL04" {
+                watermark.open_journal()?;
+                return Ok(watermark);
+            }
+        }
+        if marker == MARKER {
+            return Err(error("missing or rolled-back accepted journal"));
+        }
         match std::fs::read(&watermark.path) {
             Ok(bytes) if bytes.len() == SEAL_BYTES => {
                 // Both records must authenticate. A damaged record might contain
@@ -96,6 +109,7 @@ impl Watermark {
         }
         Ok(watermark)
     }
+    #[cfg(test)]
     fn encode(
         &self,
         position: &Position,
@@ -137,6 +151,7 @@ impl Watermark {
             postcard::from_bytes(&bytes[28..28 + len]).map_err(error)?,
         ))
     }
+    #[cfg(test)]
     fn publish(&mut self, position: &Position) -> io::Result<()> {
         let generation = self
             .generation
@@ -229,15 +244,10 @@ impl Database {
         Ok(())
     }
     pub(crate) fn seal(&mut self) -> io::Result<()> {
-        let position = self.position()?;
-        if self.watermark.file.is_some() && self.watermark.sealed.as_ref() == Some(&position) {
-            return Ok(());
-        }
-        if let Err(failure) = self.watermark.publish(&position) {
+        if let Err(failure) = self.seal_journal() {
             self.failed = true;
             return Err(failure);
         }
-        self.watermark.sealed = Some(position);
         Ok(())
     }
 }
@@ -313,6 +323,7 @@ mod tests {
             serde_json::to_vec(&Signed { body, mac }).unwrap(),
         )
         .unwrap();
+        std::fs::write(path.with_extension("cluster-lock"), b"screech-cluster-v2\n").unwrap();
         let mut db = Database::open_mode(&path, &cfg, false, false).unwrap();
         assert_eq!(db.position().unwrap(), position);
         assert_eq!(
@@ -357,10 +368,9 @@ mod tests {
         );
         drop(db);
         restore(&path);
-        assert!(
-            Database::open_mode(&path, &config(), false, false).is_err(),
-            "standby allowed a promised prefix to roll back"
-        );
+        let db = Database::open_mode(&path, &config(), false, false).unwrap();
+        assert_eq!(db.last().unwrap(), 16);
+        assert_eq!(db.hard().unwrap().commit, 16);
     }
     #[test]
     fn lost_commit_notification_replays_full_accepted_payload_without_weakening_sync_mode() {
@@ -415,7 +425,7 @@ mod tests {
         assert_eq!(db.record(1).unwrap().unwrap().payload.as_ref(), b"durable");
     }
     #[test]
-    fn consistent_database_rollback_cannot_forget_commits_votes_or_accepted_entries() {
+    fn journal_replays_commits_votes_and_accepted_entries_lost_from_the_projection() {
         for kind in ["commit", "vote", "accepted"] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("store.db");
@@ -428,14 +438,15 @@ mod tests {
                 _ => db.persist(&[entry(2, 1)], None),
             }
             .unwrap();
+            let expected = db.position().unwrap();
             drop(db);
             restore(&path);
-            let result = Database::open_mode(&path, &config(), false, false);
-            assert!(result.is_err(), "{kind} rollback resumed voting");
+            let db = Database::open_mode(&path, &config(), false, false).unwrap();
+            assert_eq!(db.position().unwrap(), expected, "lost {kind}");
         }
     }
     #[test]
-    fn sqlite_ahead_of_the_watermark_recovers_after_interrupted_seal_publication() {
+    fn rolling_back_the_journal_cannot_discard_an_accepted_sqlite_suffix() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("store.db");
         let mut db = Database::open_mode(&path, &config(), true, false).unwrap();
@@ -444,11 +455,10 @@ mod tests {
         db.persist(&[entry(2, 1)], Some(&hard(1, 2))).unwrap();
         drop(db);
         std::fs::write(path.with_extension("cluster-watermark"), old).unwrap();
-        let db = Database::open_mode(&path, &config(), false, false).unwrap();
-        assert_eq!(db.hard().unwrap().commit, 2);
+        assert!(Database::open_mode(&path, &config(), false, false).is_err());
     }
     #[test]
-    fn interrupted_new_term_suffix_replacement_does_not_look_like_database_rollback() {
+    fn rolling_back_the_journal_cannot_forget_a_new_term_or_suffix_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("store.db");
         let mut db = Database::open_mode(&path, &config(), true, false).unwrap();
@@ -458,9 +468,26 @@ mod tests {
         db.persist(&[entry(2, 2)], Some(&hard(2, 2))).unwrap();
         drop(db);
         std::fs::write(path.with_extension("cluster-watermark"), old).unwrap();
-        let db = Database::open_mode(&path, &config(), false, false).unwrap();
-        assert_eq!(db.last().unwrap(), 2);
-        assert_eq!(db.hard().unwrap().term, 2);
+        assert!(Database::open_mode(&path, &config(), false, false).is_err());
+    }
+    #[test]
+    fn signed_v3_fence_migrates_only_before_the_new_format_marker_is_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let cfg = config();
+        let mut db = Database::open_mode(&path, &cfg, true, false).unwrap();
+        db.persist(&[entry(1, 1)], Some(&hard(1, 1))).unwrap();
+        let position = db.position().unwrap();
+        // Construct an actual old-format root, including its directory sync.
+        db.watermark.file = None;
+        db.watermark.journal = None;
+        db.watermark.publish(&position).unwrap();
+        drop(db);
+        assert!(Database::open_mode(&path, &cfg, false, false).is_err());
+        std::fs::write(path.with_extension("cluster-lock"), b"screech-cluster-v2\n").unwrap();
+        let db = Database::open_mode(&path, &cfg, false, false).unwrap();
+        assert_eq!(db.position().unwrap(), position);
+        assert!(db.watermark.journal.is_some());
     }
     #[test]
     fn missing_or_corrupt_seal_requires_quorum_recovery() {
@@ -474,6 +501,59 @@ mod tests {
                 std::fs::write(path.with_extension("cluster-watermark"), b"broken").unwrap();
             }
             assert!(Database::open_mode(&path, &config(), false, false).is_err());
+        }
+    }
+    #[test]
+    fn journal_recovers_new_term_suffix_replacement_after_losing_sqlite_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut db = Database::open(&path, &config(), true).unwrap();
+        db.persist(&[entry(1, 1), entry(2, 1), entry(3, 1)], Some(&hard(1, 1)))
+            .unwrap();
+        backup(&db, &path);
+        db.persist(&[entry(2, 2)], Some(&hard(2, 2))).unwrap();
+        drop(db);
+        restore(&path);
+        let db = Database::open(&path, &config(), false).unwrap();
+        assert_eq!(db.last().unwrap(), 2);
+        assert_eq!(db.entry(2).unwrap().term, 2);
+        assert_eq!(db.hard().unwrap(), hard(2, 2));
+        assert!(db.entry(3).is_err());
+    }
+    #[test]
+    fn only_bytes_outside_the_authenticated_published_prefix_can_be_discarded() {
+        for damage in ["unpublished-tail", "payload", "truncated"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let mut db = Database::open(&path, &config(), true).unwrap();
+            db.persist(&[entry(1, 1)], Some(&hard(1, 1))).unwrap();
+            drop(db);
+            let file = path.with_extension("cluster-watermark");
+            let mut bytes = std::fs::read(&file).unwrap();
+            match damage {
+                "unpublished-tail" => bytes.extend_from_slice(b"interrupted unpublished record"),
+                "payload" => bytes[SEAL_BYTES + 10] ^= 1,
+                _ => {
+                    bytes.pop();
+                }
+            }
+            std::fs::write(&file, bytes).unwrap();
+            let recovered = Database::open(&path, &config(), false);
+            if damage == "unpublished-tail" {
+                let mut db = recovered.unwrap();
+                assert_eq!(db.hard().unwrap(), hard(1, 1));
+                db.persist(&[entry(2, 1)], Some(&hard(1, 2))).unwrap();
+                drop(db);
+                assert_eq!(
+                    Database::open(&path, &config(), false)
+                        .unwrap()
+                        .last()
+                        .unwrap(),
+                    2
+                );
+            } else {
+                assert!(recovered.is_err(), "{damage} journal resumed voting");
+            }
         }
     }
 }

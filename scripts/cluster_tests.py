@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Real three-process Raft histories. Every child is killed/reaped on failure."""
 import argparse,json,socket,sqlite3,subprocess,tempfile,time
+from contextlib import closing
 from pathlib import Path
 from wire import Client
 
@@ -64,7 +65,7 @@ class Cluster:
                 for i in self.processes:
                     path=self.store_path(i)
                     if not path.exists():break
-                    with sqlite3.connect(f'file:{path}?mode=ro',uri=True) as db:
+                    with closing(sqlite3.connect(f'file:{path}?mode=ro',uri=True)) as db:
                         end=db.execute('select coalesce(max(seq),0) from event_index').fetchone()[0]
                         floor=db.execute("select value from cluster_meta where key='app_sequence'").fetchone()
                         view=db.execute("select value from cluster_meta where key='view'").fetchone()

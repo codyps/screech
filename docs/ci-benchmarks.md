@@ -42,7 +42,7 @@ with the published benchmark artifacts.
 | NATS · always | sync_interval: always | Stream writes are synced; standalone consumer state can still flush asynchronously |
 | NATS · 10 ms | sync_interval: 10ms | Stream syncing is deferred between intervals |
 | NATS · default 2m | sync_interval omitted | NATS' documented two-minute default; this is not an equal power-loss contract |
-| Screech · 3/5 voters · FULL | Ordinary cluster startup, SQLite FULL on each voter | Committed publication, reservation and consumer ACK state follows a durable quorum |
+| Screech · 3/5 voters · FULL | Ordinary startup, synced accepted journals and FULL checkpoint roots | Committed publication, reservation and consumer ACK state follows a durable quorum |
 | NATS · 3/5 replicas · always | JetStream cluster, sync_interval: always on every server | File streams and durable consumers explicitly request matching R3/R5 replication; persistence contracts differ from Screech |
 
 Core cases use no stream storage; their labels say Core. Additional intervals can

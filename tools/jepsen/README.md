@@ -293,10 +293,10 @@ audits of both seeded and interrupted cycles.
 
 | Scenario | Boundary and fault |
 | --- | --- |
-| `vm-active-write` | Hold a real database/WAL block write without replying, then cut power. |
+| `vm-active-write` | Hold a real accepted-journal/database/WAL block write without replying, then cut power. |
 | `vm-active-flush` | Hold a real block FLUSH without replying, then cut power. |
-| `vm-torn` | Persist exactly the first 512 bytes of a changing multi-sector database/WAL request, withhold the reply, then cut power. |
-| `vm-eio-write` | Return `EIO` for a real database/WAL block write, observe a guest kernel I/O error, then cut power. |
+| `vm-torn` | Persist exactly the first 512 bytes of a changing multi-sector accepted-journal/database/WAL request, withhold the reply, then cut power. |
+| `vm-eio-write` | Return `EIO` for a real accepted-journal/database/WAL block write, observe a guest kernel I/O error, then cut power. |
 | `vm-eio-flush` | Return `EIO` for a real block FLUSH, observe a guest kernel I/O error, then cut power. |
 
 FIEMAP without its sync flag identifies allocated authoritative file extents.

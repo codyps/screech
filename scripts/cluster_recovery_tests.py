@@ -59,7 +59,7 @@ def damage_store(cluster,slot,damage):
     elif damage=='watermark-corrupt':path.with_suffix('.cluster-watermark').write_bytes(b'broken recovery seal')
     elif damage in ('watermark-slot-0','watermark-slot-1'):
         seal=path.with_suffix('.cluster-watermark');data=bytearray(seal.read_bytes())
-        assert len(data)==8192,'expected two authenticated recovery-fence records'
+        assert len(data)>=8192,'expected authenticated recovery-fence records and journal'
         data[int(damage[-1])*4096+128]^=0x80;seal.write_bytes(data)
     elif damage=='manifest-corrupt':
         (cluster.root/str(slot)/'db.node-state').write_bytes(b'broken startup identity')
@@ -86,8 +86,50 @@ def verify(cluster,expected,acked=True):
             assert c.get(1) is None
             info=c.request('$JS.API.CONSUMER.INFO.T.D',{});assert info['ack_floor']['consumer_seq']>=1,info
     finally:c.close()
+
+def replay_projection_without_quorum(binary):
+    with tempfile.TemporaryDirectory(prefix='screech-projection-replay-') as tmp:
+        cluster=Cluster(binary,Path(tmp))
+        try:
+            for slot in range(1,4):cluster.start(slot)
+            leader=cluster.wait_leader();c=cluster.client(leader);c.create()
+            assert c.publish(b'old-projection')==1;c.close();cluster.await_equal()
+            victim=next(slot for slot in cluster.processes if slot!=leader)
+            previous=cluster.member(victim);path=cluster.store_path(victim)
+            with sqlite3.connect(path) as source,sqlite3.connect(cluster.root/str(victim)/'stale') as dest:source.backup(dest)
+            source.close();dest.close()
+            c=cluster.client(leader);assert c.publish(b'journaled-payload')==2;c.close();cluster.await_equal()
+            with sqlite3.connect(path) as db:last=db.execute('SELECT max(idx) FROM entries').fetchone()[0]
+            db.close()
+            for slot in list(cluster.processes):cluster.kill(slot)
+            damage_store(cluster,victim,'stale');cluster.start(victim);time.sleep(2)
+            assert cluster.member(victim)==previous
+            deadline=time.monotonic()+10
+            while True:
+                db=None
+                try:
+                    db=sqlite3.connect(f'file:{path}?mode=ro',uri=True,timeout=.1)
+                    restored=db.execute('SELECT max(idx) FROM entries').fetchone()[0]>=last
+                    restored &= any(b'journaled-payload' in row[0] for row in db.execute('SELECT data FROM entries'))
+                    if restored:break
+                except sqlite3.Error:pass
+                finally:
+                    if db is not None:db.close()
+                assert time.monotonic()<deadline,'journal did not restore the lost payload projection'
+                time.sleep(.05)
+            try:
+                c=Client(cluster.address(victim,'service'),timeout=.3);c.close()
+                raise AssertionError('replayed minority served without quorum')
+            except (OSError,EOFError):pass
+            for slot in range(1,4):
+                if slot!=victim:cluster.start(slot)
+            verify(cluster,{1:b'old-projection',2:b'journaled-payload'},acked=False)
+            cluster.await_equal()
+            return dict(test='journal restores lost SQL payloads before quorum returns without allowing minority service',passed=True)
+        finally:cluster.close()
+
 def run(binary):
-    results=[]
+    results=[replay_projection_without_quorum(binary)]
     with tempfile.TemporaryDirectory(prefix='screech-recovery-') as tmp:
         cluster=Cluster(binary,Path(tmp),spares=0)
         expected={}
@@ -218,8 +260,12 @@ def run(binary):
         try:
             for n in range(1,4):cluster.start(n)
             leader=cluster.wait_leader();c=cluster.client(leader);c.create();assert c.publish(b'old-state')==1;c.close();cluster.await_equal()
-            victim=next(n for n in cluster.processes if n!=leader);previous=cluster.member(victim)
+            victim=leader;previous=cluster.member(victim)
             with sqlite3.connect(cluster.store_path(victim)) as source,sqlite3.connect(cluster.root/str(victim)/'stale') as dest:source.backup(dest)
+            # A matching journal can replay a lost SQL projection. Cross a FULL
+            # checkpoint root so this backup actually lacks required recovery
+            # authority and must wait for the surviving quorum instead.
+            compact(cluster)
             c=cluster.client(leader);assert c.publish(b'new-state')==2;c.close();cluster.await_equal()
             for n in list(cluster.processes):cluster.kill(n)
             damage_store(cluster,victim,'stale');cluster.start(victim);time.sleep(2)
@@ -231,7 +277,7 @@ def run(binary):
             for n in range(1,4):
                 if n!=victim:cluster.start(n)
             wait_healed(cluster,victim,previous);verify(cluster,{1:b'old-state',2:b'new-state'},acked=False)
-            results.append(dict(test='valid stale database cannot resume voting without its promised history; quorum heals it',passed=True))
+            results.append(dict(test='stale checkpoint root cannot resume voting without its promised history; quorum heals it',passed=True))
         finally:cluster.close()
     with tempfile.TemporaryDirectory(prefix='screech-automatic-standby-') as tmp:
         cluster=Cluster(binary,Path(tmp),spares=1)

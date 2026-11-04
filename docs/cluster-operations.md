@@ -91,7 +91,8 @@ The `.node-state` file durably selects the current store generation. Replacement
 stores live beneath `<store stem>.recovery/<member>/store.db`. Original and failed
 generations are preserved for diagnosis and consume disk until archived or removed
 while the server is stopped. Keep the active generation, WAL/SHM files, startup
-manifest, recovery watermarks and lock markers together. Startup verifies persisted identities, log
+manifest, accepted journals (`.cluster-watermark`) and lock markers together. The
+journal contains payloads and must be included in backups. Startup verifies identities, log
 continuity, snapshots and required bodies before resuming a stored voter. A complete
 restart relies on the surviving stores retaining their durable voting history;
 restoring an entire voting quorum to older, internally consistent backups is not a
@@ -111,31 +112,34 @@ per-stream replica placement or sharding.
 
 ## Persistence and current limits
 
-SQLite WAL FULL atomically persists complete Raft entries and required term/vote
-state before persistence-dependent replication messages. Entries contain application
-transitions and their payloads. Record/content indexes refer into those entries and
-expose only the committed prefix. Commit-index notifications and reconstructible
-indexes use SQLite NORMAL transactions; accepted entries, payloads, terms and votes
-always use FULL. Raft permits asynchronous commit-index persistence. A lost commit
-notification cannot remove an accepted payload: the next leader establishes a
-current-term committed prefix before exposing its recovered model.
-Recovery rebuilds indexes from that prefix,
-then reconstructs the model from a validated checkpoint and its committed tail.
-Uncommitted accepted entries remain available to Raft for conflict replacement.
+An authenticated accepted journal atomically seals complete Raft entries, their
+payloads, and the resulting term/vote promise with one file sync. That sync precedes
+SQLite projection updates and persistence-dependent replication messages. A client
+success also requires quorum commitment and application. SQLite uses NORMAL for
+accepted-entry and query projections between FULL snapshot roots; losing those
+updates cannot lose accepted bytes because startup replays the journal first.
+Commit-index notifications may persist asynchronously, as permitted by Raft. A new
+leader commits a current-term observation before exposing the recovered model.
+Indexes expose only the committed prefix; the accepted suffix remains available
+for conflict replacement. Standalone storage keeps its existing FULL behavior.
 
-Before releasing persistence-dependent messages, an authenticated local watermark
-seals the durable term, vote, commit and accepted log position. Startup compares the
-database against this watermark, rejecting rolled-back history even without a
-reachable leader. Missing or corrupt watermarks require quorum repair. A database
-ahead of the watermark is safe to resume after interrupted publication. SQLite is
-the only source of replicated application state; the watermark can only reject a
-store. The fence has two fixed-size authenticated records with consecutive
-generations. Both must validate; a torn or invalid record requires quorum repair
-even if the other record is readable. This prevents silently resuming from an older
-vote or accepted-log promise. Each update syncs the changed record before releasing
-persistence-dependent messages. Signed JSON fences upgrade automatically during
-ordinary startup through an atomic file replacement and directory sync; older
-binaries cannot open an upgraded local fence.
+The journal retains the `.cluster-watermark` filename. Two fixed-size authenticated
+control records bind its root, published length, hash chain and voting/log position.
+Both must validate with consecutive generations. A torn control record or damaged
+published payload requires quorum repair, even if an older record is readable.
+Bytes beyond the authenticated published length are unconfirmed and can be ignored.
+This distinguishes an interrupted append from damage to acknowledged history.
+SQLite restored within the same checkpoint root can replay its missing projection;
+an unrelated or older root requires quorum repair. A newer SQLite term or accepted
+suffix outside the journal also requires repair.
+
+Snapshots atomically install a FULL SQLite root and its signed journal predecessor.
+Only after that commit does an atomic file replacement reclaim the old journal.
+Startup completes an interrupted replacement only when the signed root names the
+exact old journal tip. Old JSON and metadata-only fences upgrade during ordinary
+startup after validating their FULL SQLite history. A synced format marker prevents
+reverting an upgraded store to an old fence. Older binaries cannot open the new
+local format; there is no separate migration command.
 
 Read-only responses use Raft ReadIndex quorum checks, without appending empty log
 entries. A committed mutation supplies the quorum observation for its own reply;
