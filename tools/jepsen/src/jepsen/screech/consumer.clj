@@ -7,17 +7,41 @@
             [jepsen.client :as client]
             [jepsen.checker :as checker]
             [jepsen.generator :as gen]
-            [jepsen.screech.client :as c])
+            [jepsen.screech.client :as c]
+            [jepsen.screech.remote :as remote])
   (:import (io.nats.client Connection Message)
            (io.nats.client.impl Headers)
            (java.time Duration)
-           (java.util Base64 UUID)))
+           (java.util Base64 UUID)
+           (java.util.concurrent TimeUnit ExecutionException)))
+
+(def ^:dynamic *request-observer* nil)
+(def ^:dynamic *request-kind* nil)
+(def ^:dynamic *request-journal* nil)
+(def ^:dynamic *request-step* nil)
 
 (defn bytes [s] (.getBytes ^String s java.nio.charset.StandardCharsets/UTF_8))
 (defn text [data] (String. ^bytes data java.nio.charset.StandardCharsets/UTF_8))
 (defn unavailable [message] (throw (ex-info message {:uncertain true})))
 (defn request [^Connection conn subject payload headers timeout]
-  (let [message (.request conn ^String subject ^Headers headers ^bytes payload (Duration/ofMillis timeout))]
+  (let [message (if (and *request-observer* (#{:publish :ack} *request-kind*))
+                  (let [id (str (UUID/randomUUID))
+                        future (.request conn ^String subject ^Headers headers ^bytes payload)
+                        observer *request-observer*]
+                    ;; The asynchronous API has submitted the actual request
+                    ;; before the controller records the open request window.
+                    (swap! *request-journal* update *request-step* assoc :io-id id)
+                    (.whenComplete future
+                                   (reify java.util.function.BiConsumer
+                                     (accept [_ _ _] (observer {:id id :phase "end"}))))
+                    (try
+                      (when-not (.isDone future)
+                        (observer {:id id :kind *request-kind* :subject subject :phase "begin"}))
+                      (try (.get future timeout TimeUnit/MILLISECONDS)
+                           (catch ExecutionException error (throw (.getCause error))))
+                      (finally
+                        (observer {:id id :phase "end"}))))
+                  (.request conn ^String subject ^Headers headers ^bytes payload (Duration/ofMillis timeout)))]
     (when (and message (.isStatusMessage message))
       (unavailable (str "NATS status " (.getStatus message))))
     message))
@@ -35,7 +59,7 @@
   ;; Keep completed steps even when the enclosing cycle later has an unknown outcome.
   (let [id (count @journal)]
     (swap! journal conj (merge fields {:kind :attempt :action kind :request id}))
-    (let [result (f)]
+    (let [result (binding [*request-kind* kind *request-journal* journal *request-step* id] (f))]
       (swap! journal conj (merge fields result {:kind kind :request id}))
       result)))
 (defn stream! [conn journal name retention replicas]
@@ -99,6 +123,7 @@
 (defn exercise! [conn catalog journal case replicas]
   (let [{:keys [id streams]} case w (:w streams) l (:l streams) i (:i streams)]
     (stream! conn journal l "limits" replicas)
+    (swap! catalog update-in [id :created] (fnil conj #{}) l)
     (consumer! conn journal l "D" 0)
     (consumer! conn journal l "GONE" 0)
     (step! journal :delete {:stream l :consumer "GONE" :epoch 0}
@@ -108,6 +133,7 @@
     (ack! conn journal l "D" 0 (deliver! conn journal l "D" 0))
     (step! journal :dedup {:stream l} #(duplicate! conn l))
     (stream! conn journal i "interest" replicas)
+    (swap! catalog update-in [id :created] (fnil conj #{}) i)
     (consumer! conn journal i "D" 0)
     (consumer! conn journal i "E" 0)
     (publish! conn journal i :removed)
@@ -117,6 +143,7 @@
     (ack! conn journal i "D" 0 (deliver! conn journal i "D" 0))
     (deliver! conn journal i "E" 0)
     (stream! conn journal w "workqueue" replicas)
+    (swap! catalog update-in [id :created] (fnil conj #{}) w)
     (consumer! conn journal w "D" 0)
     (publish! conn journal w :removed)
     (swap! catalog assoc-in [id :work-dedup] true)
@@ -148,14 +175,20 @@
                                            r)))]))}))
 
 (defn audit! [conn catalog journal]
-  (into {} (for [[id {:keys [streams dedup work-dedup stale-token]}] (sort-by key @catalog)]
+  (into {} (for [[id {:keys [streams created dedup work-dedup stale-token]}] (sort-by key @catalog)]
              [id (let [d (when dedup (step! journal :dedup {:stream (:l streams) :case id} #(duplicate! conn (:l streams))))
                        wd (when work-dedup (step! journal :dedup {:stream (:w streams) :case id} #(duplicate! conn (:w streams) :removed)))
                        stale (when stale-token (step! journal :stale {:stream (:w streams) :case id} #(stale! conn stale-token)))]
                    {:dedup d :work-dedup wd :stale stale
-                    :streams {(:l streams) (read-stream conn (:l streams) ["D" "GONE"] [1] journal id)
-                              (:i streams) (read-stream conn (:i streams) ["D" "E"] [1 2] journal id)
-                              (:w streams) (read-stream conn (:w streams) ["D"] [1 2] journal id)}})])))
+                    ;; Unknown creates impose no stream contract. Skip streams
+                    ;; never confirmed created; the checker independently
+                    ;; demands observations for every confirmed create.
+                    :streams (into {} (for [[stream consumers seqs]
+                                            [[(:l streams) ["D" "GONE"] [1]]
+                                             [(:i streams) ["D" "E"] [1 2]]
+                                             [(:w streams) ["D"] [1 2]]]
+                                            :when (contains? created stream)]
+                                        [stream (read-stream conn stream consumers seqs journal id)]))})])))
 
 (defrecord Client [connection node catalog]
   client/Client
@@ -163,13 +196,19 @@
   (setup! [_ _])
   (invoke! [_ test op]
     (let [journal (atom []) id (str/replace (str (UUID/randomUUID)) "-" "")
-          fixture {:id id :seed (:seed (:value op)) :streams {:w (str "W_" id) :l (str "L_" id) :i (str "I_" id)}}
+          fixture {:id id :seed (:seed (:value op)) :recovery (:recovery (:value op)) :node node
+                   :streams {:w (str "W_" id) :l (str "L_" id) :i (str "I_" id)}}
           value (if (= :exercise (:f op)) fixture {:node node})]
       (try
-        (let [result (case (:f op)
+        (let [result (binding [*request-observer* (when (:active-io test)
+                                                   (fn [event]
+                                                     (try (remote/rpc (:remote test) "request-window" node event)
+                                                          (catch Exception error
+                                                            (throw (ex-info "Fault observer failed" {:violation true} error))))))]
+                       (case (:f op)
                        :exercise (do (swap! catalog assoc id fixture)
                                      (exercise! connection catalog journal fixture (count (:nodes test))) {})
-                       :audit {:cases (audit! connection catalog journal)})]
+                       :audit {:cases (audit! connection catalog journal)}))]
           (assoc op :type :ok :value (merge value result {:events @journal})))
         (catch Exception error
           (let [uncertain (or (:uncertain (ex-data error))
@@ -327,9 +366,12 @@
        :confirmed-acks (get counts :ack 0) :acknowledged-publications (get counts :publish 0)
        :events counts :audited-nodes (sort (keys by-node)) :error-count (count errors) :errors (vec (take 32 errors))})))
 
-(defn workload [_]
+(defn workload [opts]
   (let [catalog (atom {})]
     {:initial-generator (gen/each-thread (gen/once {:f :exercise :value {:seed true}}))
-     :generator (gen/each-thread (gen/limit 2 (gen/repeat {:f :exercise})))
-     :final-generator (gen/each-thread (gen/until-ok (gen/repeat {:f :audit})))
+     :generator (gen/each-thread (gen/limit (if (:active-io opts) 6 2) (gen/repeat {:f :exercise})))
+     :final-generator (gen/phases
+                        (when (:active-io opts)
+                          (gen/each-thread (gen/until-ok (gen/repeat {:f :exercise :value {:recovery true}}))))
+                        (gen/each-thread (gen/until-ok (gen/repeat {:f :audit}))))
      :wrap-generator identity :client (->Client nil nil catalog) :checker (->Checker)}))

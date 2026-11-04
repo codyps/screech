@@ -2,6 +2,7 @@
 """One native-ext4 voter per disposable VM; no LazyFS and no host disk access."""
 import argparse
 import base64
+import fcntl
 from http.server import ThreadingHTTPServer
 import hashlib
 import json
@@ -11,10 +12,12 @@ import signal
 import socketserver
 import sqlite3
 import subprocess
+import struct
 import threading
 import time
 from control import damage
 from guest import Control, Gateway
+from wire import Client
 
 ROOT = Path('/data/screech-jepsen')
 NODE = None
@@ -90,6 +93,27 @@ def inspect():
                 'view': int.from_bytes(view[0], 'little'), 'boot_id': BOOT_ID}
 
 
+def file_extents():
+    """FIEMAP without FIEMAP_FLAG_SYNC: observe allocated DB/WAL sectors, no fsync."""
+    _, base = instance()
+    result = []
+    for path in [base, Path(str(base) + '-wal')]:
+        if not path.exists():
+            continue
+        buffer = bytearray(struct.pack('=QQIIII', 0, 2**64-1, 0, 0, 256, 0) + bytes(56 * 256))
+        with path.open('rb') as file:
+            fcntl.ioctl(file.fileno(), 0xc020660b, buffer, True)
+        mapped = struct.unpack_from('=I', buffer, 20)[0]
+        for index in range(mapped):
+            logical, physical, length, _, _, flags, _, _, _ = struct.unpack_from('=QQQQQIIII', buffer, 32 + index * 56)
+            # Unknown/delayed allocation/unwritten extents cannot prove which
+            # already allocated data sectors a live block request changes.
+            if physical and not flags & (2 | 4 | 0x800):
+                result.append({'path': str(path), 'logical': logical, 'physical': physical, 'length': length})
+    assert result, 'no allocated authoritative file extents'
+    return result
+
+
 def act(request):
     assert Path('/run/screech-voter-vm').exists()
     op = request['op']
@@ -104,12 +128,33 @@ def act(request):
         return start()
     if op == 'inspect':
         return inspect()
-    if op == 'arm-power':
+    if op == 'extents':
+        return {'extents': file_extents()}
+    if op == 'io-errors':
+        output = subprocess.check_output(['dmesg'], text=True)
+        return {'errors': [line for line in output.splitlines()
+                           if 'I/O error' in line or 'I/O Error' in line]}
+    if op == 'leader':
         try:
-            member = instance()[0]['member']
-        except (OSError, ValueError, KeyError, TypeError):
-            member = None
-        if SERVER is not None and SERVER.poll() is None:
+            client = Client((f'10.0.1.{NODE[1:]}', 7500), timeout=2)
+            try:
+                # Only the local leader owns this listener. A linearizable API
+                # read here would itself queue behind the workload's storage.
+                client.flush()
+                return {'leader': True}
+            finally:
+                client.close()
+        except (OSError, EOFError, AssertionError):
+            return {'leader': False}
+    if op == 'arm-power':
+        pause = request.get('pause', True)
+        member = request.get('member')
+        if pause:
+            try:
+                member = instance()[0]['member']
+            except (OSError, ValueError, KeyError, TypeError):
+                member = None
+        if pause and SERVER is not None and SERVER.poll() is None:
             SERVER.send_signal(signal.SIGSTOP)
             until = time.monotonic() + 5
             while True:
@@ -124,7 +169,10 @@ def act(request):
         # overwrite is unsynced; do no sync/shutdown operation before hypervisor kill.
         with (DIRECTORY / 'dirty-canary').open('r+b', buffering=0) as file:
             file.write(request['marker'].encode())
-        return {'boot_id': BOOT_ID, 'member': member, 'armed': True}
+        states = [p.read_text().split('State:', 1)[1].splitlines()[0].strip()[0]
+                  for p in Path(f'/proc/{SERVER.pid}/task').glob('*/status')] if SERVER is not None and SERVER.poll() is None else []
+        return {'boot_id': BOOT_ID, 'member': member, 'armed': True,
+                'server_not_stopped': bool(states) and all(s not in ('T', 't') for s in states)}
     if op == 'damage':
         assert MAINTENANCE and SERVER is None
         kind = request['kind']

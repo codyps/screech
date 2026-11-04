@@ -62,9 +62,11 @@ class Controls(unittest.TestCase):
             def call(self, op, **payload):
                 record('arm', self.node)
                 return {'armed': True, 'boot_id': self.node + '-old', 'member': int(self.node[1:])}
+            def close_block(self): pass
         with tempfile.TemporaryDirectory() as temp:
             cluster = Cluster.__new__(Cluster)
             cluster.output, cluster.events, cluster.damages = Path(temp), [], []
+            cluster.io_faults = []
             cluster.vms = {f'n{i}': Voter(f'n{i}') for i in range(1, 6)}
             result = cluster.power_cut(cluster.vms)
             self.assertTrue(result['guest_killed'])
@@ -120,6 +122,39 @@ class Controls(unittest.TestCase):
                 self.assertFalse(result['voter_started'])
                 self.assertEqual({str(base), str(wal)}, {f['path'] for f in result['files']})
                 self.assertTrue(all(f['before'] != f['after'] for f in result['files']))
+
+    def test_active_arm_never_stops_threads_reads_the_database_or_syncs(self):
+        class Process:
+            pid = 'self'  # /proc may expose a parent PID namespace in the sandbox.
+            def poll(self): return None
+            def send_signal(self, _): raise AssertionError('active arm paused the voter')
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            (directory / 'dirty-canary').write_bytes(voter_guest.STABLE)
+            with patch.multiple(voter_guest, DIRECTORY=directory, SERVER=Process(), BOOT_ID='kernel'), \
+                 patch('voter_guest.Path.exists', return_value=True), \
+                 patch('voter_guest.instance', side_effect=AssertionError('read DB on stalled disk')), \
+                 patch('voter_guest.os.sync', side_effect=AssertionError('sync before power cut')), \
+                 patch('voter_guest.os.fsync', side_effect=AssertionError('fsync before power cut')):
+                proof = voter_guest.act({'op': 'arm-power', 'marker': 'x' * len(voter_guest.STABLE),
+                                         'pause': False, 'member': 7})
+            self.assertTrue(proof['server_not_stopped'])
+            self.assertEqual(7, proof['member'])
+            self.assertEqual(b'x' * len(voter_guest.STABLE), (directory / 'dirty-canary').read_bytes())
+
+    def test_request_completion_cannot_be_reopened_by_a_late_begin_notification(self):
+        cluster = Cluster.__new__(Cluster)
+        cluster.requests, cluster.closed_requests = {}, set()
+        cluster.request_lock = threading.Lock()
+        cluster.dispatch({'op': 'request-window', 'phase': 'end', 'id': 'done'})
+        cluster.dispatch({'op': 'request-window', 'phase': 'begin', 'id': 'done',
+                          'kind': 'ack', 'subject': 'ack-token', 'node': 'n1'})
+        self.assertEqual([], cluster.pending_requests('ack'))
+        cluster.dispatch({'op': 'request-window', 'phase': 'begin', 'id': 'new',
+                          'kind': 'ack', 'subject': 'ack-token', 'node': 'n1'})
+        self.assertEqual(['new'], [r['id'] for r in cluster.pending_requests('ack')])
+        cluster.dispatch({'op': 'request-window', 'phase': 'end', 'id': 'new'})
+        self.assertEqual([], cluster.pending_requests('ack'))
 
 
 if __name__ == '__main__':

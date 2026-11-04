@@ -20,6 +20,60 @@
    :vm-power {:power-cut 2} :vm-damage {:power-bitflip 1 :power-truncate 1}
    :vm-wipe {:power-wipe 1} :vm-blank {:power-blank 1}})
 
+(def active-scenarios
+  {:vm-active-write ["hold" "write"] :vm-active-flush ["hold" "flush"]
+   :vm-torn ["tear" "write"] :vm-eio-write ["eio" "write"] :vm-eio-flush ["eio" "flush"]})
+
+(defn active-proof? [nodes proof scenario]
+  (if-let [[mode operation] (active-scenarios scenario)]
+    (let [faults (:io_faults proof)
+          kinds (set (map :request_kind faults))]
+      (boolean
+        (and (= #{"publish" "ack"} kinds)
+             (every? (fn [fault]
+                       (let [targets (set (:targets fault))
+                             survivors (set (:surviving_nodes fault))
+                             cut (get (:power_events proof) (:cut_index fault))
+                             requests (:requests fault)]
+                         (and (= mode (:mode fault)) (= operation (:operation fault))
+                              (contains? targets (:leader fault))
+                              (seq targets) (<= (count targets) (quot (count nodes) 2))
+                              (= (set nodes) (into targets survivors))
+                              (not-any? targets survivors)
+                              (>= (count survivors) (inc (quot (count nodes) 2)))
+                              (= targets (set (:nodes cut)))
+                              (false? (:voter_threads_paused cut))
+                              (= "host-SIGSTOP-without-I/O-drain" (:pause_mechanism cut))
+                              (seq requests)
+                              (every? #(and (string? (:id %)) (seq (:id %))
+                                            (= (:request_kind fault) (:kind %))) requests)
+                              (if (= mode "eio")
+                                (and (= 5 (:errno fault)) (true? (:reply_sent fault)) (seq (:guest_errors fault)))
+                                (some (set (map :id requests)) (map :id (:requests_at_cut fault))))
+                              (or (not= mode "tear")
+                                  (and (>= (:length fault 0) 1024) (= 512 (:persisted_bytes fault))
+                                       (seq (:extents fault))
+                                       (some #(and (<= (:physical %) (:offset fault))
+                                                   (<= (+ (:offset fault) (:length fault))
+                                                       (+ (:physical %) (:length %)))) (:extents fault))
+                                       (= (:cold_sha256 fault) (:expected_sha256 fault) (:after_sha256 fault))
+                                       (string? (:cold_sha256 fault)) (= 64 (count (:cold_sha256 fault)))
+                                       (not= (:cold_sha256 fault) (:before_sha256 fault))
+                                       (not= (:cold_sha256 fault) (:requested_sha256 fault))))))) faults))))
+    true))
+
+(defn active-history? [nodes proof scenario history]
+  (or (not (active-scenarios scenario))
+      (let [attempts (into {} (keep #(when (:io-id %) [(:io-id %) (name (:action %))])
+                                   (consumer/completed-events history)))
+            recovered (set (keep #(when (and (= :exercise (:f %)) (= :ok (:type %))
+                                              (get-in % [:value :recovery]))
+                                     (get-in % [:value :node])) history))]
+        (and (= (set nodes) recovered)
+             (every? (fn [fault]
+                       (every? #(= (:request_kind fault) (attempts (:id %))) (:requests fault)))
+                     (:io_faults proof))))))
+
 (defn valid-power-control? [control]
   (and (true? (:fsynced_preserved control)) (true? (:unsynced_lost control))
        (string? (:old_boot_id control)) (seq (:old_boot_id control))
@@ -60,16 +114,23 @@
             proof (last (keep #(when (and (= :verify (:f %)) (get-in % [:value :converged])) (:value %)) history))
             canaries (if native?
                        (and (= (count (:nodes test)) (:vm-nodes @(:stats database)))
-                            (independent-proof? (:nodes test) proof))
+                            (independent-proof? (:nodes test) proof)
+                            (active-proof? (:nodes test) proof scenario))
                        (= (count (:nodes test)) (:canaries @(:stats database))))
-            required (some-> (required-faults scenario) (assoc :verify 1))
+            required (some-> (if (active-scenarios scenario)
+                               {:active-publish 1 :active-ack 1}
+                               (required-faults scenario)) (assoc :verify 1))
             required (or required (throw (ex-info "Unknown fault scenario" {:scenario scenario})))
             faults (every? (fn [[f minimum]] (<= minimum (get @fault-stats f 0))) required)
+            recovered (active-history? (:nodes test) proof scenario history)
             clears (or native? (= scenario :baseline) (pos? (get @(:stats database) :cache-clears 0)))]
-        {:valid? (boolean (and canaries faults clears (pos? acknowledged)))
+        {:valid? (boolean (and canaries faults recovered clears (pos? acknowledged)))
          :acknowledged acknowledged :lazyfs (when-not native? @(:stats database))
          :native-ext4 (when native? @(:stats database)) :faults @fault-stats
          :required-faults required
+         :active-io (when (active-scenarios scenario) {:verified (active-proof? (:nodes test) proof scenario)
+                                                     :recovery-cycles-completed recovered
+                                                     :faults (count (:io_faults proof))})
          :independent-vms (when native? {:verified (independent-proof? (:nodes test) proof)
                                          :boot-ids (:boot_ids proof) :power-cuts (count (:power_events proof))
                                          :disk-damage (count (:disk_damage proof))})}))))

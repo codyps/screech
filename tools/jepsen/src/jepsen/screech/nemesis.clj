@@ -23,6 +23,15 @@
           value (case (:f op)
                   :heal (heal! test)
                   :power-cut (sd/action test "power-cut" nil {:nodes (vec nodes)})
+                  (:active-publish :active-ack)
+                  (let [[mode operation] (case (:scenario test)
+                                           :vm-active-write ["hold" "write"]
+                                           :vm-active-flush ["hold" "flush"]
+                                           :vm-torn ["tear" "write"]
+                                           :vm-eio-write ["eio" "write"]
+                                           :vm-eio-flush ["eio" "flush"])]
+                    (sd/action test "active-fault" nil {:mode mode :operation operation
+                                                        :kind (if (= :active-ack (:f op)) "ack" "publish")}))
                   (:power-bitflip :power-truncate :power-wipe :power-blank)
                   (sd/action test "power-damage" nil {:kind (subs (name (:f op)) 6)})
                   :verify (sd/action test "verify" nil {:nodes (:nodes test)})
@@ -43,7 +52,7 @@
       (assoc op :value value)))
   (teardown! [_ test] (heal! test))
   n/Reflection
-  (fs [_] #{:kill :start :pause :resume :heal :partition :wipe :bitflip :truncate :verify :power-cut :power-bitflip :power-truncate :power-wipe :power-blank}))
+  (fs [_] #{:kill :start :pause :resume :heal :partition :wipe :bitflip :truncate :verify :power-cut :power-bitflip :power-truncate :power-wipe :power-blank :active-publish :active-ack}))
 
 (defn op [f nodes] {:type :info :f f :value nodes})
 (defn cycle-for [scenario nodes]
@@ -53,6 +62,9 @@
         b (vec (drop (inc half) nodes))]
     (case scenario
       :baseline [(gen/sleep 5)]
+      (:vm-active-write :vm-active-flush :vm-torn :vm-eio-write :vm-eio-flush)
+      [(gen/sleep 1) (op :active-publish nil) (op :heal nil) (gen/sleep 5)
+       (op :active-ack nil) (op :heal nil) (gen/sleep 5)]
       :vm-power [(gen/sleep 3) (op :power-cut (vec (take (inc half) nodes))) (gen/sleep 2) (op :heal nil)
                  (gen/sleep 5) (op :power-cut nodes) (gen/sleep 2) (op :heal nil) (gen/sleep 5)]
       :vm-damage [(gen/sleep 3) (op :power-bitflip nodes) (op :heal nil) (gen/sleep 7)
@@ -68,4 +80,8 @@
       :corrupt [(gen/sleep 3) (op :bitflip nil) (gen/sleep 8) (op :truncate nil) (gen/sleep 8)]
       :wipe [(gen/sleep 3) (op :wipe nil) (gen/sleep 10)])))
 
-(defn generator [scenario nodes] (cycle (cycle-for scenario nodes)))
+(defn generator [scenario nodes]
+  (let [schedule (cycle-for scenario nodes)]
+    (if (#{:vm-active-write :vm-active-flush :vm-torn :vm-eio-write :vm-eio-flush} scenario)
+      (concat schedule (repeat (gen/sleep 5)))
+      (cycle schedule))))

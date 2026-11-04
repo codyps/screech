@@ -58,6 +58,17 @@
 (defn check-snapshot [s] (check-history fixture-events (zipmap nodes (repeat s))))
 (defn errors [s] (set (map :kind (:errors (check-snapshot s)))))
 
+(deftest audits-cover-every-confirmed-create-without-reading-uncreated-plans
+  (let [reads (atom [])
+        catalog (atom {"x" {:streams {:l "L_x" :i "I_x" :w "W_x"} :created #{"L_x" "W_x"}}
+                       "unknown" {:streams {:l "L_y" :i "I_y" :w "W_y"}}})
+        result (with-redefs [c/read-stream (fn [_ stream _ _ _ _] (swap! reads conj stream) {:read true})]
+                 (c/audit! nil catalog (atom [])))]
+    (is (= ["L_x" "W_x"] @reads))
+    (is (= #{"L_x" "W_x"} (set (keys (get-in result ["x" :streams])))))
+    (is (empty? (get-in result ["unknown" :streams]))))
+  (is (contains? (errors (update snapshot :streams dissoc "I_x")) :lost-stream)))
+
 (deftest healthy-history-and-damaged-observations
   ;; The enclosing cycle can time out after its confirmed steps. Those results
   ;; remain binding: treating all :info cycles as unknown would miss these bugs.

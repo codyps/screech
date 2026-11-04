@@ -38,6 +38,10 @@
                               _ (when native?
                                   (assert (cli/independent-proof? nodes proof)
                                           (str "Invalid independent-VM proof for " stem))
+                                  (assert (cli/active-proof? nodes proof (keyword (:scenario opts)))
+                                          (str "Invalid active-I/O proof for " stem))
+                                  (assert (cli/active-history? nodes proof (keyword (:scenario opts)) history)
+                                          (str "Missing active requests or completed recovery cycles for " stem))
                                   (spit (io/file root "runs" stem "convergence.json")
                                         (json/generate-string proof {:pretty true})))]]
                     {:scenario (:scenario opts)

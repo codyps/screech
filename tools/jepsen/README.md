@@ -250,6 +250,63 @@ replayed with `check.py --recheck` just like LazyFS histories. Use a fresh outpu
 directory for every campaign. The driver defaults to a one-hour overall deadline;
 `--memory` sets guest MiB per voter and `--timeout` changes that deadline.
 
+### Active I/O, torn writes and disk errors
+
+Select the additional active-I/O schedules explicitly:
+
+```sh
+python3 tools/jepsen/cluster_vm.py \
+  --runtime results/jepsen-runtime/runtime.json \
+  --output results/jepsen-inflight-five --nodes 5 \
+  --scenarios vm-active-write,vm-active-flush,vm-torn,vm-eio-write,vm-eio-flush \
+  --time-limit 90 --final-time-limit 300
+```
+
+These schedules automatically attach a disposable controller-side
+[NBD](https://github.com/NetworkBlockDevice/nbd/blob/master/doc/proto.md) device
+to every VM. The real guest ext4/virtio stack issues its normal block requests.
+Normal writes enter an explicit volatile cache; reads see that cache, and successful
+FLUSH/FUA replies follow host `fsync`. A power cut discards the cache. The backend
+advertises only READ, WRITE, DISC and FLUSH, supports FUA, and does not synthesize
+filesystem or Screech responses. Other native schedules keep their direct raw disks
+unless selected in the same campaign as an active-I/O schedule.
+
+Each fault chooses the serving leader and at most a minority of voters. The
+remaining quorum's kernels/disks keep running. Both publication and consumer ACK
+requests must be interrupted in every scenario. Jepsen submits an asynchronous
+NATS request before reporting its open window; completion callbacks close it,
+including completion that races the opening notification. The proof IDs must
+match attempts in the saved consumer history. Observer errors invalidate a history.
+Each active schedule injects one fault during publication and one during an ACK.
+The main generator allows up to six additional cycles per client, followed by a
+required successful recovery lifecycle through every public address and final
+audits of both seeded and interrupted cycles.
+
+| Scenario | Boundary and fault |
+| --- | --- |
+| `vm-active-write` | Hold a real database/WAL block write without replying, then cut power. |
+| `vm-active-flush` | Hold a real block FLUSH without replying, then cut power. |
+| `vm-torn` | Persist exactly the first 512 bytes of a changing multi-sector database/WAL request, withhold the reply, then cut power. |
+| `vm-eio-write` | Return `EIO` for a real database/WAL block write, observe a guest kernel I/O error, then cut power. |
+| `vm-eio-flush` | Return `EIO` for a real block FLUSH, observe a guest kernel I/O error, then cut power. |
+
+FIEMAP without its sync flag identifies allocated authoritative file extents.
+Selected writes must fit entirely inside one extent. Torn proofs include the
+old, requested, mixed and cold disk hashes; the persisted prefix and lost suffix
+must both change bytes, and the cold disk must match the expected mixed image
+before any recovery boot. This models a partial uncompleted write, not loss of
+a correctly completed flush on the surviving quorum.
+
+Active cuts never SIGSTOP the voter threads inside the guest. After arming the
+unsynced canary, they SIGSTOP the QEMU host process and require its stopped status,
+then dispatch every SIGKILL before awaiting any exit. This avoids QMP stop's I/O
+drain, which cannot complete a deliberately held request. A held/torn request must
+still overlap an open client request at the cut. EIO must have a real error reply
+and guest kernel evidence; it may already have failed the client request when
+power is cut. All cuts still require new kernel IDs and the cold-boot canaries.
+Recovery uses ordinary voter starts, without removing or editing application files.
+The final `io_faults` proof is retained beside the other convergence evidence.
+
 ## Scope
 
 The queue workload derives from the
