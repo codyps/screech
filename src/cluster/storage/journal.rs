@@ -489,14 +489,23 @@ impl Database {
         }
     }
     pub(crate) fn accept_journal(&mut self, entries: &[Entry], hard: &HardState) -> io::Result<()> {
-        let mut position = self.position()?;
-        position.term = hard.term;
-        position.vote = hard.vote;
-        position.commit = hard.commit;
-        if let Some(last) = entries.last() {
-            position.last = last.index;
-            position.last_term = last.term;
-        }
+        // persist() already validated the accepted suffix and HardState. A new
+        // suffix supplies the complete resulting frontier without rereading
+        // the preceding SQL entry and metadata that it replaces.
+        let (last, last_term) = if let Some(last) = entries.last() {
+            (last.index, last.term)
+        } else {
+            let previous = self.position()?;
+            (previous.last, previous.last_term)
+        };
+        let position = Position {
+            incarnation: self.incarnation,
+            term: hard.term,
+            vote: hard.vote,
+            commit: hard.commit,
+            last,
+            last_term,
+        };
         if let Err(failure) = self.watermark.append_accepted(position, entries) {
             self.failed = true;
             return Err(failure);

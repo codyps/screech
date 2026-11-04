@@ -512,11 +512,13 @@ fn pump_ready(
     while node.has_ready() {
         let mut ready = node.ready();
         let read_states = ready.take_read_states();
-        let old = node.store().db.lock().unwrap().hard()?;
         let epoch_change = !ready.snapshot().is_empty()
-            || ready
-                .hs()
-                .is_some_and(|hard| hard.term != old.term || hard.vote != old.vote);
+            || if let Some(hard) = ready.hs() {
+                let old = node.store().db.lock().unwrap().hard()?;
+                hard.term != old.term || hard.vote != old.vote
+            } else {
+                false
+            };
         let mut early = ready.take_messages();
         if !epoch_change {
             // Raft marks leader replication messages as independent of local
