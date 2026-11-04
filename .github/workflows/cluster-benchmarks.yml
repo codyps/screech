@@ -1,5 +1,8 @@
 name: Cluster benchmark targets
 on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/cluster-benchmarks.yml]
   workflow_dispatch:
     inputs:
       trials:
