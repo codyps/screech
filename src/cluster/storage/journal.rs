@@ -6,6 +6,25 @@ use std::io::{Read, SeekFrom};
 const MAGIC: &[u8; 8] = b"SCSEAL04";
 const ROOT_KEY: &str = "journal_root";
 const MAX_RECORD: u64 = 34 * 1024 * 1024;
+const ALLOCATION_BYTES: u64 = 1024 * 1024;
+
+fn reserve(file: &File, end: u64) -> io::Result<u64> {
+    let capacity = end
+        .checked_add(ALLOCATION_BYTES - 1)
+        .ok_or_else(|| error("journal allocation overflow"))?
+        / ALLOCATION_BYTES
+        * ALLOCATION_BYTES;
+    #[cfg(target_os = "linux")]
+    match rustix::fs::fallocate(file, rustix::fs::FallocateFlags::empty(), 0, capacity) {
+        Ok(()) => return Ok(capacity),
+        Err(rustix::io::Errno::OPNOTSUPP | rustix::io::Errno::NOSYS) => (),
+        Err(failure) => return Err(failure.into()),
+    }
+    // Unsupported allocation (including some FUSE filesystems) can still grow
+    // safely. No I/O or out-of-space error is ignored; acceptance always syncs.
+    file.set_len(capacity)?;
+    Ok(capacity)
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Tip {
     root: [u8; 16],
@@ -35,6 +54,7 @@ pub(super) struct Journal {
     file: File,
     seal: Seal,
     generation: u64,
+    capacity: u64,
 }
 
 impl Watermark {
@@ -141,6 +161,7 @@ impl Watermark {
             return Err(error("journal seal moved backward"));
         }
         let mut journal = Journal {
+            capacity: file.metadata()?.len(),
             file,
             seal,
             generation,
@@ -230,6 +251,7 @@ impl Watermark {
             .create(true)
             .truncate(true)
             .open(&temporary)?;
+        let capacity = reserve(&file, SEAL_BYTES as u64)?;
         file.write_all(&self.encode_seal(&seal, 0, 0)?)?;
         file.write_all(&self.encode_seal(&seal, 0, 1)?)?;
         file.sync_all()?;
@@ -247,6 +269,7 @@ impl Watermark {
             file,
             seal,
             generation: 0,
+            capacity,
         });
         self.file = None;
         crate::fault::point("after_cluster_watermark");
@@ -290,6 +313,9 @@ impl Watermark {
         };
         let frame = self.encode_seal(&seal, generation, generation % 2)?;
         let j = self.journal.as_mut().unwrap();
+        if seal.end > j.capacity {
+            j.capacity = reserve(&j.file, seal.end)?;
+        }
         crate::fault::point("before_cluster_watermark");
         j.file.seek(SeekFrom::Start(j.seal.end))?;
         j.file.write_all(&(body.len() as u64).to_le_bytes())?;
@@ -431,12 +457,14 @@ impl Database {
                 .next_root_bytes(position.clone(), self.snapshot_position)?;
             // A legacy FULL store is the first root; no NORMAL accepted writes
             // are allowed until this root and its journal are both published.
-            self.conn
-                .execute(
+            self.commit_transaction(true, |tx| {
+                tx.execute(
                     "INSERT OR REPLACE INTO cluster_meta VALUES('journal_root',?1)",
                     [&root],
                 )
                 .map_err(error)?;
+                Ok(())
+            })?;
             return self
                 .watermark
                 .create_journal(self.watermark.read_root(&root)?);

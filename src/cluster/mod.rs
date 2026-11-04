@@ -461,9 +461,43 @@ fn pump(
     out: &BTreeMap<u64, tokio::sync::mpsc::Sender<Message>>,
     routes: &BTreeMap<u64, u64>,
 ) -> io::Result<()> {
+    if !node.has_ready() {
+        return Ok(());
+    }
+    let gate = node.store().db.lock().unwrap().gate.clone();
+    let _gate = gate.lock().unwrap();
+    node.store().db.lock().unwrap().begin_projection()?;
+    let mut completed = Vec::new();
+    let result = pump_ready(node, pending, out, routes, &mut completed);
+    let finished = node
+        .store()
+        .db
+        .lock()
+        .unwrap()
+        .finish_projection(result.is_ok());
+    let result = result.and(finished);
+    if let Err(failure) = &result {
+        node.store().db.lock().unwrap().failed = true;
+        for (reply, _) in completed {
+            let _ = reply.send(Err(error(failure)));
+        }
+    } else {
+        // Complete the query projection before exposing replies. The accepted
+        // payload and promises synced independently before replication ACKs.
+        for (reply, end) in completed {
+            let _ = reply.send(Ok(end));
+        }
+    }
+    result
+}
+fn pump_ready(
+    node: &mut RawNode<LogStorage>,
+    pending: &mut BTreeMap<Vec<u8>, Pending>,
+    out: &BTreeMap<u64, tokio::sync::mpsc::Sender<Message>>,
+    routes: &BTreeMap<u64, u64>,
+    completed: &mut Vec<(Reply, u64)>,
+) -> io::Result<()> {
     while node.has_ready() {
-        let gate = node.store().db.lock().unwrap().gate.clone();
-        let _gate = gate.lock().unwrap();
         let mut ready = node.ready();
         let read_states = ready.take_read_states();
         let old = node.store().db.lock().unwrap().hard()?;
@@ -496,7 +530,7 @@ fn pump(
             let replies = node.store().db.lock().unwrap().apply(commit)?;
             for (key, end) in replies {
                 if let Some(request) = pending.remove(&key) {
-                    let _ = request.reply.send(Ok(end));
+                    completed.push((request.reply, end));
                 }
             }
         }
@@ -509,7 +543,7 @@ fn pump(
             let mut db = node.store().db.lock().unwrap();
             for (key, end) in db.apply(commit)? {
                 if let Some(request) = pending.remove(&key) {
-                    let _ = request.reply.send(Ok(end));
+                    completed.push((request.reply, end));
                 }
             }
         }
@@ -526,7 +560,7 @@ fn pump(
         let view = node.raft.raft_log.applied;
         pending.retain(|_, request| {
             if request.read_index.is_some_and(|index| index <= view) {
-                let _ = request.reply.send(Ok(view));
+                completed.push((request.reply.clone(), view));
                 false
             } else {
                 true
@@ -1466,6 +1500,71 @@ mod tests {
                 before
             );
         }
+    }
+    #[test]
+    fn failed_projection_commit_cannot_release_a_staged_success_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sim = Simulation::new(dir.path());
+        sim.nodes[0].campaign().unwrap();
+        sim.settle(None);
+        let before = {
+            let db = sim.nodes[0].store().db.lock().unwrap();
+            // A deferred constraint fails at COMMIT, after all projection
+            // statements and reply staging have succeeded.
+            db.conn.execute_batch("PRAGMA foreign_keys=ON;
+              CREATE TABLE projection_parent(id INTEGER PRIMARY KEY);
+              CREATE TABLE projection_guard(id INTEGER REFERENCES projection_parent(id) DEFERRABLE INITIALLY DEFERRED);
+              CREATE TRIGGER fail_projection AFTER INSERT ON cluster_meta WHEN NEW.key='view'
+              BEGIN INSERT INTO projection_guard VALUES(99); END;").unwrap();
+            db.view().unwrap()
+        };
+        let context = b"fail-only-at-commit".to_vec();
+        let (reply, rx) = mpsc::sync_channel(1);
+        sim.pending[0].insert(
+            context.clone(),
+            Pending {
+                started: Instant::now(),
+                reply,
+                read_index: None,
+            },
+        );
+        sim.nodes[0].propose(context, Vec::new()).unwrap();
+        pump(
+            &mut sim.nodes[0],
+            &mut sim.pending[0],
+            &sim.send,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        // Obtain an actual majority's durable acceptance before attempting to
+        // apply the leader's committed prefix.
+        while let Ok(message) = sim.receive[1].try_recv() {
+            sim.nodes[1].step(message).unwrap();
+            pump(
+                &mut sim.nodes[1],
+                &mut sim.pending[1],
+                &sim.send,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        }
+        while let Ok(message) = sim.receive[0].try_recv() {
+            sim.nodes[0].step(message).unwrap();
+        }
+        assert!(pump(
+            &mut sim.nodes[0],
+            &mut sim.pending[0],
+            &sim.send,
+            &BTreeMap::new()
+        )
+        .is_err());
+        assert!(
+            rx.try_recv().unwrap().is_err(),
+            "COMMIT failure produced success"
+        );
+        let db = sim.nodes[0].store().db.lock().unwrap();
+        assert!(db.failed);
+        assert_eq!(db.view().unwrap(), before);
     }
     #[test]
     fn old_term_majority_cannot_commit_before_a_current_term_entry() {

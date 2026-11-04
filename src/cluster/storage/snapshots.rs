@@ -275,65 +275,66 @@ impl Database {
             },
             (index, snapshot.get_metadata().term, image.sequence),
         )?;
-        let tx = self.conn.transaction().map_err(error)?;
-        if local {
-            tx.execute("DELETE FROM entries WHERE idx<=?1", [sql(index)?])
+        self.commit_transaction(true, |tx| {
+            if local {
+                tx.execute("DELETE FROM entries WHERE idx<=?1", [sql(index)?])
+                    .map_err(error)?;
+            } else {
+                tx.execute("DELETE FROM entries", []).map_err(error)?;
+            }
+            tx.execute_batch(
+                "DELETE FROM event_index;DELETE FROM body_index;DELETE FROM snapshot_bodies;",
+            )
+            .map_err(error)?;
+            for (key, bytes, hash) in rows {
+                tx.execute(
+                    "INSERT INTO snapshot_bodies VALUES(?1,?2,?3,?4)",
+                    params![
+                        sql(key.generation)?,
+                        sql(key.sequence)?,
+                        bytes,
+                        hash.as_slice()
+                    ],
+                )
                 .map_err(error)?;
-        } else {
-            tx.execute("DELETE FROM entries", []).map_err(error)?;
-        }
-        tx.execute_batch(
-            "DELETE FROM event_index;DELETE FROM body_index;DELETE FROM snapshot_bodies;",
-        )
-        .map_err(error)?;
-        for (key, bytes, hash) in rows {
+            }
+            for e in entries {
+                let b = e.write_to_bytes().map_err(error)?;
+                tx.execute(
+                    "INSERT INTO entries VALUES(?1,?2,?3,?4)",
+                    params![sql(e.index)?, sql(e.term)?, b, crc32fast::hash(&b)],
+                )
+                .map_err(error)?;
+            }
+            for (key, value) in [
+                ("raft_snapshot", bytes.clone()),
+                ("raft_snapshot_hash", digest(&bytes).to_vec()),
+                ("hard", next.write_to_bytes().map_err(error)?),
+                ("view", index.to_le_bytes().to_vec()),
+                ("conf", conf),
+                ("membership", image.membership.clone()),
+                ("conf_index", image.conf_index.to_le_bytes().to_vec()),
+                ("app_snapshot", image.model.clone()),
+                ("app_sequence", image.sequence.to_le_bytes().to_vec()),
+                ("journal_root", root),
+            ] {
+                tx.execute(
+                    "INSERT OR REPLACE INTO cluster_meta VALUES(?1,?2)",
+                    params![key, value],
+                )
+                .map_err(error)?;
+            }
+            let mut crc = crc32fast::Hasher::new();
+            crc.update(&image.sequence.to_le_bytes());
+            crc.update(&image.model);
             tx.execute(
-                "INSERT INTO snapshot_bodies VALUES(?1,?2,?3,?4)",
-                params![
-                    sql(key.generation)?,
-                    sql(key.sequence)?,
-                    bytes,
-                    hash.as_slice()
-                ],
+                "INSERT OR REPLACE INTO cluster_meta VALUES('app_crc',?1)",
+                [crc.finalize().to_le_bytes().as_slice()],
             )
             .map_err(error)?;
-        }
-        for e in entries {
-            let b = e.write_to_bytes().map_err(error)?;
-            tx.execute(
-                "INSERT INTO entries VALUES(?1,?2,?3,?4)",
-                params![sql(e.index)?, sql(e.term)?, b, crc32fast::hash(&b)],
-            )
-            .map_err(error)?;
-        }
-        for (key, value) in [
-            ("raft_snapshot", bytes.clone()),
-            ("raft_snapshot_hash", digest(&bytes).to_vec()),
-            ("hard", next.write_to_bytes().map_err(error)?),
-            ("view", index.to_le_bytes().to_vec()),
-            ("conf", conf),
-            ("membership", image.membership.clone()),
-            ("conf_index", image.conf_index.to_le_bytes().to_vec()),
-            ("app_snapshot", image.model.clone()),
-            ("app_sequence", image.sequence.to_le_bytes().to_vec()),
-            ("journal_root", root),
-        ] {
-            tx.execute(
-                "INSERT OR REPLACE INTO cluster_meta VALUES(?1,?2)",
-                params![key, value],
-            )
-            .map_err(error)?;
-        }
-        let mut crc = crc32fast::Hasher::new();
-        crc.update(&image.sequence.to_le_bytes());
-        crc.update(&image.model);
-        tx.execute(
-            "INSERT OR REPLACE INTO cluster_meta VALUES('app_crc',?1)",
-            [crc.finalize().to_le_bytes().as_slice()],
-        )
-        .map_err(error)?;
-        crate::fault::point("before_cluster_snapshot_install");
-        tx.commit().map_err(error)?;
+            crate::fault::point("before_cluster_snapshot_install");
+            Ok(())
+        })?;
         self.refresh_log_bytes()?;
         self.snapshot_position = (index, snapshot.get_metadata().term, image.sequence);
         self.seal()?;

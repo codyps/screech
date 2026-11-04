@@ -34,6 +34,7 @@ pub(crate) struct Database {
     pub max_log_bytes: u64,
     pub snapshot_position: (u64, u64, u64),
     entries_bytes: u64,
+    projection_batch: bool,
     _lock: File,
     watermark: watermark::Watermark,
 }
@@ -172,6 +173,7 @@ impl Database {
             failed: false,
             snapshot_position: (0, 0, 0),
             entries_bytes: 0,
+            projection_batch: false,
             gate: Arc::new(Mutex::new(())),
             node_id: config.node_id,
             incarnation,
@@ -228,6 +230,9 @@ impl Database {
                 .unwrap_or_else(|| Path::new(".")),
         )?
         .sync_all()?;
+        db.conn
+            .pragma_update(None, "synchronous", "NORMAL")
+            .map_err(error)?;
         Ok(db)
     }
     pub fn meta(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
@@ -442,14 +447,46 @@ impl Database {
             Ok(results)
         })
     }
-    fn commit_transaction<T>(
+    pub(super) fn begin_projection(&mut self) -> io::Result<()> {
+        if self.projection_batch {
+            return Err(error("nested projection batch"));
+        }
+        self.conn.execute_batch("BEGIN DEFERRED").map_err(error)?;
+        self.projection_batch = true;
+        Ok(())
+    }
+    pub(super) fn finish_projection(&mut self, commit: bool) -> io::Result<()> {
+        if !self.projection_batch {
+            return Ok(());
+        }
+        let result = self
+            .conn
+            .execute_batch(if commit { "COMMIT" } else { "ROLLBACK" })
+            .map_err(error);
+        self.projection_batch = false;
+        if result.is_err() {
+            self.failed = true;
+            if !self.conn.is_autocommit() {
+                let _ = self.conn.execute_batch("ROLLBACK");
+            }
+        }
+        result
+    }
+    pub(super) fn commit_transaction<T>(
         &mut self,
         durable: bool,
-        apply: impl FnOnce(&rusqlite::Transaction<'_>) -> io::Result<T>,
+        apply: impl FnOnce(&Connection) -> io::Result<T>,
     ) -> io::Result<T> {
-        if !durable {
+        if !durable && self.projection_batch {
+            return apply(&self.conn);
+        }
+        let resume = self.projection_batch;
+        if resume {
+            self.finish_projection(true)?;
+        }
+        if durable {
             self.conn
-                .pragma_update(None, "synchronous", "NORMAL")
+                .pragma_update(None, "synchronous", "FULL")
                 .map_err(error)?;
         }
         let result = (|| {
@@ -458,16 +495,19 @@ impl Database {
             tx.commit().map_err(error)?;
             Ok(value)
         })();
-        // Never leave the FULL checkpoint/root installer at NORMAL. Accepted
-        // payloads and votes already synced in the journal before projection.
-        let restored = if !durable {
+        // Only checkpoint roots need FULL SQLite persistence. Normal query
+        // projections already have complete durable bytes in the journal.
+        let restored = if durable {
             self.conn
-                .pragma_update(None, "synchronous", "FULL")
+                .pragma_update(None, "synchronous", "NORMAL")
                 .map_err(error)
         } else {
             Ok(())
         };
         restored?;
+        if resume && result.is_ok() {
+            self.begin_projection()?;
+        }
         result
     }
     pub fn record(&self, sequence: u64) -> io::Result<Option<Record>> {

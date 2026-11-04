@@ -326,11 +326,11 @@ mod tests {
         std::fs::write(path.with_extension("cluster-lock"), b"screech-cluster-v2\n").unwrap();
         let mut db = Database::open_mode(&path, &cfg, false, false).unwrap();
         assert_eq!(db.position().unwrap(), position);
-        assert_eq!(
+        assert!(
             std::fs::metadata(path.with_extension("cluster-watermark"))
                 .unwrap()
-                .len(),
-            SEAL_BYTES as u64
+                .len()
+                >= SEAL_BYTES as u64
         );
         db.persist(&[entry(2, 1)], Some(&hard(1, 2))).unwrap();
         drop(db);
@@ -373,7 +373,8 @@ mod tests {
         assert_eq!(db.hard().unwrap().commit, 16);
     }
     #[test]
-    fn lost_commit_notification_replays_full_accepted_payload_without_weakening_sync_mode() {
+    fn lost_commit_notification_replays_payload_and_full_root_failures_restore_normal_projection_mode(
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("store.db");
         let mut db = Database::open_mode(&path, &config(), true, false).unwrap();
@@ -402,16 +403,16 @@ mod tests {
             db.conn
                 .query_row("PRAGMA synchronous", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            2
+            1
         );
         let failed: io::Result<()> =
-            db.commit_transaction(false, |_| Err(error("projection failed")));
+            db.commit_transaction(true, |_| Err(error("checkpoint failed")));
         assert!(failed.is_err());
         assert_eq!(
             db.conn
                 .query_row("PRAGMA synchronous", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            2
+            1
         );
         drop(db);
         // Simulate losing only NORMAL WAL frames. The accepted batch and its
@@ -527,15 +528,14 @@ mod tests {
             let path = dir.path().join("db");
             let mut db = Database::open(&path, &config(), true).unwrap();
             db.persist(&[entry(1, 1)], Some(&hard(1, 1))).unwrap();
+            let published = SEAL_BYTES as u64 + db.journal_bytes();
             drop(db);
             let file = path.with_extension("cluster-watermark");
             let mut bytes = std::fs::read(&file).unwrap();
             match damage {
                 "unpublished-tail" => bytes.extend_from_slice(b"interrupted unpublished record"),
                 "payload" => bytes[SEAL_BYTES + 10] ^= 1,
-                _ => {
-                    bytes.pop();
-                }
+                _ => bytes.truncate(published as usize - 1),
             }
             std::fs::write(&file, bytes).unwrap();
             let recovered = Database::open(&path, &config(), false);

@@ -166,23 +166,24 @@ impl Database {
                 "voter incarnation does not match committed enrollment",
             ));
         }
-        let tx = self.conn.transaction().map_err(error)?;
-        tx.execute(
-            "INSERT OR REPLACE INTO cluster_meta VALUES('conf',?1)",
-            [conf.write_to_bytes().map_err(error)?],
-        )
-        .map_err(error)?;
-        tx.execute(
-            "INSERT OR REPLACE INTO cluster_meta VALUES('conf_index',?1)",
-            [index.to_le_bytes().as_slice()],
-        )
-        .map_err(error)?;
-        tx.execute(
-            "INSERT OR REPLACE INTO cluster_meta VALUES('membership',?1)",
-            [postcard::to_allocvec(&state).map_err(error)?],
-        )
-        .map_err(error)?;
-        tx.commit().map_err(error)
+        self.commit_transaction(false, |tx| {
+            tx.execute(
+                "INSERT OR REPLACE INTO cluster_meta VALUES('conf',?1)",
+                [conf.write_to_bytes().map_err(error)?],
+            )
+            .map_err(error)?;
+            tx.execute(
+                "INSERT OR REPLACE INTO cluster_meta VALUES('conf_index',?1)",
+                [index.to_le_bytes().as_slice()],
+            )
+            .map_err(error)?;
+            tx.execute(
+                "INSERT OR REPLACE INTO cluster_meta VALUES('membership',?1)",
+                [postcard::to_allocvec(&state).map_err(error)?],
+            )
+            .map_err(error)?;
+            Ok(())
+        })
     }
 }
 pub(crate) fn apply_configuration(node: &mut RawNode<LogStorage>, commit: u64) -> io::Result<()> {
@@ -209,24 +210,25 @@ pub(crate) fn apply_configuration(node: &mut RawNode<LogStorage>, commit: u64) -
             db.validate_voter_count(&conf)?;
             let mut state = db.membership()?;
             Database::note_change(&mut state, &e)?;
-            let tx = db.conn.transaction().map_err(error)?;
-            tx.execute(
-                "INSERT OR REPLACE INTO cluster_meta VALUES('conf',?1)",
-                [conf.write_to_bytes().map_err(error)?],
-            )
-            .map_err(error)?;
-            tx.execute(
-                "INSERT OR REPLACE INTO cluster_meta VALUES('conf_index',?1)",
-                [e.index.to_le_bytes().as_slice()],
-            )
-            .map_err(error)?;
-            tx.execute(
-                "INSERT OR REPLACE INTO cluster_meta VALUES('membership',?1)",
-                [postcard::to_allocvec(&state).map_err(error)?],
-            )
-            .map_err(error)?;
-            crate::fault::point("before_cluster_membership_apply");
-            tx.commit().map_err(error)?;
+            db.commit_transaction(false, |tx| {
+                tx.execute(
+                    "INSERT OR REPLACE INTO cluster_meta VALUES('conf',?1)",
+                    [conf.write_to_bytes().map_err(error)?],
+                )
+                .map_err(error)?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO cluster_meta VALUES('conf_index',?1)",
+                    [e.index.to_le_bytes().as_slice()],
+                )
+                .map_err(error)?;
+                tx.execute(
+                    "INSERT OR REPLACE INTO cluster_meta VALUES('membership',?1)",
+                    [postcard::to_allocvec(&state).map_err(error)?],
+                )
+                .map_err(error)?;
+                crate::fault::point("before_cluster_membership_apply");
+                Ok(())
+            })?;
             crate::fault::point("after_cluster_membership_apply");
         }
     }
