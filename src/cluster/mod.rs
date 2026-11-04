@@ -467,6 +467,7 @@ impl Store for ClusterStore {
             .map_err(StoreError::from)
     }
 }
+#[cfg(test)]
 fn pump(
     node: &mut RawNode<LogStorage>,
     pending: &mut BTreeMap<Vec<u8>, Pending>,
@@ -476,18 +477,32 @@ fn pump(
     if !node.has_ready() {
         return Ok(());
     }
+    project(node, |node, completed| {
+        pump_ready(node, pending, out, routes, completed)
+    })
+}
+fn project<R>(
+    node: &mut RawNode<LogStorage>,
+    step: impl FnOnce(&mut RawNode<LogStorage>, &mut Vec<(Reply, u64)>) -> io::Result<R>,
+) -> io::Result<R> {
     let gate = node.store().db.lock().unwrap().gate.clone();
     let _gate = gate.lock().unwrap();
-    node.store().db.lock().unwrap().begin_projection()?;
+    {
+        let mut db = node.store().db.lock().unwrap();
+        if db.failed {
+            return Err(error("replica quarantined"));
+        }
+        db.begin_projection()?;
+    }
     let mut completed = Vec::new();
-    let result = pump_ready(node, pending, out, routes, &mut completed);
+    let result = step(node, &mut completed);
     let finished = node
         .store()
         .db
         .lock()
         .unwrap()
         .finish_projection(result.is_ok());
-    let result = result.and(finished);
+    let result = finished.and(result);
     if let Err(failure) = &result {
         node.store().db.lock().unwrap().failed = true;
         for (reply, _) in completed {
@@ -884,9 +899,19 @@ async fn run_runtime(
                 (db.sender_policy()?, db.conf_index()?)
             };
             loop {
+                let input = rx.recv_timeout(Duration::from_millis(20));
+                if matches!(&input, Ok(Input::Stop) | Err(mpsc::RecvTimeoutError::Disconnected)) {
+                    break;
+                }
+                if matches!(&input, Ok(Input::Fault)) {
+                    return Err(error("replica storage failed; quarantined"));
+                }
                 let mut incoming_lease = None;
-                match rx.recv_timeout(Duration::from_millis(20)) {
-                    Ok(Input::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                // Include input validation, Raft storage reads and role metadata
+                // in the same projection transaction as this input's Ready work.
+                let configuration = project(&mut node, |node, completed| {
+                match input {
+                    Ok(Input::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => unreachable!(),
                     Ok(Input::SnapshotSent(id, ok)) => node.report_snapshot(
                         id,
                         if ok {
@@ -895,7 +920,7 @@ async fn run_runtime(
                             raft::SnapshotStatus::Failure
                         },
                     ),
-                    Ok(Input::Fault) => return Err(error("replica storage failed; quarantined")),
+                    Ok(Input::Fault) => unreachable!(),
                     Ok(Input::Message(message, nonce, permit)) => {
                         incoming_lease = Some(permit);
                         if policy.accepts(&message, nonce) {
@@ -959,7 +984,7 @@ async fn run_runtime(
                             drop(db);
                             if let Some(old) = old {
                                 membership::start_replacement(
-                                    &mut node,
+                                    node,
                                     membership::Replacement {
                                         old,
                                         new: member,
@@ -967,7 +992,7 @@ async fn run_runtime(
                                     },
                                 )?;
                             } else {
-                                membership::enroll_standby(&mut node, member, nonce, learner)?;
+                                membership::enroll_standby(node, member, nonce, learner)?;
                             }
                             Ok(0)
                         })();
@@ -993,7 +1018,7 @@ async fn run_runtime(
                             let _ = reply
                                 .send(Err(error("invalid replacement target or leader epoch")));
                         } else {
-                            let result = membership::start_replacement(&mut node, replacement);
+                            let result = membership::start_replacement(node, replacement);
                             let _ = reply.send(result.map(|_| 0));
                         }
                     }
@@ -1061,8 +1086,7 @@ async fn run_runtime(
                     node.tick();
                     tick = Instant::now();
                 }
-                pump(&mut node, &mut pending, &out, &routes)?;
-                drop(incoming_lease);
+                pump_ready(node, &mut pending, &out, &routes, completed)?;
                 let configuration = {
                     let db = node.store().db.lock().unwrap();
                     let index = db.conf_index()?;
@@ -1073,8 +1097,11 @@ async fn run_runtime(
                     index
                 };
                 if policy.replacement_pending() {
-                    membership::advance_replacement(&mut node)?;
+                    membership::advance_replacement(node)?;
                 }
+                Ok(configuration)
+                })?;
+                drop(incoming_lease);
                 let role = Role {
                     leader: node.raft.leader_id,
                     term: node.raft.term,
