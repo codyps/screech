@@ -15,7 +15,10 @@ before protocol responses. Application indexes point into the committed entries;
 they never give an accepted suffix application authority. Physical entry identity
 includes term/index, so suffix replacement does not alias committed content.
 
-All public nodes proxy client connections to the elected leader. The leader's
+Public nodes route client connections to the elected leader. The leader hands
+its public sockets directly to the local protocol service; followers proxy over
+TCP. Both local and proxied sockets share routing, admission limits and shutdown
+when the leader epoch changes. The leader's
 existing model owns stream/consumer decisions and Core interest. Quorum barriers
 protect model reads; successful mutations follow quorum commitment. Leadership
 changes close client connections and a replacement leader recovers its local

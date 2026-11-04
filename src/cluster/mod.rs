@@ -131,6 +131,10 @@ struct Role {
     term: u64,
     configuration: u64,
 }
+enum ConnectionRoute {
+    Local(tokio::sync::mpsc::Sender<TcpStream>),
+    Remote(TcpStream),
+}
 type Reply = mpsc::SyncSender<io::Result<u64>>;
 struct Pending {
     started: Instant,
@@ -1206,9 +1210,12 @@ async fn run_runtime(
             }
             Ok(())
         })?;
-    // Leader-local service lifecycle. The public endpoints proxy all protocols,
-    // including Core subscriptions and pull inboxes, through this one owner.
+    // All protocols, including Core subscriptions and pull inboxes, share this
+    // leader-local owner. Local public connections hand off their actual socket;
+    // followers proxy to its service listener over the network.
     let connection_limit = server_config.max_connections;
+    let local_connections = Arc::new(Mutex::new(None));
+    let service_connections = local_connections.clone();
     server_config.listen = peer.service;
     server_config.connect_urls = config
         .peers
@@ -1232,6 +1239,7 @@ async fn run_runtime(
             if running.as_ref().is_some_and(|(_, _, term)| {
                 current.leader != service_config.node_id || current != *term
             }) {
+                service_connections.lock().unwrap().take();
                 let (stop, task, _) = running.take().unwrap();
                 stop.send_replace(true);
                 let _ = task.await;
@@ -1288,7 +1296,14 @@ async fn run_runtime(
                         match Server::bind(local).await {
                             Ok(server) => {
                                 let (stop, rx) = watch::channel(false);
-                                running = Some((stop, tokio::spawn(server.run(rx)), current));
+                                let (send, incoming) =
+                                    tokio::sync::mpsc::channel(connection_limit.clamp(1, 256));
+                                *service_connections.lock().unwrap() = Some((current, send));
+                                running = Some((
+                                    stop,
+                                    tokio::spawn(server.run_with_incoming(rx, Some(incoming))),
+                                    current,
+                                ));
                             }
                             Err(e) => {
                                 handle.shutdown().await;
@@ -1309,6 +1324,7 @@ async fn run_runtime(
             }
             tokio::select! {_=service_stop.changed()=>break,result=service_role.changed()=>{if result.is_err(){break;}},_=tokio::time::sleep(Duration::from_millis(200))=>{}}
         }
+        service_connections.lock().unwrap().take();
         if let Some((stop, task, _)) = running {
             stop.send_replace(true);
             let _ = task.await;
@@ -1327,17 +1343,28 @@ async fn run_runtime(
             accepted=clients.accept()=>{
                 let (mut incoming,_)=accepted?;incoming.set_nodelay(true)?;let Ok(slot)=slots.clone().try_acquire_owned() else{continue};
                 let mut role=role.clone();let peers=config.peers.clone();let route_db=db.clone();let mut stop=stop_rx.clone();
+                let local_connections=local_connections.clone();let local_id=config.node_id;
                 tokio::spawn(async move {
                     let _slot=slot;
                     let selected=tokio::time::timeout(Duration::from_secs(6),async{
                         loop {
                             let current=*role.borrow_and_update();
+                            if current.leader == local_id {
+                                let local = local_connections.lock().unwrap().as_ref()
+                                    .filter(|(epoch,_)| *epoch == current).map(|(_,send)|send.clone());
+                                if let Some(send) = local {return Ok::<_,io::Error>((current,ConnectionRoute::Local(send)));}
+                            } else {
                             let leader_slot=if peers.contains_key(&current.leader){current.leader}else{route_db.lock().unwrap().membership().ok().and_then(|m|m.identities.get(&current.leader).map(|n|u64::from_le_bytes(n[..8].try_into().unwrap()))).unwrap_or(0)};
-                            if let Some(peer)=peers.get(&leader_slot) {if let Ok(stream)=TcpStream::connect(peer.service).await{stream.set_nodelay(true)?;return Ok::<_,io::Error>((current,stream));}}
+                            if let Some(peer)=peers.get(&leader_slot) {if let Ok(stream)=TcpStream::connect(peer.service).await{stream.set_nodelay(true)?;return Ok::<_,io::Error>((current,ConnectionRoute::Remote(stream)));}}
+                            }
                             tokio::select!{_=role.changed()=>{},_=tokio::time::sleep(Duration::from_millis(50))=>{}}
                         }
                     }).await;
-                    if let Ok(Ok((epoch,mut outgoing)))=selected {
+                    if let Ok(Ok((epoch,route)))=selected {
+                        let mut outgoing=match route {
+                            ConnectionRoute::Local(send)=>{let _=send.try_send(incoming);return;},
+                            ConnectionRoute::Remote(stream)=>stream,
+                        };
                         tokio::select!{
                             _=tokio::io::copy_bidirectional(&mut incoming,&mut outgoing)=>{},
                             _=stop.changed()=>{},

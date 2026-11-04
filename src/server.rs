@@ -18,7 +18,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{tcp::OwnedWriteHalf, TcpListener, TcpStream},
-    sync::{watch, Notify, Semaphore},
+    sync::{mpsc, watch, Notify, Semaphore},
     task::JoinSet,
     time::{timeout, Instant},
 };
@@ -966,7 +966,14 @@ impl Server {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.listener.local_addr()
     }
-    pub async fn run(self, mut shutdown: watch::Receiver<bool>) -> io::Result<()> {
+    pub async fn run(self, shutdown: watch::Receiver<bool>) -> io::Result<()> {
+        self.run_with_incoming(shutdown, None).await
+    }
+    pub(crate) async fn run_with_incoming(
+        self,
+        mut shutdown: watch::Receiver<bool>,
+        mut incoming: Option<mpsc::Receiver<TcpStream>>,
+    ) -> io::Result<()> {
         let hub = Arc::new(Mutex::new(Hub {
             core: Core::default(),
             peers: HashMap::new(),
@@ -1002,17 +1009,31 @@ impl Server {
             if *shutdown.borrow() {
                 break;
             }
-            tokio::select! {
+            let accepted = tokio::select! {
                 biased;
                 _=shutdown.changed()=>{break;}
-                Some(result)=tasks.join_next(),if !tasks.is_empty()=>{if let Err(e)=result {tracing::error!(error=%e,"connection task failed");}}
-                result=self.listener.accept()=>{
-                    let (socket,addr)=result?;
-                    let Ok(slot)=slots.clone().try_acquire_owned() else {drop(socket);continue;};
-                    id=id.checked_add(1).ok_or_else(||io::Error::other("client id exhausted"))?;
-                    let hub=hub.clone();let config=config.clone();let stop=shutdown.clone();let identity=self.identity.clone();
-                    tasks.spawn(async move {let _slot=slot;if let Err(e)=connection(id,socket,hub,config,stop,identity).await {tracing::debug!(client=id,peer=%addr,error=%e,"connection closed");}});
-                }
+                Some(result)=tasks.join_next(),if !tasks.is_empty()=>{if let Err(e)=result {tracing::error!(error=%e,"connection task failed");} None}
+                result=accept_socket(&self.listener, &mut incoming)=>result.transpose(),
+            };
+            if let Some(result) = accepted {
+                let (socket, addr) = result?;
+                let Ok(slot) = slots.clone().try_acquire_owned() else {
+                    drop(socket);
+                    continue;
+                };
+                id = id
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("client id exhausted"))?;
+                let hub = hub.clone();
+                let config = config.clone();
+                let stop = shutdown.clone();
+                let identity = self.identity.clone();
+                tasks.spawn(async move {
+                    let _slot = slot;
+                    if let Err(e) = connection(id, socket, hub, config, stop, identity).await {
+                        tracing::debug!(client=id,peer=%addr,error=%e,"connection closed");
+                    }
+                });
             }
             if *shutdown.borrow() {
                 break;
@@ -1030,6 +1051,22 @@ impl Server {
             js.shutdown().await;
         }
         Ok(())
+    }
+}
+async fn accept_socket(
+    listener: &TcpListener,
+    incoming: &mut Option<mpsc::Receiver<TcpStream>>,
+) -> io::Result<Option<(TcpStream, SocketAddr)>> {
+    // Both sources share admission, protocol, routing and shutdown. Keep them
+    // fair when either listener has a connection burst.
+    tokio::select! {
+        result=listener.accept()=>result.map(Some),
+        socket=async { incoming.as_mut().unwrap().recv().await },if incoming.is_some()=>{
+            match socket {
+                Some(socket)=>socket.peer_addr().map(|addr|Some((socket,addr))),
+                None=>{*incoming=None;Ok(None)}
+            }
+        }
     }
 }
 struct Registration {
@@ -1327,3 +1364,7 @@ fn no_response(hub: &Arc<Mutex<Hub>>, reply: Option<&[u8]>) {
 #[cfg(test)]
 #[path = "server_output_tests.rs"]
 mod output_tests;
+
+#[cfg(test)]
+#[path = "server_handoff_tests.rs"]
+mod handoff_tests;

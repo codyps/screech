@@ -47,7 +47,10 @@ In three terminals, start the servers:
 ```
 
 Connect NATS clients to ports 4201–4203. Each public endpoint routes connections
-to the elected leader's service. INFO advertises all public endpoints so compatible
+to the elected leader's service. On the leader, the accepted public socket is
+handed directly to that service without another TCP connection. Both paths use
+the same connection limits and close when the leader epoch changes.
+INFO advertises all public endpoints so compatible
 clients discover reconnect targets. Connections close on a leadership change;
 clients reconnect and retry outstanding operations under their normal retry rules.
 A timed-out publication has an unknown outcome; use `Nats-Msg-Id` for deduplication
