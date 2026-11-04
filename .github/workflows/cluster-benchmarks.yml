@@ -47,6 +47,7 @@ jobs:
             tools/bench/go.sum
             upstream/go.sum
       - name: Build production servers and checked driver
+        id: build
         run: |
           mkdir -p bin results
           cargo build --release --locked
@@ -68,6 +69,17 @@ jobs:
           python3 scripts/check_cluster_targets.py --three results/cluster-3.json \
             --five results/cluster-5.json --minimum-trials "$TRIALS" \
             --output results/cluster-targets.json
+      - name: Profile publication CPU and disk calls separately from timing
+        if: ${{ always() && steps.build.outcome == 'success' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-tools-generic strace
+          sudo sysctl kernel.perf_event_paranoid=1
+          perf_binary=$(find -L /usr/lib/linux-tools -type f -name perf | sort | tail -1)
+          test -x "$perf_binary"
+          sudo python3 scripts/profile_cluster.py --screech target/release/screech-server \
+            --nats bin/nats-server --driver bin/bench-driver --perf "$perf_binary" \
+            --strace "$(command -v strace)" --output results/cluster-profiles
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:

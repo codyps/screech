@@ -27,13 +27,13 @@ func run() error {
 	n := flag.Int("n", 100000, "publishes")
 	size := flag.Int("size", 128, "payload bytes, at least 8")
 	subscribers := flag.Int("subscribers", 1, "subscribers")
-	profileGate := flag.String("profile-gate", "", "consumer profiling barriers; excludes prefill and validation")
+	profileGate := flag.String("profile-gate", "", "publication/consumer profiling barriers; excludes setup, prefill and validation")
 	flag.Parse()
 	if *profileGate != "" {
 		switch *scenario {
-		case "consume", "consume-one", "consume-parallel", "consume-ack-window", "consume-limits", "consume-next":
+		case "durable", "dedup", "consume", "consume-one", "consume-parallel", "consume-ack-window", "consume-limits", "consume-next":
 		default:
-			return fmt.Errorf("profile gate requires a consumer scenario")
+			return fmt.Errorf("profile gate requires a sequential publication or consumer scenario")
 		}
 	}
 	if *n <= 0 || *size < 8 || *subscribers <= 0 || (*replicas != 1 && *replicas != 3 && *replicas != 5) {
@@ -260,6 +260,9 @@ func run() error {
 			return e
 		}
 		defer js.DeleteStream(name)
+		if e = profileBarrier(*profileGate, ".ready", ".release"); e != nil {
+			return e
+		}
 		start := time.Now()
 		for i := 0; i < *n; i++ {
 			binary.LittleEndian.PutUint64(payload, uint64(i/2))
@@ -274,6 +277,9 @@ func run() error {
 			latencies = append(latencies, float64(time.Since(t).Nanoseconds())/1000)
 		}
 		elapsed = time.Since(start)
+		if e = profileBarrier(*profileGate, ".complete", ".finish"); e != nil {
+			return e
+		}
 		deliveries = int64((*n + 1) / 2)
 		for i := 0; i < (*n+1)/2; i++ {
 			m, e := js.GetMsg(name, uint64(i+1))
@@ -295,6 +301,9 @@ func run() error {
 			return e
 		}
 		defer js.DeleteStream(name)
+		if e = profileBarrier(*profileGate, ".ready", ".release"); e != nil {
+			return e
+		}
 		start := time.Now()
 		for i := 0; i < *n; i++ {
 			binary.LittleEndian.PutUint64(payload, uint64(i))
@@ -309,6 +318,9 @@ func run() error {
 			latencies = append(latencies, float64(time.Since(t).Nanoseconds())/1000)
 		}
 		elapsed = time.Since(start)
+		if e = profileBarrier(*profileGate, ".complete", ".finish"); e != nil {
+			return e
+		}
 		deliveries = int64(*n)
 		for i := 0; i < *n; i++ {
 			m, e := js.GetMsg(name, uint64(i+1))
