@@ -119,11 +119,15 @@
            [[:io_faults 0 :cold_sha256] (apply str (repeat 64 "1"))]]]
     (is (false? (cli/active-proof? nodes (assoc-in active-proof path value) :vm-torn)) (str path)))
   (let [proof (update active-proof :io_faults
-                      #(mapv (fn [f] (assoc f :mode "eio" :operation "flush" :errno 5 :reply_sent true :guest_errors ["I/O error, dev vda"])) %))]
+                      #(mapv (fn [f] (assoc f :mode "eio" :operation "flush" :errno 5 :reply_sent true
+                                            :error_after_canary true :subsequent_io_held true
+                                            :guest_errors ["I/O error, dev vda"])) %))]
     (is (true? (cli/active-proof? nodes proof :vm-eio-flush)))
     (is (false? (cli/active-proof? nodes (assoc-in proof [:io_faults 0 :errno] 0) :vm-eio-flush)))
     (is (false? (cli/active-proof? nodes (assoc-in proof [:io_faults 0 :reply_sent] false) :vm-eio-flush)))
-    (is (false? (cli/active-proof? nodes (assoc-in proof [:io_faults 0 :guest_errors] []) :vm-eio-flush)))))
+    (is (false? (cli/active-proof? nodes (assoc-in proof [:io_faults 0 :guest_errors] []) :vm-eio-flush)))
+    (is (false? (cli/active-proof? nodes (assoc-in proof [:io_faults 0 :error_after_canary] false) :vm-eio-flush)))
+    (is (false? (cli/active-proof? nodes (assoc-in proof [:io_faults 0 :subsequent_io_held] false) :vm-eio-flush)))))
 
 (deftest active-windows-must-match-history-attempts-and-completed-recovery-cycles
   (let [history (concat

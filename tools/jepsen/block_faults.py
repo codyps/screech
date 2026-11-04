@@ -34,6 +34,8 @@ class Disk:
         self.dead = threading.Event()
         self.hit = threading.Event()
         self.replied = threading.Event()
+        self.error_release = threading.Event()
+        self.failed = False
         self.rule = None
         self.proof = None
         self.connections = set()
@@ -65,6 +67,7 @@ class Disk:
             self.rule = mode, operation, pending, extents
             self.hit.clear()
             self.replied.clear()
+            self.error_release.clear()
 
     def disarm(self):
         with self.lock:
@@ -97,6 +100,8 @@ class Disk:
         with self.lock:
             if self.dead.is_set():
                 raise EOFError()
+            if self.failed:
+                return 0, b'', True  # No later I/O can drain before the cut.
             if offset + length > self.size or length > 32 * 1024**2:
                 return errno.EINVAL, b'', False
             if self.rule and NAMES.get(operation) == self.rule[1]:
@@ -127,7 +132,7 @@ class Disk:
                     self.hit.set()
                     if mode == 'eio':
                         self.proof['errno'] = errno.EIO
-                        return errno.EIO, b'', False
+                        return errno.EIO, b'', True
                     return 0, b'', True
             if operation == READ:
                 return 0, self.read(offset, length), False
@@ -168,7 +173,13 @@ class Disk:
                 return
             data = receive_exact(connection, length) if operation == WRITE else b''
             error, result, hold = self.execute(operation, flags, offset, data, length)
-            if hold:
+            if hold and error == errno.EIO:
+                # Arm the unsynced canary while this real request is pending,
+                # before Linux can remount the filesystem read-only on EIO.
+                while not self.error_release.wait(.05):
+                    if self.dead.is_set():
+                        return
+            elif hold:
                 self.dead.wait()  # Only a real VM cut cancels the in-flight request.
                 return
             with self.lock:
@@ -176,6 +187,8 @@ class Disk:
                     return
                 connection.sendall(struct.pack('!IIQ', 0x67446698, error, cookie) + result)
                 if error == errno.EIO and self.proof and self.proof.get('errno') == errno.EIO:
+                    self.failed = True
+                    self.proof['subsequent_io_held'] = True
                     self.proof['reply_sent'] = True
                     self.replied.set()
 

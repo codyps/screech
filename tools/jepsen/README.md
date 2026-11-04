@@ -309,7 +309,11 @@ then dispatch every SIGKILL before awaiting any exit. This avoids QMP stop's I/O
 drain, which cannot complete a deliberately held request. A held/torn request must
 still overlap an open client request at the cut. EIO must have a real error reply
 and guest kernel evidence; it may already have failed the client request when
-power is cut. All cuts still require new kernel IDs and the cold-boot canaries.
+power is cut. The matched EIO request is initially held while the controller arms
+the canary, then its real error reply is delivered. Later disk requests remain
+held until the cut. This permits Linux to remount the filesystem read-only without
+requiring a canary write to that read-only filesystem or allowing a later flush to
+persist the dirty canary. All cuts still require new kernel IDs and the cold-boot canaries.
 Recovery uses ordinary voter starts, without removing or editing application files.
 The final `io_faults` proof is retained beside the other convergence evidence.
 

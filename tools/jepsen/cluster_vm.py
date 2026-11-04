@@ -201,7 +201,7 @@ class Cluster:
         self.request_lock = threading.Lock()
         self.io_faults = []
 
-    def power_cut(self, nodes, active=False, members=None, request_kind=None):
+    def power_cut(self, nodes, active=False, members=None, request_kind=None, prearmed=None):
         nodes = list(nodes)
         assert nodes and len(set(nodes)) == len(nodes) and all(n in self.vms for n in nodes)
         event = {'nodes': nodes, 'verified': {}, 'all_paused_before_kill': False, 'signal': 'SIGKILL'}
@@ -212,7 +212,7 @@ class Cluster:
                 assert vm.process is not None and vm.process.poll() is None
                 marker = uuid.uuid4().hex[:len('stable-before-unsynced-overwrite')]
                 payload = {'pause': False, 'member': members[node]} if active else {}
-                result = vm.call('arm-power', marker=marker, **payload)
+                result = (prearmed or {}).get(node) or vm.call('arm-power', marker=marker, **payload)
                 assert result['armed']
                 if active:
                     assert result['server_not_stopped'], 'active cut stopped voter threads first'
@@ -297,9 +297,16 @@ class Cluster:
         proof = dict(block.proof, leader=leader, targets=targets, request_kind=kind,
                      surviving_nodes=[n for n in self.vms if n not in targets],
                      membership_before=membership, replicas_before=replicas)
+        prearmed = {}
         if mode == 'eio':
+            prearmed[leader] = self.vms[leader].call('arm-power', pause=False, member=members[leader],
+                                                   marker=uuid.uuid4().hex[:len('stable-before-unsynced-overwrite')])
+            assert prearmed[leader]['armed'] and prearmed[leader]['server_not_stopped']
+            proof['error_after_canary'] = True
+            block.error_release.set()
             assert block.replied.wait(3), 'EIO reply was not delivered to QEMU'
             proof['reply_sent'] = block.proof['reply_sent']
+            proof['subsequent_io_held'] = block.proof['subsequent_io_held']
             deadline = time.monotonic() + 5
             while True:
                 proof['guest_errors'] = self.vms[leader].call('io-errors')['errors']
@@ -307,7 +314,7 @@ class Cluster:
                     break
                 assert time.monotonic() < deadline, 'guest never reported the injected disk I/O error'
                 time.sleep(.02)
-        cut = self.power_cut(targets, active=True, members=members, request_kind=kind)['event']
+        cut = self.power_cut(targets, active=True, members=members, request_kind=kind, prearmed=prearmed)['event']
         proof['requests_at_cut'] = cut['requests_at_cut']
         # Check after stopping QEMU, not before the guest canary RPC. An EIO
         # may instead complete the API with an error before the subsequent cut.

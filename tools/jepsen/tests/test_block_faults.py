@@ -96,16 +96,29 @@ class BlockFaults(unittest.TestCase):
         with self.assertRaises(socket.timeout):
             self.client.reply()
 
-    def test_read_write_and_flush_eio_are_real_error_replies_and_one_shot(self):
+    def test_eio_delivery_waits_for_canary_arming_and_then_prevents_further_io_until_power_loss(self):
         for operation, name in [(READ, 'read'), (WRITE, 'write'), (FLUSH, 'flush')]:
             self.disk.arm('eio', name, lambda: [{'id': 'request-1'}], [{'physical': 0, 'length': 65536}])
             fields = {'data': b'n' * 4096} if operation == WRITE else {'length': 4096} if operation == READ else {}
             self.client.send(operation, **fields)
+            self.assertTrue(self.disk.hit.wait(2))
+            self.client.socket.settimeout(.05)
+            with self.assertRaises(socket.timeout):
+                self.client.reply()
+            self.disk.error_release.set()
+            self.client.socket.settimeout(2)
             self.assertEqual((errno.EIO, b''), self.client.reply(4096 if operation == READ else 0))
             self.assertTrue(self.disk.replied.wait(2))
             self.assertTrue(self.disk.proof['reply_sent'])
+            self.assertTrue(self.disk.proof['subsequent_io_held'])
             self.client.send(operation, **fields)
-            self.assertEqual(0, self.client.reply(4096 if operation == READ else 0)[0])
+            self.client.socket.settimeout(.05)
+            with self.assertRaises(socket.timeout):
+                self.client.reply()
+            self.client.socket.close()
+            self.disk.close()
+            self.disk = Disk(self.path)
+            self.client = NBD(self.disk)
 
     def test_no_fault_without_pending_client_or_authoritative_file_overlap(self):
         pending = []
