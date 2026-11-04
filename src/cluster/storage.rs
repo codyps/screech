@@ -39,6 +39,7 @@ pub(crate) struct Database {
     pub max_log_bytes: u64,
     pub snapshot_position: (u64, u64, u64),
     entries_bytes: u64,
+    accepted_tip: Option<(u64, u64)>,
     projection_batch: bool,
     pub(super) projection_changes: Arc<AtomicU64>,
     _lock: File,
@@ -189,6 +190,7 @@ impl Database {
             failed: false,
             snapshot_position: (0, 0, 0),
             entries_bytes: 0,
+            accepted_tip: None,
             projection_batch: false,
             projection_changes: Arc::new(AtomicU64::new(0)),
             gate: Arc::new(Mutex::new(())),
@@ -255,6 +257,16 @@ impl Database {
         db.conn
             .pragma_update(None, "synchronous", "NORMAL")
             .map_err(error)?;
+        // Populate only after validating the complete independent SQL witness
+        // against the accepted journal. Verification always reads SQL directly.
+        db.accepted_tip = Some((
+            last,
+            if last == base {
+                db.snapshot_position.1
+            } else {
+                db.entry(last)?.term
+            },
+        ));
         Ok(db)
     }
     pub fn meta(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
@@ -322,6 +334,17 @@ impl Database {
             return Err(error("Raft entry identity mismatch"));
         }
         Ok(entry)
+    }
+    fn log_term(&self, idx: u64) -> io::Result<u64> {
+        if self.failed {
+            return Err(error("replica quarantined"));
+        }
+        if let Some((last, term)) = self.accepted_tip {
+            if idx == last {
+                return Ok(term);
+            }
+        }
+        self.entry(idx).map(|e| e.term)
     }
     pub fn persist(&mut self, entries: &[Entry], hard: Option<&HardState>) -> io::Result<()> {
         if self.failed {
@@ -409,24 +432,44 @@ impl Database {
             .checked_sub(removed)
             .and_then(|n| n.checked_add(added))
             .ok_or_else(|| error("invalid cached log size"))?;
+        if let Some(last) = entries.last() {
+            self.accepted_tip = Some((last.index, last.term));
+        }
         crate::fault::point("after_cluster_persist");
         Ok(())
     }
     pub fn apply(&mut self, commit: u64) -> io::Result<Vec<(Vec<u8>, u64)>> {
-        let base = self
-            .meta("view")?
-            .map(|b| u64::from_le_bytes(b.try_into().unwrap_or([255; 8])))
-            .unwrap_or(0);
+        let base = self.view()?;
+        let entries = (base..commit)
+            .map(|idx| self.entry(idx + 1))
+            .collect::<io::Result<Vec<_>>>()?;
+        self.apply_entries(commit, entries)
+    }
+    /// The owner already read and checksum-verified this exact prefix while
+    /// applying configuration changes in the same gated SQL transaction.
+    pub(super) fn apply_entries(
+        &mut self,
+        commit: u64,
+        entries: Vec<Entry>,
+    ) -> io::Result<Vec<(Vec<u8>, u64)>> {
+        let base = self.view()?;
         if base > commit {
             return Err(error("view ahead of commitment"));
+        }
+        if entries.len() as u64 != commit - base
+            || entries
+                .iter()
+                .enumerate()
+                .any(|(n, e)| e.index != base + n as u64 + 1)
+        {
+            return Err(error("application prefix does not match committed view"));
         }
         if base == commit {
             return Ok(Vec::new());
         }
         let mut end = self.end()?;
         let mut decoded = Vec::new();
-        for idx in base + 1..=commit {
-            let entry = self.entry(idx)?;
+        for entry in entries {
             let batch = if entry.data.is_empty()
                 || entry.get_entry_type() != raft::eraftpb::EntryType::EntryNormal
             {
@@ -489,6 +532,9 @@ impl Database {
             .execute_batch(if commit { "COMMIT" } else { "ROLLBACK" })
             .map_err(error);
         self.projection_batch = false;
+        if !commit || result.is_err() {
+            self.accepted_tip = None;
+        }
         if commit && result.is_ok() {
             self.projection_changes
                 .store(self.conn.total_changes(), Ordering::Release);
@@ -638,7 +684,7 @@ impl Storage for LogStorage {
         if idx == base {
             return Ok(term);
         }
-        db.entry(idx).map(|e| e.term).map_err(raft_error)
+        db.log_term(idx).map_err(raft_error)
     }
     fn first_index(&self) -> raft::Result<u64> {
         Ok(self
@@ -696,6 +742,7 @@ mod tests {
             }),
         )
         .unwrap();
+        assert_eq!(db.log_term(2).unwrap(), 1);
         assert_eq!(
             db.log_bytes().unwrap(),
             u64::from(a.compute_size() + b.compute_size())
@@ -714,6 +761,7 @@ mod tests {
         .unwrap();
         let expected = u64::from(a.compute_size() + b.compute_size());
         assert_eq!(db.log_bytes().unwrap(), expected);
+        assert_eq!(db.log_term(2).unwrap(), 2);
         assert!(db
             .persist(
                 &[Entry {
@@ -726,13 +774,11 @@ mod tests {
             .is_err());
         assert_eq!(db.log_bytes().unwrap(), expected);
         drop(db);
-        assert_eq!(
-            Database::open(&path, &c, false)
-                .unwrap()
-                .log_bytes()
-                .unwrap(),
-            expected
-        );
+        let mut db = Database::open(&path, &c, false).unwrap();
+        assert_eq!(db.log_bytes().unwrap(), expected);
+        assert_eq!(db.log_term(2).unwrap(), 2);
+        db.failed = true;
+        assert!(db.log_term(2).is_err());
     }
 
     use super::*;
@@ -787,6 +833,37 @@ mod tests {
             data: postcard::to_allocvec(&batch).unwrap().into(),
             ..Default::default()
         }
+    }
+    #[test]
+    fn reused_application_prefix_cannot_skip_committed_records_or_apply_them_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Database::open(&dir.path().join("db"), &config(), true).unwrap();
+        let first = entry(1, 1, b"body");
+        let second = Entry {
+            index: 2,
+            term: 1,
+            ..Default::default()
+        };
+        db.persist(
+            &[first.clone(), second.clone()],
+            Some(&HardState {
+                term: 1,
+                vote: 1,
+                commit: 2,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        assert!(db.apply_entries(2, vec![second.clone()]).is_err());
+        assert!(db.apply_entries(2, vec![first.clone()]).is_err());
+        assert_eq!(db.view().unwrap(), 0);
+        assert!(db.record(1).unwrap().is_none());
+        let verified = vec![db.entry(1).unwrap(), db.entry(2).unwrap()];
+        db.apply_entries(2, verified).unwrap();
+        assert_eq!(db.view().unwrap(), 2);
+        assert_eq!(db.end().unwrap(), 1);
+        assert!(db.apply_entries(2, vec![first, second]).is_err());
+        assert_eq!(db.end().unwrap(), 1);
     }
     #[test]
     fn disposable_indexes_rebuild_only_committed_content_and_rollback_with_projection() {

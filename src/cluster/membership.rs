@@ -231,14 +231,17 @@ impl Database {
         })
     }
 }
-pub(crate) fn apply_configuration(node: &mut RawNode<LogStorage>, commit: u64) -> io::Result<()> {
+pub(crate) fn apply_configuration(
+    node: &mut RawNode<LogStorage>,
+    commit: u64,
+) -> io::Result<Vec<Entry>> {
     let entries = {
         let db = node.store().db.lock().unwrap();
-        (db.view()? + 1..=commit)
-            .map(|i| db.entry(i))
+        (db.view()?..commit)
+            .map(|i| db.entry(i + 1))
             .collect::<io::Result<Vec<_>>>()?
     };
-    for e in entries {
+    for e in &entries {
         if e.get_entry_type() == EntryType::EntryConfChangeV2 {
             let cc = ConfChangeV2::parse_from_bytes(&e.data).map_err(error)?;
             // The committed configuration must survive losing the SQLite
@@ -254,7 +257,7 @@ pub(crate) fn apply_configuration(node: &mut RawNode<LogStorage>, commit: u64) -
             let mut db = node.store().db.lock().unwrap();
             db.validate_voter_count(&conf)?;
             let mut state = db.membership()?;
-            Database::note_change(&mut state, &e)?;
+            Database::note_change(&mut state, e)?;
             db.commit_transaction(false, |tx| {
                 tx.execute(
                     "INSERT INTO cluster_meta VALUES('conf',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -277,7 +280,7 @@ pub(crate) fn apply_configuration(node: &mut RawNode<LogStorage>, commit: u64) -
             crate::fault::point("after_cluster_membership_apply");
         }
     }
-    Ok(())
+    Ok(entries)
 }
 fn single(id: u64, kind: ConfChangeType) -> ConfChangeSingle {
     ConfChangeSingle {

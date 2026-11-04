@@ -339,6 +339,7 @@ impl Database {
         self.refresh_log_bytes()?;
         self.snapshot_position = (index, snapshot.get_metadata().term, image.sequence);
         self.seal()?;
+        self.accepted_tip = Some((last, last_term));
         crate::fault::point("after_cluster_snapshot_install");
         Ok(())
     }

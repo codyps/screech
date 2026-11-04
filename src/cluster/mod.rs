@@ -560,8 +560,13 @@ fn pump_ready(
         // Raft's committed entry lists may be split across Ready and LightReady.
         let commit = node.raft.raft_log.committed;
         if commit > node.raft.raft_log.applied {
-            membership::apply_configuration(node, commit)?;
-            let replies = node.store().db.lock().unwrap().apply(commit)?;
+            let entries = membership::apply_configuration(node, commit)?;
+            let replies = node
+                .store()
+                .db
+                .lock()
+                .unwrap()
+                .apply_entries(commit, entries)?;
             for (key, end) in replies {
                 if let Some(request) = pending.remove(&key) {
                     completed.push((request.reply, end));
@@ -573,9 +578,9 @@ fn pump_ready(
             let mut hard = node.store().db.lock().unwrap().hard()?;
             hard.commit = commit;
             node.store().db.lock().unwrap().persist(&[], Some(&hard))?;
-            membership::apply_configuration(node, commit)?;
+            let entries = membership::apply_configuration(node, commit)?;
             let mut db = node.store().db.lock().unwrap();
-            for (key, end) in db.apply(commit)? {
+            for (key, end) in db.apply_entries(commit, entries)? {
                 if let Some(request) = pending.remove(&key) {
                     completed.push((request.reply, end));
                 }
