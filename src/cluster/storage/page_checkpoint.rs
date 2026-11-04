@@ -27,6 +27,12 @@ impl PageCheckpointer {
         conn.busy_timeout(Duration::ZERO).map_err(error)?;
         conn.pragma_update(None, "synchronous", "FULL")
             .map_err(error)?;
+        let page_size: u64 = conn
+            .pragma_query_value(None, "page_size", |r| r.get::<_, i64>(0))
+            .map_err(error)?
+            .try_into()
+            .map_err(error)?;
+        let minimum_wal_bytes = page_size * 2048;
         let mut wal = path.into_os_string();
         wal.push("-wal");
         let wal = PathBuf::from(wal);
@@ -43,7 +49,7 @@ impl PageCheckpointer {
                         if current.saturating_sub(checkpointed) < PROJECTION_CHANGE_BUDGET {
                             return Ok(());
                         }
-                        if std::fs::metadata(&wal)?.len() < 8 * 1024 * 1024 {
+                        if std::fs::metadata(&wal)?.len() < minimum_wal_bytes {
                             return Ok(());
                         }
                         match conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
@@ -106,6 +112,36 @@ mod tests {
         header[16..24].try_into().unwrap()
     }
 
+    #[test]
+    fn small_page_projections_checkpoint_before_eight_megabytes_accumulate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA page_size=1024; PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=NORMAL; PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE t(id INTEGER PRIMARY KEY, body BLOB);
+            INSERT INTO t VALUES(1, zeroblob(2621440));",
+        )
+        .unwrap();
+        let wal_bytes = std::fs::metadata(format!("{}-wal", path.display()))
+            .unwrap()
+            .len();
+        assert!(wal_bytes > 2 * 1024 * 1024 && wal_bytes < 8 * 1024 * 1024);
+        let changes = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = mpsc::sync_channel(1);
+        let _worker = PageCheckpointer::start(path.clone(), changes.clone(), tx).unwrap();
+        changes.store(PROJECTION_CHANGE_BUDGET, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::fs::metadata(&path).unwrap().len() < 2 * 1024 * 1024 {
+            assert!(
+                Instant::now() < deadline,
+                "small-page checkpoint did not run"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
     #[test]
     fn retained_wal_capacity_does_not_trigger_checkpoints_without_projection_work() {
         let dir = tempfile::tempdir().unwrap();

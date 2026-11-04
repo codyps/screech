@@ -92,6 +92,12 @@ impl Database {
             return Err(error("missing cluster database"));
         }
         let conn = Connection::open(path).map_err(error)?;
+        if !existed {
+            // Raft appends and small metadata updates otherwise dirty several
+            // 4 KiB WAL pages for a small publication. Existing roots retain
+            // their page size; no rewrite or migration is needed to reopen.
+            conn.pragma_update(None, "page_size", 1024).map_err(error)?;
+        }
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(error)?;
         conn.pragma_update(None, "synchronous", "FULL")
@@ -101,7 +107,10 @@ impl Database {
         // of repeatedly syncing a reused WAL's retained capacity.
         conn.pragma_update(None, "wal_autocheckpoint", 32768)
             .map_err(error)?;
-        conn.pragma_update(None, "journal_size_limit", 128 * 1024 * 1024)
+        let page_size: i64 = conn
+            .pragma_query_value(None, "page_size", |r| r.get(0))
+            .map_err(error)?;
+        conn.pragma_update(None, "journal_size_limit", page_size * 32768)
             .map_err(error)?;
         let initialized: bool = conn
             .query_row(
@@ -844,6 +853,58 @@ mod tests {
             data: postcard::to_allocvec(&batch).unwrap().into(),
             ..Default::default()
         }
+    }
+    #[test]
+    fn existing_projection_layout_and_accepted_history_survive_smaller_page_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut db = Database::open(&path, &config(), true).unwrap();
+        assert_eq!(
+            db.conn
+                .pragma_query_value(None, "page_size", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1024
+        );
+        db.persist(
+            &[entry(1, 1, b"durable")],
+            Some(&HardState {
+                term: 1,
+                vote: 1,
+                commit: 1,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        db.apply(1).unwrap();
+        drop(db);
+        // Construct the legacy layout offline. The accepted journal and every
+        // promise remain unchanged, so reopening must preserve this history.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA synchronous=FULL; PRAGMA journal_mode=DELETE;
+            PRAGMA page_size=4096; VACUUM;",
+        )
+        .unwrap();
+        drop(conn);
+        let db = Database::open(&path, &config(), false).unwrap();
+        assert_eq!(
+            db.conn
+                .pragma_query_value(None, "page_size", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            4096
+        );
+        assert_eq!(db.end().unwrap(), 1);
+        assert_eq!(db.hard().unwrap().commit, 1);
+        assert_eq!(
+            db.content(ContentKey {
+                generation: 1,
+                sequence: 1
+            })
+            .unwrap()
+            .unwrap()
+            .payload,
+            "durable"
+        );
     }
     #[test]
     fn raft_frontier_reads_follow_shorter_replacement_suffixes_after_restart() {
