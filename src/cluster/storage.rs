@@ -346,6 +346,13 @@ impl Database {
         }
         self.entry(idx).map(|e| e.term)
     }
+    fn log_last_index(&self) -> io::Result<u64> {
+        if self.failed {
+            return Err(error("replica quarantined"));
+        }
+        self.accepted_tip
+            .map_or_else(|| self.last(), |(last, _)| Ok(last))
+    }
     pub fn persist(&mut self, entries: &[Entry], hard: Option<&HardState>) -> io::Result<()> {
         if self.failed {
             return Err(error("replica quarantined"));
@@ -697,7 +704,7 @@ impl Storage for LogStorage {
             + 1)
     }
     fn last_index(&self) -> raft::Result<u64> {
-        self.db.lock().unwrap().last().map_err(raft_error)
+        self.db.lock().unwrap().log_last_index().map_err(raft_error)
     }
     fn snapshot(&self, index: u64, _: u64) -> raft::Result<Snapshot> {
         let db = self.db.lock().unwrap();
@@ -743,6 +750,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(db.log_term(2).unwrap(), 1);
+        assert_eq!(db.log_last_index().unwrap(), 2);
         assert_eq!(
             db.log_bytes().unwrap(),
             u64::from(a.compute_size() + b.compute_size())
@@ -762,6 +770,7 @@ mod tests {
         let expected = u64::from(a.compute_size() + b.compute_size());
         assert_eq!(db.log_bytes().unwrap(), expected);
         assert_eq!(db.log_term(2).unwrap(), 2);
+        assert_eq!(db.log_last_index().unwrap(), 2);
         assert!(db
             .persist(
                 &[Entry {
@@ -777,8 +786,10 @@ mod tests {
         let mut db = Database::open(&path, &c, false).unwrap();
         assert_eq!(db.log_bytes().unwrap(), expected);
         assert_eq!(db.log_term(2).unwrap(), 2);
+        assert_eq!(db.log_last_index().unwrap(), 2);
         db.failed = true;
         assert!(db.log_term(2).is_err());
+        assert!(db.log_last_index().is_err());
     }
 
     use super::*;
@@ -833,6 +844,39 @@ mod tests {
             data: postcard::to_allocvec(&batch).unwrap().into(),
             ..Default::default()
         }
+    }
+    #[test]
+    fn raft_frontier_reads_follow_shorter_replacement_suffixes_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut db = Database::open(&path, &config(), true).unwrap();
+        db.persist(
+            &[entry(1, 1, b"first"), entry(2, 1, b"uncommitted")],
+            Some(&HardState {
+                term: 1,
+                vote: 1,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        assert_eq!(db.log_last_index().unwrap(), 2);
+        db.persist(
+            &[entry(1, 2, b"replacement")],
+            Some(&HardState {
+                term: 2,
+                vote: 1,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        assert_eq!(db.log_last_index().unwrap(), 1);
+        assert_eq!(db.log_term(1).unwrap(), 2);
+        assert!(db.log_term(2).is_err());
+        drop(db);
+        let db = Database::open(&path, &config(), false).unwrap();
+        assert_eq!(db.log_last_index().unwrap(), 1);
+        assert_eq!(db.log_term(1).unwrap(), 2);
+        assert!(db.log_term(2).is_err());
     }
     #[test]
     fn reused_application_prefix_cannot_skip_committed_records_or_apply_them_twice() {
