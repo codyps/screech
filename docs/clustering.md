@@ -503,6 +503,19 @@ preserving another 40 confirmed ACKs. All twelve histories passed replay, includ
 their fault controls and automatic-recovery checks; the harness README records the
 exact schedules, counts and scope.
 
+The mixed extension retains directed Ethernet loss across minority reboots and
+disk repair. Real UDP controls prove both blocked and permitted directions. A
+shared conditional-write witness probes each leader-local service, rejects
+conflicting confirmations and stale reads, and requires fresh minority catalog
+mutations to remain unconfirmed. Surviving-majority progress is required during
+partition, power-off, damaged restart and healing; normal startup must restore full
+membership and preserve confirmed consumer ACKs and witness payloads.
+The completed three/five-voter mixed matrices passed all twelve histories and
+replays: 644 confirmed consumer ACKs, 173 conditional-write confirmations, 48
+consumer audits and 48 witness audits. No conflicting confirmations, stale reads
+or minority catalog confirmations were observed. All eighteen damaged voter
+instances recovered automatically to full membership with a surviving quorum.
+
 The assurance limits remain explicit. A healthy surviving quorum is required for
 repair; a consistent rollback of all local files including the watermark cannot be
 diagnosed locally. This review does not certify arbitrary storage/controller faults,

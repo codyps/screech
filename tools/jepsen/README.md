@@ -590,3 +590,63 @@ cross-checks are in `results/jepsen-inflight-three-device-power/` and
 `results/jepsen-inflight-verification.json`. Compatibility artifacts are in
 `results/jepsen-inflight-lazyfs-compatibility/` and
 `results/jepsen-inflight-native-compatibility/`.
+
+## Checked mixed-network runs
+
+The three- and five-voter matrices each passed all six combinations of directed
+network loss and disk damage. Each used one client per voter, seeded consumer
+fixtures, at most two additional main cycles per client, a 30-second main-client
+scheduling window and a 300-second final recovery/audit window. The composite
+fault and its conditional-write witness ran to completion before final recovery
+cycles began. Runtime versions and independent-VM hardware match the native runs
+above; every voter used a volatile NBD device.
+
+| Scenario | Three-voter confirmed consumer ACKs | Five-voter confirmed consumer ACKs |
+| --- | ---: | ---: |
+| `vm-split-bitflip` | 41 | 65 |
+| `vm-split-wipe` | 41 | 71 |
+| `vm-send-bitflip` | 40 | 66 |
+| `vm-send-wipe` | 36 | 65 |
+| `vm-receive-bitflip` | 41 | 71 |
+| `vm-receive-wipe` | 41 | 66 |
+
+Across 192 attempted consumer cycles, all 644 confirmed consumer ACKs and 648
+acknowledged workload publications passed their durability and lifecycle checks.
+Every public address completed a fresh recovery lifecycle and its consumer audit:
+48 successful recovery cycles and 48 audits, with no ACK-floor rollback, retention,
+deduplication, recreation or stale-ACK violations.
+
+The independent witness recorded 194 concurrent conditional-write rounds and 173
+confirmed conditional publications, with no conflicting confirmations or confirmed
+sequence forks. Its 169 successful local-service reads preserved the required
+committed prefix. All 208 minority catalog probes remained unconfirmed, including
+probes against erased and restarted stores. Every fault phase had at least two
+successful quorum write rounds and two successful local-service read rounds.
+All 48 post-heal witness audits returned every confirmed payload through each
+public address.
+
+The 36 real UDP controls checked 468 directed source/destination pairs, proving
+both blocked and allowed links before the cut, after partitioned reboots and after
+healing. The 24 grouped cuts, including twelve preflights, produced 66 successful
+cold-boot canary checks. All preserved fsynced bytes, lost unsynced overwrites and
+observed new kernel IDs; surviving-quorum kernel IDs stayed unchanged. The maximum
+SIGKILL dispatch skew was below 0.06 ms. All eighteen damaged voter instances returned
+as different fully admitted members through ordinary startup, with matching final
+durable positions and no outstanding joint replacement.
+
+All twelve histories passed replay against the final consumer, network-control,
+conditional-write/read and recovery oracles. The control suite passed twenty
+Python tests and sixteen Clojure tests with 144 assertions. Both three-voter queue
+baselines (LazyFS and direct native disks) passed, and the earlier three/five-voter
+active-I/O histories also passed replay. No production server changes were needed;
+the binary SHA-256 matches the earlier campaigns.
+
+The mixed implementation is `800565d`. The shared wire-client EOF/resource fix is
+`738918a`; malformed greetings remain protocol failures. Final per-phase read
+coverage and recovered-leader checks are in `efe6e77`. Full histories, proofs,
+replay reports, images and runtime metadata are retained in the ignored
+`results/jepsen-mixed-three-final/` and `results/jepsen-mixed-five-final/` directories.
+The aggregate proof audit is `results/jepsen-mixed-verification.json`; compatibility
+artifacts are in `results/jepsen-mixed-native-compatibility/` and
+`results/jepsen-mixed-lazyfs-compatibility/`. Physical-host/controller failures and
+arbitrary network schedules remain outside these bounded histories.

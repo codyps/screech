@@ -177,6 +177,27 @@ EIO delivery waits for canary arming, then later device requests stay pending un
 the cut. This handles a Linux read-only remount without writing to the failed
 filesystem after the error or silently draining its volatile data.
 
+The mixed native matrix combines directed private-NIC partitions, minority VM
+power cuts and either database/WAL corruption or entire-store erasure:
+
+```sh
+python3 tools/jepsen/cluster_vm.py \
+  --runtime results/jepsen-runtime/runtime.json \
+  --output results/jepsen-mixed-five --nodes 5 \
+  --scenarios vm-split-bitflip,vm-split-wipe,vm-send-bitflip,vm-send-wipe,vm-receive-bitflip,vm-receive-wipe \
+  --time-limit 30 --final-time-limit 300 --timeout 5400
+```
+
+Guest UDP controls and hub counters must prove every directed link before and
+after the minority reboots. Conditional publications through each voter's local
+service must produce no conflicting confirmations; isolated voters must not
+confirm fresh catalog mutations, and successful reads must preserve every
+previously observed committed prefix. A connected durable majority must make
+progress before the cut, while targets are off, after partitioned restarts and
+after healing. Every public address then verifies all confirmed witness values
+and the consumer ACK/lifecycle contracts. A composite nemesis can outlast the
+30-second client scheduling window; its control deadline is five minutes.
+
 Saved consumer histories can be checked again with:
 
 ```sh
