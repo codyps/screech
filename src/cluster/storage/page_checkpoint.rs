@@ -6,7 +6,9 @@ use crate::cluster::Input;
 use rusqlite::{ErrorCode, OpenFlags};
 use std::{path::PathBuf, sync::mpsc, time::Duration};
 
-const PROJECTION_CHANGE_BUDGET: u64 = 16 * 1024;
+// Small, regular passes avoid a large dirty WAL flush delaying the accepted
+// journals on the same device. Activity still gates retained WAL capacity.
+const PROJECTION_CHANGE_BUDGET: u64 = 1024;
 
 pub(crate) struct PageCheckpointer {
     stop: mpsc::Sender<()>,

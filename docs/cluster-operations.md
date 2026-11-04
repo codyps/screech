@@ -135,7 +135,7 @@ the next is authenticated. Client replies wait for successful transaction comple
 and publication of the committed service epoch. A committed membership position is
 sealed before applying the new voter configuration, so lost SQL projection writes
 cannot resurrect a removed voter.
-Passive SQLite page checkpoints run on a separate connection after 16,384 committed
+Passive SQLite page checkpoints run on a separate connection after 1,024 committed
 projection row changes and at least 8 MiB of WAL capacity. Retained capacity alone
 does not trigger another checkpoint. The primary connection retains an automatic
 checkpoint fallback at 32,768 frames (about 128 MiB), with a 128 MiB retained WAL
