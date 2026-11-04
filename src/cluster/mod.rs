@@ -837,13 +837,21 @@ async fn run_runtime(
     let clients = TcpListener::bind(peer.client).await?;
     let db = Arc::new(Mutex::new(database));
     let (tx, rx) = mpsc::sync_channel(256);
-    let checkpoint_path = db.lock().unwrap().conn.path().map(std::path::PathBuf::from);
+    let (checkpoint_path, changes) = {
+        let database = db.lock().unwrap();
+        (
+            database.conn.path().map(std::path::PathBuf::from),
+            database.projection_changes.clone(),
+        )
+    };
     let _page_checkpointer = if let Some(path) = checkpoint_path {
         let fault = tx.clone();
         Some(
-            tokio::task::spawn_blocking(move || storage::PageCheckpointer::start(path, fault))
-                .await
-                .map_err(error)??,
+            tokio::task::spawn_blocking(move || {
+                storage::PageCheckpointer::start(path, changes, fault)
+            })
+            .await
+            .map_err(error)??,
         )
     } else {
         None

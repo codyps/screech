@@ -122,13 +122,17 @@ Commit-index notifications may persist asynchronously, as permitted by Raft. A n
 leader commits a current-term observation before exposing the recovered model.
 Indexes expose only the committed prefix; the accepted suffix remains available
 for conflict replacement. Standalone storage keeps its existing FULL behavior.
-Projection updates share one transaction per Raft pump; client replies wait for
+Input validation, Raft storage reads and projection updates share one transaction
+per Raft input; client replies wait for
 that transaction's successful completion. A committed membership position is
 sealed before applying the new voter configuration, so lost SQL projection writes
 cannot resurrect a removed voter.
-Passive SQLite page checkpoints run on a separate connection. The normal automatic
-checkpoint limit remains a fallback; checkpoint I/O errors fence the voter. These
-page checkpoints preserve FULL snapshot roots and do not change journal syncing.
+Passive SQLite page checkpoints run on a separate connection after 16,384 committed
+projection row changes and at least 8 MiB of WAL capacity. Retained capacity alone
+does not trigger another checkpoint. The primary connection retains an automatic
+checkpoint fallback at 32,768 frames (about 128 MiB), with a 128 MiB retained WAL
+size limit. Checkpoint I/O errors fence the voter. These physical page checkpoints
+preserve FULL snapshot roots and do not change journal syncing.
 
 The journal retains the `.cluster-watermark` filename. Two fixed-size authenticated
 control records bind its root, published length, hash chain and voting/log position.

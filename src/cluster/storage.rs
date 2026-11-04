@@ -19,7 +19,10 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Write},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 
 fn sql(n: u64) -> io::Result<i64> {
@@ -37,6 +40,7 @@ pub(crate) struct Database {
     pub snapshot_position: (u64, u64, u64),
     entries_bytes: u64,
     projection_batch: bool,
+    pub(super) projection_changes: Arc<AtomicU64>,
     _lock: File,
     watermark: watermark::Watermark,
 }
@@ -91,12 +95,12 @@ impl Database {
             .map_err(error)?;
         conn.pragma_update(None, "synchronous", "FULL")
             .map_err(error)?;
-        // Match the standalone WAL budget. Snapshotting retained payloads and
-        // SQLite's page checkpoint are separate work; avoid forcing both into
-        // short admission bursts. The accepted journal syncs every new entry.
-        conn.pragma_update(None, "wal_autocheckpoint", 4096)
+        // Bound the replayable query WAL independently of the accepted journal.
+        // Amortize checkpoint/header syncs over useful projection work instead
+        // of repeatedly syncing a reused WAL's retained capacity.
+        conn.pragma_update(None, "wal_autocheckpoint", 32768)
             .map_err(error)?;
-        conn.pragma_update(None, "journal_size_limit", 32 * 1024 * 1024)
+        conn.pragma_update(None, "journal_size_limit", 128 * 1024 * 1024)
             .map_err(error)?;
         let initialized: bool = conn
             .query_row(
@@ -176,6 +180,7 @@ impl Database {
             snapshot_position: (0, 0, 0),
             entries_bytes: 0,
             projection_batch: false,
+            projection_changes: Arc::new(AtomicU64::new(0)),
             gate: Arc::new(Mutex::new(())),
             node_id: config.node_id,
             incarnation,
@@ -465,6 +470,10 @@ impl Database {
             .execute_batch(if commit { "COMMIT" } else { "ROLLBACK" })
             .map_err(error);
         self.projection_batch = false;
+        if commit && result.is_ok() {
+            self.projection_changes
+                .store(self.conn.total_changes(), Ordering::Release);
+        }
         if result.is_err() {
             self.failed = true;
             if !self.conn.is_autocommit() {
@@ -496,6 +505,10 @@ impl Database {
             tx.commit().map_err(error)?;
             Ok(value)
         })();
+        if result.is_ok() {
+            self.projection_changes
+                .store(self.conn.total_changes(), Ordering::Release);
+        }
         // Only checkpoint roots need FULL SQLite persistence. Normal query
         // projections already have complete durable bytes in the journal.
         let restored = if durable {
