@@ -21,19 +21,21 @@ The default campaign runs three checked trials per case, plus warmups. It covers
 Core fanout/wildcards/queues/request-reply, live Core on a stream, sequential and
 concurrent durable publishers, pull consumers, ACK-and-next, dedup, retention and
 mixed workloads, including a 1000-message outstanding ACK window. A second campaign runs four concurrent cases at 20,000 messages and a 10,000-message limits-retention consumer case.
-Separate three- and five-voter campaigns run all 14 JetStream cases at 1,000
-publications per trial against both servers. There are 513 measured trials at the
+Separate three- and five-voter campaigns run all 14 JetStream cases at 3,000
+publications per trial against both servers, covering repeated checkpoint and WAL
+reuse cycles. There are 513 measured trials at the
 default settings: 270 standard, 75 larger and 168 clustered.
 A manual CI run can set trials (1–10) and nats_ref (branch, tag or SHA).
 The manual `Cluster benchmark targets` workflow runs just the two clustered
-campaigns on a fresh runner and uploads their raw trials and target report. It
+campaigns on a fresh runner and uploads their raw trials and target report; its
+`messages` input controls publications per trial. It
 requires at least 90% of NATS always throughput and at most 110% of its p99 for
 every case at both voter counts, using medians of at least three matched checked
 trials. Core-on-stream uses durable ACK p99; Fetch(1) uses the full Fetch/ACK cycle
 p99. One-trial runs cannot certify the target. Main CI also preserves this report
 with the published benchmark artifacts.
 The focused workflow also captures CPU stacks and disk/syscall summaries across
-all three voters. Separate publication-phase gates exclude setup and payload
+all three voters, including per-file sync latency distributions. Separate publication-phase gates exclude setup and payload
 validation; these diagnostic timings never count toward the performance target.
 
 ## Storage modes
@@ -125,7 +127,7 @@ for voters in 3 5; do
   python3 scripts/benchmark.py --screech target/release/screech-server \
     --nats bin/nats-server --driver bin/bench-driver \
     --nats-commit "$(cat results/nats-commit.txt)" \
-    --cluster-voters "$voters" --trials 3 --output "results/cluster-$voters.json"
+    --cluster-voters "$voters" --cluster-messages 3000 --trials 3 --output "results/cluster-$voters.json"
 done
 python3 scripts/render_benchmarks.py \
   --input 'Local standard' results/standard.json \

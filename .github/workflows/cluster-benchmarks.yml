@@ -9,6 +9,10 @@ on:
         description: Checked trials per case (1–10; certification requires at least 3)
         type: number
         default: 3
+      messages:
+        description: Publications per trial; 3000 exercises repeated checkpoint cycles
+        type: number
+        default: 3000
       nats_ref:
         description: NATS branch, tag or commit (resolved SHA is recorded)
         type: string
@@ -24,6 +28,7 @@ jobs:
     timeout-minutes: 30
     env:
       TRIALS: ${{ inputs.trials || '3' }}
+      MESSAGES: ${{ inputs.messages || '3000' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -61,7 +66,7 @@ jobs:
             python3 scripts/benchmark.py --screech target/release/screech-server \
               --nats bin/nats-server --driver bin/bench-driver \
               --nats-commit "$(cat results/nats-commit.txt)" \
-              --cluster-voters "$voters" --trials "$TRIALS" \
+              --cluster-voters "$voters" --cluster-messages "$MESSAGES" --trials "$TRIALS" \
               --output "results/cluster-$voters.json"
           done
       - name: Verify throughput and p99 targets for every clustered case

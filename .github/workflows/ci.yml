@@ -148,7 +148,7 @@ jobs:
             python3 scripts/benchmark.py --screech target/release/screech-server \
               --nats bin/nats-server --driver bin/bench-driver \
               --nats-commit "$(cat results/nats-commit.txt)" \
-              --cluster-voters "$voters" --trials "$TRIALS" \
+              --cluster-voters "$voters" --cluster-messages 3000 --trials "$TRIALS" \
               --output "results/cluster-$voters.json"
           done
       - name: JetStream performance target reports
