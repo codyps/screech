@@ -340,6 +340,7 @@ impl Database {
         self.snapshot_position = (index, snapshot.get_metadata().term, image.sequence);
         self.seal()?;
         self.accepted_tip = Some((last, last_term));
+        self.membership_revision = self.membership_revision.wrapping_add(1);
         crate::fault::point("after_cluster_snapshot_install");
         Ok(())
     }
@@ -756,6 +757,7 @@ mod tests {
             .unwrap();
         let snapshot = donor.snapshot().unwrap();
         let mut receiver = Database::open(&dir.path().join("receiver"), &config(2), true).unwrap();
+        let revision = receiver.membership_revision;
         let hard = HardState {
             term: 1,
             vote: 2,
@@ -770,6 +772,7 @@ mod tests {
             .install_snapshot(&bad, Some(&hard), &[], false)
             .is_err());
         assert_eq!(receiver.last().unwrap(), 0);
+        assert_eq!(receiver.membership_revision, revision);
         receiver.incarnation = [9; 16];
         assert!(receiver
             .install_snapshot(&snapshot, Some(&hard), &[], false)
@@ -779,6 +782,7 @@ mod tests {
             .install_snapshot(&snapshot, Some(&hard), &[], false)
             .unwrap();
         assert_eq!(receiver.hard().unwrap().vote, 2);
+        assert_eq!(receiver.membership_revision, revision + 1);
         assert_eq!(receiver.content(key).unwrap().unwrap().payload, "retained");
         let mut vote_rollback = hard.clone();
         vote_rollback.vote = 1;

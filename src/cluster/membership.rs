@@ -277,6 +277,7 @@ pub(crate) fn apply_configuration(
                 crate::fault::point("before_cluster_membership_apply");
                 Ok(())
             })?;
+            db.membership_revision = db.membership_revision.wrapping_add(1);
             crate::fault::point("after_cluster_membership_apply");
         }
     }

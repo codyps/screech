@@ -40,6 +40,8 @@ pub(crate) struct Database {
     pub snapshot_position: (u64, u64, u64),
     entries_bytes: u64,
     accepted_tip: Option<(u64, u64)>,
+    // Actor-local invalidation token, never a durability or recovery witness.
+    pub(super) membership_revision: u64,
     projection_batch: bool,
     pub(super) projection_changes: Arc<AtomicU64>,
     _lock: File,
@@ -200,6 +202,7 @@ impl Database {
             snapshot_position: (0, 0, 0),
             entries_bytes: 0,
             accepted_tip: None,
+            membership_revision: 0,
             projection_batch: false,
             projection_changes: Arc::new(AtomicU64::new(0)),
             gate: Arc::new(Mutex::new(())),

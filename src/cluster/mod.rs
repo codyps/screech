@@ -960,9 +960,9 @@ async fn run_runtime(
             // are transport hints only; membership still gates every message.
             let mut routes = BTreeMap::new();
             let mut tick = Instant::now();
-            let (mut policy, mut policy_index) = {
+            let (mut policy, mut policy_index, mut policy_revision) = {
                 let db = node.store().db.lock().unwrap();
-                (db.sender_policy()?, db.conf_index()?)
+                (db.sender_policy()?, db.conf_index()?, db.membership_revision)
             };
             loop {
                 let mut input = rx.recv_timeout(Duration::from_millis(20));
@@ -1076,7 +1076,7 @@ async fn run_runtime(
                         reply,
                     }) => {
                         if term != node.raft.term
-                            || configuration != node.store().db.lock().unwrap().conf_index()?
+                            || configuration != policy_index
                             || session != actor_session.load(Ordering::Acquire)
                             || actor_config
                                 .slot_for(
@@ -1095,7 +1095,7 @@ async fn run_runtime(
                     Ok(Input::Read {term,configuration,session,reply}) => {
                         if node.raft.state != StateRole::Leader
                             || node.raft.term != term
-                            || configuration != node.store().db.lock().unwrap().conf_index()?
+                            || configuration != policy_index
                             || session != actor_session.load(Ordering::Acquire)
                         {
                             let _ = reply.send(Err(error("not current leader")));
@@ -1118,7 +1118,7 @@ async fn run_runtime(
                     }) => {
                         if node.raft.state != StateRole::Leader
                             || node.raft.term != term
-                            || configuration != node.store().db.lock().unwrap().conf_index()?
+                            || configuration != policy_index
                             || (!activate && session != actor_session.load(Ordering::Acquire))
                             || (activate && !data.is_empty())
                         {
@@ -1160,10 +1160,14 @@ async fn run_runtime(
                 pump_ready(node, &mut pending, &out, &routes, completed)?;
                 {
                     let db = node.store().db.lock().unwrap();
-                    let index = db.conf_index()?;
-                    if index != policy_index {
+                    // Only configuration application and snapshot installation
+                    // can change this policy. Check their in-memory token on
+                    // ordinary heartbeats, avoiding a SQLite read transaction.
+                    // Refresh after EACH input, before authenticating the next.
+                    if db.membership_revision != policy_revision {
                         policy = db.sender_policy()?;
-                        policy_index = index;
+                        policy_index = db.conf_index()?;
+                        policy_revision = db.membership_revision;
                     }
                 }
                 if policy.replacement_pending() {
@@ -1554,6 +1558,7 @@ mod tests {
         sim.nodes[0].campaign().unwrap();
         sim.settle(None);
         let path = dir.path().join("1");
+        let initial_revision = sim.nodes[0].store().db.lock().unwrap().membership_revision;
         {
             let db = sim.nodes[0].store().db.lock().unwrap();
             db.conn
@@ -1576,6 +1581,10 @@ mod tests {
             )
             .unwrap();
         sim.settle(None);
+        assert_eq!(
+            sim.nodes[0].store().db.lock().unwrap().membership_revision,
+            initial_revision + 1
+        );
         sim.nodes[0]
             .propose_conf_change(
                 vec![],
@@ -1591,11 +1600,19 @@ mod tests {
             )
             .unwrap();
         sim.settle(None);
+        assert_eq!(
+            sim.nodes[0].store().db.lock().unwrap().membership_revision,
+            initial_revision + 2
+        );
         assert!(!membership::step_down_removed(&mut sim.nodes[0]));
         sim.nodes[0]
             .propose_conf_change(vec![], ConfChangeV2::default())
             .unwrap();
         sim.settle(None);
+        assert_eq!(
+            sim.nodes[0].store().db.lock().unwrap().membership_revision,
+            initial_revision + 3
+        );
         assert_eq!(sim.nodes[0].raft.state, StateRole::Follower);
         assert!(!membership::step_down_removed(&mut sim.nodes[0]));
         let index = sim.nodes[0]
@@ -1632,12 +1649,17 @@ mod tests {
                 let db = sim.nodes[0].store().db.lock().unwrap();
                 (db.last().unwrap(), db.hard().unwrap(), db.view().unwrap())
             };
+            let revision = sim.nodes[0].store().db.lock().unwrap().membership_revision;
             let rx = sim.quorum_read(0, b"partitioned-read".to_vec());
             sim.settle(Some(1));
             assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
             sim.ticks(3, None);
             assert_eq!(rx.try_recv().unwrap().unwrap(), before.2);
             let db = sim.nodes[0].store().db.lock().unwrap();
+            assert_eq!(
+                db.membership_revision, revision,
+                "quorum reads changed membership policy"
+            );
             assert_eq!(
                 (db.last().unwrap(), db.hard().unwrap(), db.view().unwrap()),
                 before
