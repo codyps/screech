@@ -259,7 +259,7 @@ python3 tools/jepsen/cluster_vm.py \
   --runtime results/jepsen-runtime/runtime.json \
   --output results/jepsen-inflight-five --nodes 5 \
   --scenarios vm-active-write,vm-active-flush,vm-torn,vm-eio-write,vm-eio-flush \
-  --time-limit 90 --final-time-limit 300
+  --time-limit 90 --final-time-limit 600 --timeout 5400
 ```
 
 These schedules automatically attach a disposable controller-side
@@ -270,6 +270,9 @@ FLUSH/FUA replies follow host `fsync`. A power cut discards the cache. The backe
 advertises only READ, WRITE, DISC and FLUSH, supports FUA, and does not synthesize
 filesystem or Screech responses. Other native schedules keep their direct raw disks
 unless selected in the same campaign as an active-I/O schedule.
+Use `--fault-disks` to select these devices explicitly for other native schedules.
+For example, `--fault-disks --scenarios vm-power` checks majority/all-voter cold
+recovery after confirmed writes, discarding every target's volatile device cache.
 
 Each fault chooses the serving leader and at most a minority of voters. The
 remaining quorum's kernels/disks keep running. Both publication and consumer ACK
@@ -461,3 +464,70 @@ under the ignored `results/jepsen-native-three-complete/` and
 `results/jepsen-native-five-complete/` directories. The scope remains independent
 guest power loss on one physical host, with mountable filesystems or provisioned
 replacement volumes and a surviving durable quorum.
+
+## Checked active-I/O runs
+
+The final three- and five-voter campaigns each passed all five active-I/O
+schedules, with one independent VM and volatile NBD device per voter. They used
+one client per voter, a one-cycle/s generator, a 90-second fault phase and up to
+600 seconds for fresh recovery lifecycles and audits. Each client seeds a fixture
+and attempts at most twelve more cycles during faults. Both publication and ACK
+requests were faulted in every scenario.
+
+| Scenario | Three-voter confirmed ACKs | Five-voter confirmed ACKs |
+| --- | ---: | ---: |
+| `vm-active-write` | 105 | 132 |
+| `vm-active-flush` | 100 | 133 |
+| `vm-torn` | 103 | 108 |
+| `vm-eio-write` | 99 | 103 |
+| `vm-eio-flush` | 98 | 106 |
+
+These ten histories preserved 1,087 confirmed ACK responses and 1,112 acknowledged
+publications. All 40 required recovery lifecycles and public-address audits passed,
+including ACK floors, retention, deduplication, consumer recreation and stale ACK
+isolation. Each fault's actual client request ID matched a saved attempt. Before
+each cut, live identities matched the full admitted voter set with no unfinished
+replacement, and the untouched voters formed a majority.
+
+The 20 active faults comprised eight held writes/flushes, four torn writes and
+eight EIO replies. Torn writes persisted exactly 512 bytes; the cold-image hashes
+matched the expected mixture and differed from both the old and full requested
+images. Every EIO had a real NBD error reply and a guest kernel I/O-error record,
+with canaries armed before delivery and later I/O held until power loss. All
+targeted voters recovered through ordinary startup and completed full membership.
+
+Two additional `--fault-disks --scenarios vm-power` campaigns passed majority and
+all-voter cold cuts after confirmed consumer state, preserving 15 confirmed ACKs
+with three voters and 25 with five. These used a 45-second fault phase and a
+240-second final audit window. Every target's volatile device cache was discarded,
+including all devices during each all-voter cut.
+
+Across all twelve histories, 452 attempted cycles recorded 1,127 confirmed ACK
+responses and 1,154 acknowledged publications. All 48 public-address audits and
+twelve final membership/durable-position inspections passed. Each final cluster
+also had a nonzero compacted snapshot index. The 37 grouped cuts, including twelve
+preflights, produced 93 successful cold-boot canary checks. All preserved fsynced
+bytes, lost unsynced overwrites and observed new kernel IDs. The largest measured
+SIGKILL dispatch skew was 0.070 ms. Replay of all twelve histories passed the
+consumer checker and fault/recovery proof checks.
+
+The control suite passed fifteen Python tests and twelve Clojure tests with 108
+assertions. Three-voter LazyFS and direct-ext4 queue baselines also passed, and both
+earlier LazyFS consumer campaigns passed replay. No server changes were required;
+the tested binary SHA-256 matches the earlier campaigns above. The VM/runtime
+versions and physical-host scope are unchanged.
+
+The implementation is `b799e99`, with admitted-quorum/failed-match controls in
+`be7d145`, read-only-remount-safe EIO controls in `96cdddd`, and explicit volatile
+device selection in `c856f27`. Bring-up demonstrated that Linux can remount an
+EIO-affected filesystem read-only before a later canary write. Those attempts were
+rejected; the checked runs use the canary-first delivery gate described above.
+
+Full active histories, proofs, replay reports, images and runtime metadata are in
+the ignored `results/jepsen-inflight-three-final/` and
+`results/jepsen-inflight-five-final/` directories. The simultaneous volatile-device
+cross-checks are in `results/jepsen-inflight-three-device-power/` and
+`results/jepsen-inflight-five-device-power/`. The aggregate proof audit is
+`results/jepsen-inflight-verification.json`. Compatibility artifacts are in
+`results/jepsen-inflight-lazyfs-compatibility/` and
+`results/jepsen-inflight-native-compatibility/`.

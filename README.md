@@ -38,7 +38,8 @@ cluster storage format. The [cluster operations guide](docs/cluster-operations.m
 covers bootstrap, reconnects, failure recovery and current capacity limits.
 The [NATS-derived Jepsen/LazyFS harness](tools/jepsen/README.md) tests clustered
 publication and consumer ACK/lifecycle durability with LazyFS cache loss and
-independent voter-VM power cuts, including simultaneous crashes and damaged disks.
+independent voter-VM power cuts, including simultaneous crashes, damaged disks,
+in-flight writes/ACKs, torn writes and disk I/O errors.
 
 The binary prints `LISTEN host:port` after binding; `--port 0` selects an available
 port. SIGINT/SIGTERM cancel connection waits and bound output/runtime shutdown,

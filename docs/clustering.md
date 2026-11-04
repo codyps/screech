@@ -489,6 +489,20 @@ The completed three/five-voter native matrices passed all ten histories, preserv
 282 confirmed ACK responses across 28 grouped power cuts and 18 injected
 damaged-voter replacements. Both saved campaigns also passed checker replay.
 
+The active-I/O extension adds an NBD device under each guest filesystem. It holds
+real writes/flushes without a reply, persists only part of a database/WAL block
+request, or returns EIO to the guest. These cuts keep a fully admitted quorum's
+machines and durable disks running and stop QEMU without draining the pending I/O.
+Client request IDs, cold disk hashes, kernel errors, membership and fresh recovery
+lifecycles make the fault boundary and recovery obligations explicit. Correctly
+completed flushes on the surviving quorum remain durable in this model.
+The final three/five-voter active-I/O matrices passed all ten histories, preserving
+1,087 confirmed ACK responses across held writes/flushes, torn writes and write/flush
+EIO. Two volatile-device majority/all-voter cold-power cross-checks also passed,
+preserving another 40 confirmed ACKs. All twelve histories passed replay, including
+their fault controls and automatic-recovery checks; the harness README records the
+exact schedules, counts and scope.
+
 The assurance limits remain explicit. A healthy surviving quorum is required for
 repair; a consistent rollback of all local files including the watermark cannot be
 diagnosed locally. This review does not certify arbitrary storage/controller faults,

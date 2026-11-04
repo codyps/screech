@@ -150,6 +150,33 @@ contain the full final proof; replay revalidates it and exports the per-case JSO
 No host root, TAP interface or bootstrap/join/repair command is
 required. `check.py` also runs the Python control tests alongside Clojure checkers.
 
+For power loss at active block-I/O boundaries, use the NBD-backed schedules:
+
+```sh
+python3 tools/jepsen/cluster_vm.py \
+  --runtime results/jepsen-runtime/runtime.json \
+  --output results/jepsen-inflight-five --nodes 5 \
+  --scenarios vm-active-write,vm-active-flush,vm-torn,vm-eio-write,vm-eio-flush \
+  --time-limit 90 --final-time-limit 600 --timeout 5400
+```
+
+Each schedule must fault both a publication and a consumer ACK request. Held
+writes/flushes remain uncompleted when QEMU is stopped and killed without an I/O
+drain. Torn requests persist only the first 512 bytes and must leave a mixed cold
+disk image; EIO requests must produce both an NBD error reply and a guest kernel
+I/O error. Database/WAL write faults use allocated file extents observed without
+syncing. The device honors successful FLUSH/FUA with host fsync; power loss drops
+its volatile cache. Before each fault, all live identities must be fully admitted,
+with no joint replacement in progress, and the untouched voters must form a quorum.
+Proof IDs must match actual client attempts. After healing, every public address
+must complete a fresh lifecycle cycle and audit earlier confirmed ACKs and payloads.
+Unmatched faults, late request notifications, missing recovery cycles or ineffective
+disk faults fail the controls. Full proofs are retained in each case's convergence
+JSON and Jepsen history.
+EIO delivery waits for canary arming, then later device requests stay pending until
+the cut. This handles a Linux read-only remount without writing to the failed
+filesystem after the error or silently draining its volatile data.
+
 Saved consumer histories can be checked again with:
 
 ```sh
