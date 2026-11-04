@@ -268,24 +268,35 @@ class Cluster:
 
     def active_fault(self, mode, operation, kind):
         assert self.fault_disks
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + 45
         while True:
-            leaders = parallel(lambda vm: (vm.node, vm.call('leader')['leader']), self.vms.values())
-            leader = next((node for node, serving in leaders if serving), None)
-            if leader:
+            try:
+                leaders = parallel(lambda vm: (vm.node, vm.call('leader')['leader']), self.vms.values())
+                leader = next(node for node, serving in leaders if serving)
+                replicas = dict(zip(self.vms, parallel(lambda vm: vm.call('inspect'), self.vms.values())))
+                client = Client(('127.0.0.1', self.vms[leader].client_port), timeout=3)
+                try:
+                    membership = client.request('$JS.API.SCREECH.CLUSTER.STATUS', {})
+                finally:
+                    client.close()
+                assert {r['member'] for r in replicas.values()} == set(membership['voters'])
+                assert len(membership['voters']) == len(self.vms)
+                assert not membership['outgoing'] and not membership['learners'] and membership['replacement'] is None
                 break
-            assert time.monotonic() < deadline, 'no serving leader for active fault'
-            time.sleep(.1)
+            except (OSError, EOFError, AssertionError, RuntimeError, KeyError, StopIteration):
+                assert time.monotonic() < deadline, 'no fully admitted durable quorum before active fault'
+                time.sleep(.2)
         # Target only a minority, including the actual service leader. The other
         # kernels and durable disks stay running throughout the fault and cut.
         targets = [leader] + [n for n in self.vms if n != leader][:len(self.vms)//2-1]
-        members = {n: self.vms[n].call('inspect')['member'] for n in targets}
+        members = {n: replicas[n]['member'] for n in targets}
         extents = self.vms[leader].call('extents')['extents']
         block = self.vms[leader].block
         block.arm(mode, operation, lambda: self.pending_requests(kind), extents)
         assert block.hit.wait(45), f'no real {operation} while {kind} was in flight'
         proof = dict(block.proof, leader=leader, targets=targets, request_kind=kind,
-                     surviving_nodes=[n for n in self.vms if n not in targets])
+                     surviving_nodes=[n for n in self.vms if n not in targets],
+                     membership_before=membership, replicas_before=replicas)
         if mode == 'eio':
             assert block.replied.wait(3), 'EIO reply was not delivered to QEMU'
             proof['reply_sent'] = block.proof['reply_sent']
@@ -393,7 +404,17 @@ class Cluster:
         if op == 'power-damage':
             return self.damage(request['kind'])
         if op == 'active-fault':
-            return self.active_fault(request['mode'], request['operation'], request['kind'])
+            try:
+                return self.active_fault(request['mode'], request['operation'], request['kind'])
+            except Exception:
+                # A failed match must not leave an armed or held device behind
+                # to stall an unrelated future request after the RPC has failed.
+                def cancel(vm):
+                    if vm.block is not None and vm.block.disarm():
+                        vm.stop()
+                parallel(cancel, self.vms.values())
+                self.heal()
+                raise
         if op == 'request-window':
             with self.request_lock:
                 if request['phase'] == 'begin':

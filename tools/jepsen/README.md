@@ -277,8 +277,14 @@ requests must be interrupted in every scenario. Jepsen submits an asynchronous
 NATS request before reporting its open window; completion callbacks close it,
 including completion that races the opening notification. The proof IDs must
 match attempts in the saved consumer history. Observer errors invalidate a history.
+Before each fault, live replica identities must match the complete voter set,
+without learners, outgoing voters or an unfinished replacement. Those identities
+and membership are included in the proof; configured slots alone do not establish
+a surviving quorum. A failed matching attempt disarms its device and cold-restarts
+any device already holding a request, then reports failure rather than leaving a
+latent stall behind.
 Each active schedule injects one fault during publication and one during an ACK.
-The main generator allows up to six additional cycles per client, followed by a
+The main generator allows up to twelve additional cycles per client, followed by a
 required successful recovery lifecycle through every public address and final
 audits of both seeded and interrupted cycles.
 

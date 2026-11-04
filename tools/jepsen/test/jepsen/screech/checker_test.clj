@@ -87,6 +87,8 @@
   (vec (for [[index kind] (map-indexed vector ["publish" "ack"])]
          {:mode "tear" :operation "write" :leader "n1" :targets ["n1"]
           :surviving_nodes ["n2" "n3"] :request_kind kind :cut_index (inc index)
+          :membership_before {:voters [1 2 3] :outgoing [] :learners [] :replacement nil}
+          :replicas_before {:n1 {:member 1} :n2 {:member 2} :n3 {:member 3}}
           :requests [{:id kind :kind kind}] :requests_at_cut [{:id kind :kind kind}]
           :offset 4096 :length 4096 :persisted_bytes 512 :extents [{:physical 4096 :length 4096}]
           :before_sha256 (apply str (repeat 64 "0")) :requested_sha256 (apply str (repeat 64 "1"))
@@ -105,6 +107,9 @@
            [[:io_faults 0 :requests_at_cut] []]
            [[:io_faults 0 :targets] ["n1" "n2"]]
            [[:io_faults 0 :surviving_nodes] ["n1" "n2"]]
+           [[:io_faults 0 :membership_before :learners] [4]]
+           [[:io_faults 0 :membership_before :replacement] {:node 1}]
+           [[:io_faults 0 :replicas_before :n2 :member] 4]
            [[:io_faults 0 :leader] "n3"]
            [[:io_faults 0 :cut_index] 0]
            [[:power_events 1 :voter_threads_paused] true]

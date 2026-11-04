@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import socket
 import struct
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -155,6 +156,53 @@ class Controls(unittest.TestCase):
         self.assertEqual(['new'], [r['id'] for r in cluster.pending_requests('ack')])
         cluster.dispatch({'op': 'request-window', 'phase': 'end', 'id': 'new'})
         self.assertEqual([], cluster.pending_requests('ack'))
+
+    def test_failed_fault_disarms_every_device_recovers_hit_voters_and_remains_a_failure(self):
+        calls = []
+        class Device:
+            def __init__(self, hit): self.hit = hit
+            def disarm(self):
+                calls.append(('disarm', self.hit))
+                return self.hit
+        class Voter:
+            def __init__(self, hit): self.block = Device(hit)
+            def stop(self): calls.append(('stop', self.block.hit))
+        cluster = Cluster.__new__(Cluster)
+        cluster.vms = {'n1': Voter(True), 'n2': Voter(False)}
+        def fail(*_): raise TimeoutError('no match')
+        cluster.active_fault = fail
+        cluster.heal = lambda: calls.append(('heal', True))
+        with self.assertRaisesRegex(TimeoutError, 'no match'):
+            cluster.dispatch({'op': 'active-fault', 'mode': 'hold', 'operation': 'write', 'kind': 'ack'})
+        self.assertEqual({('disarm', True), ('disarm', False), ('stop', True), ('heal', True)}, set(calls))
+
+    def test_active_cut_stops_and_kills_real_qemu_host_process_without_qmp_io_drain(self):
+        class QMP:
+            def command(self, _): raise AssertionError('QMP must not drain active disk I/O')
+            def close(self): pass
+        class Voter:
+            lock = threading.RLock()
+            qmp = QMP()
+            def call(self, op, **payload):
+                self.assertion = payload
+                return {'armed': True, 'boot_id': 'old', 'member': 1, 'server_not_stopped': True}
+            def close_block(self): pass
+        with tempfile.TemporaryDirectory() as temp:
+            voter = Voter()
+            voter.process = subprocess.Popen(['sleep', '30'])
+            cluster = Cluster.__new__(Cluster)
+            cluster.output, cluster.events, cluster.damages, cluster.io_faults = Path(temp), [], [], []
+            cluster.vms = {'n1': voter}
+            try:
+                result = cluster.power_cut(['n1'], active=True, members={'n1': 1})
+                self.assertEqual(-9, voter.process.returncode)
+                self.assertFalse(voter.assertion['pause'])
+                self.assertEqual('host-SIGSTOP-without-I/O-drain', result['event']['pause_mechanism'])
+                self.assertFalse(result['event']['voter_threads_paused'])
+            finally:
+                if voter.process.poll() is None:
+                    voter.process.kill()
+                    voter.process.wait()
 
 
 if __name__ == '__main__':

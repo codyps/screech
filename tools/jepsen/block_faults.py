@@ -66,6 +66,11 @@ class Disk:
             self.hit.clear()
             self.replied.clear()
 
+    def disarm(self):
+        with self.lock:
+            self.rule = None
+            return self.hit.is_set()
+
     def persist(self):
         for offset, data in self.cache:
             self.write_all(offset, data)

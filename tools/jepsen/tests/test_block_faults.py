@@ -75,6 +75,7 @@ class BlockFaults(unittest.TestCase):
         self.disk.arm('hold', 'flush', lambda: [{'id': 'ack-1'}])
         self.client.send(FLUSH)
         self.assertTrue(self.disk.hit.wait(2))
+        self.assertTrue(self.disk.disarm())  # A hit must be power-cancelled, not resumed as success.
         self.assertFalse(self.disk.proof['reply_sent'])
         self.disk.close()
         self.assertEqual(b'o' * 65536, self.path.read_bytes())
@@ -116,6 +117,13 @@ class BlockFaults(unittest.TestCase):
             pending.append({'id': 'ack-1'})
         self.client.send(WRITE, offset=4096, data=b'x' * 4096)
         self.assertTrue(self.disk.hit.wait(2))
+
+    def test_cancelling_an_unmatched_rule_cannot_fault_a_later_request(self):
+        self.disk.arm('eio', 'write', lambda: [{'id': 'ack'}], [{'physical': 0, 'length': 65536}])
+        self.assertFalse(self.disk.disarm())
+        self.client.send(WRITE, data=b'n' * 4096)
+        self.assertEqual((0, b''), self.client.reply())
+        self.assertFalse(self.disk.hit.is_set())
 
 
 if __name__ == '__main__':

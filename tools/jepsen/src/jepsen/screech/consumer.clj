@@ -369,7 +369,7 @@
 (defn workload [opts]
   (let [catalog (atom {})]
     {:initial-generator (gen/each-thread (gen/once {:f :exercise :value {:seed true}}))
-     :generator (gen/each-thread (gen/limit (if (:active-io opts) 6 2) (gen/repeat {:f :exercise})))
+     :generator (gen/each-thread (gen/limit (if (:active-io opts) 12 2) (gen/repeat {:f :exercise})))
      :final-generator (gen/phases
                         (when (:active-io opts)
                           (gen/each-thread (gen/until-ok (gen/repeat {:f :exercise :value {:recovery true}}))))
