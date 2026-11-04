@@ -808,6 +808,11 @@ async fn run_runtime(
     let clients = TcpListener::bind(peer.client).await?;
     let db = Arc::new(Mutex::new(database));
     let (tx, rx) = mpsc::sync_channel(256);
+    let _page_checkpointer = if let Some(path) = db.lock().unwrap().conn.path() {
+        Some(storage::PageCheckpointer::start(path.into(), tx.clone())?)
+    } else {
+        None
+    };
     let (role_tx, role) = watch::channel(Role::default());
     let (stop, stop_rx) = watch::channel(false);
     let incarnation = db.lock().unwrap().incarnation;

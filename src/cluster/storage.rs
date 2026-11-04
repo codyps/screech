@@ -2,10 +2,12 @@
 //! journal. SQLite projects that history with NORMAL transactions between FULL
 //! snapshot roots. Startup replays before the node can vote or expose data.
 use super::{error, Batch, ClusterConfig};
+mod page_checkpoint;
 mod snapshots;
 mod watermark;
 use crate::storage::{Content, ContentKey, Record};
 use fs2::FileExt;
+pub(crate) use page_checkpoint::PageCheckpointer;
 use protobuf::Message;
 use raft::{
     eraftpb::{ConfState, Entry, HardState, Snapshot},
