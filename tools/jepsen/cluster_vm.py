@@ -179,6 +179,7 @@ class Cluster:
         self.damages = []
         self.case = None
         self.case_lock = threading.Lock()
+        self.proof_path = output / 'convergence.json'
 
     def power_cut(self, nodes):
         nodes = list(nodes)
@@ -274,6 +275,9 @@ class Cluster:
                 result = {'converged': True, 'replicas': replicas, 'cluster': status,
                           'independent_vms': True, 'boot_ids': ids, 'power_canaries': canaries,
                           'power_events': self.events, 'disk_damage': self.damages}
+                # Jepsen kills guests before snarfing logs. Preserve the proof on
+                # the controller too: those final guest writes may be unsynced.
+                self.proof_path.write_text(json.dumps(result, indent=2))
                 for node, vm in self.vms.items():
                     vm.call('write', path=f'/data/screech-jepsen/{node}/convergence.json',
                             data=base64.b64encode(json.dumps(result, indent=2).encode()).decode())
@@ -447,6 +451,7 @@ def run(args):
         for spec in sorted((output / 'specs').glob('*.json')):
             directory = output / 'runs' / spec.stem
             directory.mkdir(parents=True)
+            cluster.proof_path = directory / 'convergence.json'
             print('Jepsen independent VMs:', spec.stem, flush=True)
             with (directory / 'controller.log').open('wb') as log:
                 result = subprocess.run([runtime['java'], '-Xmx2g', '-Djava.awt.headless=true', '-cp', classpath,

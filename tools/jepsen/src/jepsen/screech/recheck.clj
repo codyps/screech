@@ -5,6 +5,7 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [jepsen.checker :as checker]
+            [jepsen.screech.cli :as cli]
             [jepsen.screech.consumer :as consumer])
   (:import (java.io PushbackReader)))
 
@@ -27,10 +28,22 @@
                                                   "consumer-lifecycle-" (:scenario opts)))
                               run (first (filter #(re-matches #"\d.*" (.getName %)) (.listFiles store)))
                               _ (assert run (str "Missing history for " stem))
-                              history (read-history (io/file run "history.edn"))]]
+                              history (read-history (io/file run "history.edn"))
+                              nodes (mapv #(str "n" %) (range 1 (inc (:node-count opts))))
+                              native? (= "independent-vms" (:topology opts))
+                              proof (when native?
+                                      (last (keep #(when (and (= :verify (:f %))
+                                                              (get-in % [:value :converged]))
+                                                     (:value %)) history)))
+                              _ (when native?
+                                  (assert (cli/independent-proof? nodes proof)
+                                          (str "Invalid independent-VM proof for " stem))
+                                  (spit (io/file root "runs" stem "convergence.json")
+                                        (json/generate-string proof {:pretty true})))]]
                     {:scenario (:scenario opts)
+                     :independent-vms-verified (when native? true)
                      :results (checker/check (consumer/->Checker)
-                                             {:nodes (mapv #(str "n" %) (range 1 (inc (:node-count opts))))}
+                                             {:nodes nodes}
                                              history {})}))
         original (json/parse-string (slurp (io/file root "results.json")) true)
         passed (and (true? (:passed original)) (seq results) (every? #(true? (get-in % [:results :valid?])) results))
