@@ -1376,6 +1376,14 @@ mod tests {
         let mut sim = Simulation::new(dir.path());
         sim.nodes[0].campaign().unwrap();
         sim.settle(None);
+        let path = dir.path().join("1");
+        {
+            let db = sim.nodes[0].store().db.lock().unwrap();
+            db.conn
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+            std::fs::copy(&path, path.with_extension("before-membership")).unwrap();
+        }
         let change = |id, kind| ConfChangeSingle {
             node_id: id,
             change_type: kind,
@@ -1413,6 +1421,28 @@ mod tests {
         sim.settle(None);
         assert_eq!(sim.nodes[0].raft.state, StateRole::Follower);
         assert!(!membership::step_down_removed(&mut sim.nodes[0]));
+        let index = sim.nodes[0]
+            .store()
+            .db
+            .lock()
+            .unwrap()
+            .conf_index()
+            .unwrap();
+        drop(sim);
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        std::fs::copy(path.with_extension("before-membership"), &path).unwrap();
+        let db = Database::open(&path, &config(1), false).unwrap();
+        assert_eq!(
+            db.conf_index().unwrap(),
+            index,
+            "forgot committed membership"
+        );
+        let conf = db.conf().unwrap();
+        assert!(conf.voters_outgoing.is_empty());
+        assert!(!conf.voters.contains(&1));
+        assert!(conf.voters.contains(&4));
     }
     #[test]
     fn quorum_reads_wait_for_majority_without_appending_or_advancing_durable_history() {

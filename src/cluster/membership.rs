@@ -195,6 +195,10 @@ pub(crate) fn apply_configuration(node: &mut RawNode<LogStorage>, commit: u64) -
     for e in entries {
         if e.get_entry_type() == EntryType::EntryConfChangeV2 {
             let cc = ConfChangeV2::parse_from_bytes(&e.data).map_err(error)?;
+            // The committed configuration must survive losing the SQLite
+            // projection, including a crash before the next ordinary append.
+            // Seal that commit before the new voter set can take effect.
+            node.store().db.lock().unwrap().seal()?;
             let conf = node.apply_conf_change(&cc).map_err(error)?;
             if step_down_removed(node) {
                 // Configuration callbacks can queue leader-only probes. A
