@@ -10,6 +10,7 @@
             [jepsen.tests :as tests]
             [jepsen.screech.db :as db]
             [jepsen.screech.consumer :as consumer]
+            [jepsen.screech.mixed :as mixed]
             [jepsen.screech.nemesis :as nemesis]
             [jepsen.screech.queue :as queue]
             [jepsen.screech.remote :as remote]))
@@ -123,19 +124,23 @@
             canaries (if native?
                        (and (= (count (:nodes test)) (:vm-nodes @(:stats database)))
                             (independent-proof? (:nodes test) proof)
-                            (active-proof? (:nodes test) proof scenario))
+                            (active-proof? (:nodes test) proof scenario)
+                            (mixed/proof? (:nodes test) proof scenario))
                        (= (count (:nodes test)) (:canaries @(:stats database))))
-            required (some-> (if (active-scenarios scenario)
-                               {:active-publish 1 :active-ack 1}
-                               (required-faults scenario)) (assoc :verify 1))
+            required (some-> (cond (active-scenarios scenario) {:active-publish 1 :active-ack 1}
+                                  (mixed/scenarios scenario) {:mixed 1}
+                                  :else (required-faults scenario)) (assoc :verify 1))
             required (or required (throw (ex-info "Unknown fault scenario" {:scenario scenario})))
             faults (every? (fn [[f minimum]] (<= minimum (get @fault-stats f 0))) required)
-            recovered (active-history? (:nodes test) proof scenario history)
+            recovered (and (active-history? (:nodes test) proof scenario history)
+                           (mixed/recovery? (:nodes test) scenario history))
             clears (or native? (= scenario :baseline) (pos? (get @(:stats database) :cache-clears 0)))]
         {:valid? (boolean (and canaries faults recovered clears (pos? acknowledged)))
          :acknowledged acknowledged :lazyfs (when-not native? @(:stats database))
          :native-ext4 (when native? @(:stats database)) :faults @fault-stats
          :required-faults required
+         :mixed (when (mixed/scenarios scenario) {:verified (mixed/proof? (:nodes test) proof scenario)
+                                                  :recovery-cycles-completed recovered})
          :active-io (when (active-scenarios scenario) {:verified (active-proof? (:nodes test) proof scenario)
                                                      :recovery-cycles-completed recovered
                                                      :faults (count (:io_faults proof))})

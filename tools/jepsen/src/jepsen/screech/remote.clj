@@ -15,7 +15,7 @@
     (let [connection ^HttpURLConnection (.openConnection (.toURL (URI. endpoint)))]
       (.setRequestMethod connection "POST")
       (.setConnectTimeout connection 5000)
-      (.setReadTimeout connection 120000)
+      (.setReadTimeout connection (if (= op "mixed-fault") 300000 120000))
       (.setRequestProperty connection "Authorization" (str "Bearer " token))
       (.setDoOutput connection true)
       (with-open [writer (io/writer (.getOutputStream connection))]

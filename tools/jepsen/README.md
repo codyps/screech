@@ -320,6 +320,63 @@ persist the dirty canary. All cuts still require new kernel IDs and the cold-boo
 Recovery uses ordinary voter starts, without removing or editing application files.
 The final `io_faults` proof is retained beside the other convergence evidence.
 
+## Mixed network, power and disk faults
+
+Run the mixed matrix with either three or five independent voters:
+
+```sh
+python3 tools/jepsen/cluster_vm.py \
+  --runtime results/jepsen-runtime/runtime.json \
+  --output results/jepsen-mixed-five --nodes 5 \
+  --scenarios vm-split-bitflip,vm-split-wipe,vm-send-bitflip,vm-send-wipe,vm-receive-bitflip,vm-receive-wipe \
+  --time-limit 30 --final-time-limit 300 --timeout 5400
+```
+
+These scenarios select volatile NBD disks automatically. The Ethernet hub drops
+directed voter-to-voter frames, using the private NIC's fixed MAC to retain policy
+across reboots. `split` drops both directions across a majority/minority boundary;
+`send` drops minority-to-majority traffic, and `receive` drops majority-to-minority
+traffic. The minority includes the original serving leader. Management connections
+stay reachable, and public NATS connections still use the actual cluster gateway.
+Static private-neighbor entries let UDP controls verify the allowed direction of
+one-way links without depending on reverse ARP traffic.
+
+Every case requires a complete admitted voter set before installing its partition.
+Real guest UDP controls must reach every allowed edge and no blocked edge, with
+positive hub forwarding/drop counters. The control repeats after the minority
+reboots, requiring new kernel IDs only on those targets and the same link policy.
+A final control requires every directed edge to work after healing.
+
+The untouched majority must confirm conditional writes before the cut, while the
+minority is off, after its damaged disks restart behind the partition, and after
+healing. Each phase requires two successful rounds. The power cut uses the existing
+thread-pause/cold-boot controls; the other voters keep running. Maintenance boots
+then either corrupt both the active database and WAL when present (`bitflip`) or
+erase the entire store, including identity/watermark files (`wipe`). No voter runs
+while its disk is being damaged. Normal starts and restored links must complete
+automatic membership replacement; recovery uses the retained disk images.
+
+A shared stream exercises `Nats-Expected-Last-Sequence` concurrently through every
+voter's own leader-local service. The witness requires at most one confirmation per
+expected position and consistent confirmed payloads across rounds. Fresh catalog
+creation probes must never succeed in the isolated minority, including on empty
+replacement stores. Successful local and quorum reads must preserve every earlier
+observed committed prefix. This tests the old leader directly during separation.
+After healing, every public address must return every confirmed witness payload.
+The consumer checker separately verifies confirmed ACK floors, retention,
+deduplication, recreation and stale ACK isolation, with a fresh successful lifecycle
+through each public address.
+
+The 30-second main-client scheduling window bounds extra consumer cycles; the
+in-flight composite nemesis may continue beyond it. It has a five-minute control
+deadline and retains conditional-write traffic during the fault and repair phases.
+Recovery cycles and audits start only after it finishes. Full link controls,
+conditional operations, disk mutations and audits are included in the final
+`network_faults` proof and saved Jepsen history. `mixed-progress.json` also retains
+partial evidence when a fault or safety check fails. Replay validates these proofs
+independently. Neither successful role claims nor missing responses establish a
+successful conditional write.
+
 ## Scope
 
 The queue workload derives from the

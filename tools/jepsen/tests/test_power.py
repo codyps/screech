@@ -124,6 +124,21 @@ class Controls(unittest.TestCase):
                 self.assertEqual({str(base), str(wal)}, {f['path'] for f in result['files']})
                 self.assertTrue(all(f['before'] != f['after'] for f in result['files']))
 
+    def test_wipe_records_manifest_removal_and_an_empty_store_without_starting_a_voter(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            store = directory / 'store'
+            store.mkdir()
+            (store / 'db.node-state').write_text('manifest')
+            (store / 'db-wal').write_bytes(b'wal')
+            with patch.multiple(voter_guest, DIRECTORY=directory, MAINTENANCE=True, SERVER=None), \
+                 patch('voter_guest.Path.exists', return_value=True), patch('voter_guest.os.sync'):
+                result = voter_guest.act({'op': 'damage', 'kind': 'wipe'})
+            self.assertTrue(result['store_empty'])
+            self.assertFalse(result['voter_started'])
+            self.assertEqual({str(store/'db.node-state'), str(store/'db-wal')}, set(result['removed_paths']))
+            self.assertEqual([], list(store.iterdir()))
+
     def test_active_arm_never_stops_threads_reads_the_database_or_syncs(self):
         class Process:
             pid = 'self'  # /proc may expose a parent PID namespace in the sandbox.

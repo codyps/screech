@@ -1,5 +1,6 @@
 (ns jepsen.screech.nemesis
   (:require [jepsen.control :as c]
+            [clojure.string :as str]
             [jepsen.db :as db]
             [jepsen.generator :as gen]
             [jepsen.nemesis :as n]
@@ -23,6 +24,8 @@
           value (case (:f op)
                   :heal (heal! test)
                   :power-cut (sd/action test "power-cut" nil {:nodes (vec nodes)})
+                  :mixed (let [[_ topology damage] (str/split (name (:scenario test)) #"-")]
+                           (sd/action test "mixed-fault" nil {:topology topology :damage damage}))
                   (:active-publish :active-ack)
                   (let [[mode operation] (case (:scenario test)
                                            :vm-active-write ["hold" "write"]
@@ -52,7 +55,7 @@
       (assoc op :value value)))
   (teardown! [_ test] (heal! test))
   n/Reflection
-  (fs [_] #{:kill :start :pause :resume :heal :partition :wipe :bitflip :truncate :verify :power-cut :power-bitflip :power-truncate :power-wipe :power-blank :active-publish :active-ack}))
+  (fs [_] #{:kill :start :pause :resume :heal :partition :wipe :bitflip :truncate :verify :power-cut :power-bitflip :power-truncate :power-wipe :power-blank :active-publish :active-ack :mixed}))
 
 (defn op [f nodes] {:type :info :f f :value nodes})
 (defn cycle-for [scenario nodes]
@@ -62,6 +65,8 @@
         b (vec (drop (inc half) nodes))]
     (case scenario
       :baseline [(gen/sleep 5)]
+      (:vm-split-bitflip :vm-split-wipe :vm-send-bitflip :vm-send-wipe :vm-receive-bitflip :vm-receive-wipe)
+      [(gen/sleep 1) (op :mixed nil)]
       (:vm-active-write :vm-active-flush :vm-torn :vm-eio-write :vm-eio-flush)
       [(gen/sleep 1) (op :active-publish nil) (op :heal nil) (gen/sleep 5)
        (op :active-ack nil) (op :heal nil) (gen/sleep 5)]
@@ -82,6 +87,7 @@
 
 (defn generator [scenario nodes]
   (let [schedule (cycle-for scenario nodes)]
-    (if (#{:vm-active-write :vm-active-flush :vm-torn :vm-eio-write :vm-eio-flush} scenario)
+    (if (#{:vm-active-write :vm-active-flush :vm-torn :vm-eio-write :vm-eio-flush
+           :vm-split-bitflip :vm-split-wipe :vm-send-bitflip :vm-send-wipe :vm-receive-bitflip :vm-receive-wipe} scenario)
       (concat schedule (repeat (gen/sleep 5)))
       (cycle schedule))))

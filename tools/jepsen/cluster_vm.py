@@ -25,6 +25,7 @@ from guest import Control
 from vm import REPO, prepare, archive
 sys.path.insert(0, str(REPO / 'scripts'))
 from wire import Client
+from mixed_faults import mixed_fault
 
 
 def parallel(function, values):
@@ -102,8 +103,8 @@ class VM:
             file.truncate(2 * 1024 ** 3)
         subprocess.run([self.owner.runtime['mkfs'], '-q', '-t', 'ext4', '-F', str(self.disk)], check=True)
 
-    def call(self, op, **payload):
-        return rpc(self.control_port, self.owner.token, dict(payload, op=op, node=self.node))
+    def call(self, op, *, rpc_timeout=120, **payload):
+        return rpc(self.control_port, self.owner.token, dict(payload, op=op, node=self.node), timeout=rpc_timeout)
 
     def start(self, maintenance=False):
         with self.lock:
@@ -200,6 +201,7 @@ class Cluster:
         self.closed_requests = set()
         self.request_lock = threading.Lock()
         self.io_faults = []
+        self.network_faults = []
 
     def power_cut(self, nodes, active=False, members=None, request_kind=None, prearmed=None):
         nodes = list(nodes)
@@ -240,6 +242,8 @@ class Cluster:
         event['all_paused_before_kill'] = True
         event['voter_threads_paused'] = not active
         event['pause_mechanism'] = 'host-SIGSTOP-without-I/O-drain' if active else 'QMP-stop'
+        if getattr(self, 'hub', None) is not None:
+            event['network'] = self.hub.snapshot()
         if request_kind is not None:
             event['requests_at_cut'] = self.pending_requests(request_kind)
         dispatched = []
@@ -260,14 +264,14 @@ class Cluster:
 
     def save_events(self):
         (self.output / 'power-events.json').write_text(json.dumps({'cuts': self.events, 'damage': self.damages,
-                                                                'io_faults': self.io_faults}, indent=2))
+                                                                'io_faults': self.io_faults,
+                                                                'network_faults': getattr(self, 'network_faults', [])}, indent=2))
 
     def pending_requests(self, kind):
         with self.request_lock:
             return [dict(r) for r in self.requests.values() if r['kind'] == kind]
 
-    def active_fault(self, mode, operation, kind):
-        assert self.fault_disks
+    def healthy(self):
         deadline = time.monotonic() + 45
         while True:
             try:
@@ -282,10 +286,14 @@ class Cluster:
                 assert {r['member'] for r in replicas.values()} == set(membership['voters'])
                 assert len(membership['voters']) == len(self.vms)
                 assert not membership['outgoing'] and not membership['learners'] and membership['replacement'] is None
-                break
+                return leader, replicas, membership
             except (OSError, EOFError, AssertionError, RuntimeError, KeyError, StopIteration):
                 assert time.monotonic() < deadline, 'no fully admitted durable quorum before active fault'
                 time.sleep(.2)
+
+    def active_fault(self, mode, operation, kind):
+        assert self.fault_disks
+        leader, replicas, membership = self.healthy()
         # Target only a minority, including the actual service leader. The other
         # kernels and durable disks stay running throughout the fault and cut.
         targets = [leader] + [n for n in self.vms if n != leader][:len(self.vms)//2-1]
@@ -331,6 +339,8 @@ class Cluster:
         return proof
 
     def heal(self):
+        if self.hub.blocked:
+            self.hub.partition([])
         parallel(lambda vm: vm.start(), self.vms.values())
         self.save_events()
         return {'restarted': list(self.vms)}
@@ -387,6 +397,8 @@ class Cluster:
                           'independent_vms': True, 'boot_ids': ids, 'power_canaries': canaries,
                           'power_events': self.events, 'disk_damage': self.damages}
                 result['io_faults'] = self.io_faults
+                result['network_faults'] = self.network_faults
+                assert not self.hub.blocked
                 # Jepsen kills guests before snarfing logs. Preserve the proof on
                 # the controller too: those final guest writes may be unsynced.
                 self.proof_path.write_text(json.dumps(result, indent=2))
@@ -410,6 +422,11 @@ class Cluster:
             return self.power_cut(request['nodes'])
         if op == 'power-damage':
             return self.damage(request['kind'])
+        if op == 'mixed-fault':
+            try:
+                return mixed_fault(self, request['topology'], request['damage'])
+            finally:
+                self.heal()
         if op == 'active-fault':
             try:
                 return self.active_fault(request['mode'], request['operation'], request['kind'])
@@ -461,6 +478,7 @@ class Cluster:
                 if cluster_id != self.case:
                     self.case = cluster_id
                     self.events, self.damages, self.io_faults = [], [], []
+                    self.network_faults = []
                     self.requests = {}
                     self.closed_requests = set()
             vm.stop()
@@ -533,6 +551,9 @@ ip link set eth0 up
 ip route add default via 10.0.2.2
 ip address add 10.0.1.${{node#n}}/24 dev eth1
 ip link set eth1 up
+for i in 1 2 3 4 5; do
+  ip neigh replace 10.0.1.$i lladdr 02:00:00:00:01:0$i nud permanent dev eth1
+done
 touch /run/screech-voter-vm
 if [ "$fresh" = 1 ]; then fresh_arg=--fresh-disk; else fresh_arg=; fi
 if [ "$maintenance" = 1 ]; then
@@ -559,7 +580,8 @@ def run(args):
     token_path.chmod(0o600)
     prepare_cluster(args, runtime, output)
     active_scenarios = {'vm-active-write', 'vm-active-flush', 'vm-torn', 'vm-eio-write', 'vm-eio-flush'}
-    fault_disks = args.fault_disks or bool(active_scenarios & set(args.scenarios.split(',')))
+    mixed_scenarios = {f'vm-{network}-{damage}' for network in ('split', 'send', 'receive') for damage in ('bitflip', 'wipe')}
+    fault_disks = args.fault_disks or bool((active_scenarios | mixed_scenarios) & set(args.scenarios.split(',')))
     cluster = Cluster(runtime, output, token, args.nodes, args.memory, fault_disks)
     class Coordinator(Control):
         def dispatch(self, request):
@@ -574,6 +596,7 @@ def run(args):
                 'node-count': args.nodes, 'concurrency': args.nodes * (2 if workload == 'queue' else 1),
                 'rate': args.rate, 'time-limit': args.time_limit, 'final-time-limit': args.final_time_limit,
                 'active-io': scenario in active_scenarios,
+                'mixed-faults': scenario in mixed_scenarios,
                 'binary': '/artifacts/screech-server', 'control-endpoint': endpoint,
                 'client-addresses': {n: f'nats://127.0.0.1:{vm.client_port}' for n, vm in cluster.vms.items()}}
         (output / 'specs' / f'{index:02}-{workload}-{scenario}.json').write_text(json.dumps(spec))

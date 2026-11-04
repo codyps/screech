@@ -15,8 +15,8 @@ if __name__ == '__main__':
                        cwd=REPO / 'tools/jepsen', check=True)
     runtime = json.loads((REPO / 'results/jepsen-runtime/runtime.json').read_text())
     classpath = (REPO / 'results/jepsen-runtime/classpath.txt').read_text().strip()
-    expression = """(require 'jepsen.screech.checker-test 'jepsen.screech.consumer-test)
-    (let [r (clojure.test/run-tests 'jepsen.screech.checker-test 'jepsen.screech.consumer-test)]
+    expression = """(require 'jepsen.screech.checker-test 'jepsen.screech.consumer-test 'jepsen.screech.mixed-test)
+    (let [r (clojure.test/run-tests 'jepsen.screech.checker-test 'jepsen.screech.consumer-test 'jepsen.screech.mixed-test)]
       (shutdown-agents)
       (System/exit (if (zero? (+ (:fail r) (:error r))) 0 1)))"""
     command = [runtime['java'], '-cp', classpath, 'clojure.main']

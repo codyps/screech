@@ -6,6 +6,7 @@
             [clojure.string :as str]
             [jepsen.checker :as checker]
             [jepsen.screech.cli :as cli]
+            [jepsen.screech.mixed :as mixed]
             [jepsen.screech.consumer :as consumer])
   (:import (java.io PushbackReader)))
 
@@ -42,6 +43,9 @@
                                           (str "Invalid active-I/O proof for " stem))
                                   (assert (cli/active-history? nodes proof (keyword (:scenario opts)) history)
                                           (str "Missing active requests or completed recovery cycles for " stem))
+                                  (assert (and (mixed/proof? nodes proof (keyword (:scenario opts)))
+                                               (mixed/recovery? nodes (keyword (:scenario opts)) history))
+                                          (str "Invalid mixed network/disk proof for " stem))
                                   (spit (io/file root "runs" stem "convergence.json")
                                         (json/generate-string proof {:pretty true})))]]
                     {:scenario (:scenario opts)

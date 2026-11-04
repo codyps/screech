@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
 import socketserver
 import sqlite3
 import subprocess
@@ -26,6 +27,8 @@ MAINTENANCE = False
 DIRECTORY = None
 BOOT_ID = None
 FRESH_DISK = False
+NET_RECEIVED = set()
+NET_LOCK = threading.Lock()
 DURABLE = b'durable-canary-v1'
 STABLE = b'stable-before-unsynced-overwrite'
 
@@ -114,6 +117,57 @@ def file_extents():
     return result
 
 
+def network_receiver():
+    connection = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    connection.bind(('0.0.0.0', 9900))
+    while True:
+        data, address = connection.recvfrom(2048)
+        value = data.decode()
+        with NET_LOCK:
+            NET_RECEIVED.add((value, address[0]))
+
+
+def cas_probe(request):
+    """Bypass the public forwarding gateway: exercise this voter's own service."""
+    client = None
+    try:
+        client = Client((f'10.0.1.{NODE[1:]}', 7500), timeout=3)
+        stream = request['stream']
+        if request['action'] == 'create':
+            name = request['name']
+            result = client.request('$JS.API.STREAM.CREATE.' + name,
+                                    {'name': name, 'subjects': [name + '.data'], 'num_replicas': request['replicas'],
+                                     'storage': 'file', 'retention': 'limits'})
+            if result.get('error'):
+                return {'outcome': 'rejected', 'response_error': result['error']}
+            assert result['config']['name'] == name
+            return {'outcome': 'ok', 'created': name}
+        if request['action'] == 'write':
+            payload = request['body'].encode()
+            headers = (f'NATS/1.0\r\nNats-Msg-Id: {request["id"]}\r\n'
+                       f'Nats-Expected-Last-Sequence: {request["expected"]}\r\n\r\n').encode()
+            inbox = client.inbox + '.cas'
+            client.send(f'SUB {inbox} 1\r\nUNSUB 1 1\r\nHPUB {stream}.data {inbox} {len(headers)} {len(headers)+len(payload)}\r\n'.encode()
+                        + headers + payload + b'\r\n')
+            message = client.read_message()
+            if message['status'] is not None:
+                return {'outcome': 'unavailable', 'status': message['status']}
+            result = json.loads(message['payload'])
+            if result.get('error'):
+                return {'outcome': 'rejected', 'response_error': result['error']}
+            assert isinstance(result.get('seq'), int) and not result.get('duplicate'), 'invalid conditional publication ACK'
+            return {'outcome': 'ok', 'seq': result['seq']}
+        result = client.request(f'$JS.API.STREAM.INFO.{stream}', {})
+        if result.get('error'):
+            return {'outcome': 'unavailable', 'response_error': result['error']}
+        return {'outcome': 'ok', 'last_seq': result['state']['last_seq']}
+    except (OSError, EOFError) as error:
+        return {'outcome': 'unknown', 'reason': str(error)}
+    finally:
+        if client is not None:
+            client.close()
+
+
 def act(request):
     assert Path('/run/screech-voter-vm').exists()
     op = request['op']
@@ -128,6 +182,17 @@ def act(request):
         return start()
     if op == 'inspect':
         return inspect()
+    if op == 'cas':
+        return dict(cas_probe(request), service_node=NODE)
+    if op == 'net-send':
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as connection:
+            for target in request['targets']:
+                connection.sendto(f'{request["tag"]}:{NODE}:{target}'.encode(), (f'10.0.1.{target[1:]}', 9900))
+        return {'sent': True}
+    if op == 'net-received':
+        with NET_LOCK:
+            return {'received': [{'tag': value, 'source_ip': ip} for value, ip in sorted(NET_RECEIVED)
+                                 if value.startswith(request['tag'] + ':')], 'boot_id': BOOT_ID}
     if op == 'extents':
         return {'extents': file_extents()}
     if op == 'io-errors':
@@ -177,8 +242,12 @@ def act(request):
         assert MAINTENANCE and SERVER is None
         kind = request['kind']
         mutations = []
+        removed = []
         if kind == 'wipe':
+            removed = [str(path) for path in (DIRECTORY / 'store').iterdir()]
+            assert removed, 'wipe found no voter state'
             damage(DIRECTORY, kind)
+            assert not list((DIRECTORY / 'store').iterdir())
         else:
             _, path = instance()
             # SQLite can reconstruct a damaged base from an intact WAL. Corrupt
@@ -206,7 +275,8 @@ def act(request):
         # This sync persists deliberately injected damage, after the original
         # power cut; the maintenance boot never starts a voter.
         os.sync()
-        return {'injected': kind, 'files': mutations, 'voter_started': False}
+        return {'injected': kind, 'files': mutations, 'voter_started': False,
+                'removed_paths': removed, 'store_empty': kind == 'wipe'}
     if op == 'exec':
         result = subprocess.run(['bash', '-c', request['cmd']], input=request.get('in', ''),
                                 text=True, capture_output=True, timeout=90)
@@ -237,6 +307,7 @@ if __name__ == '__main__':
     NODE, MAINTENANCE, FRESH_DISK = args.node, args.maintenance, args.fresh_disk
     DIRECTORY = ROOT / NODE
     BOOT_ID = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    threading.Thread(target=network_receiver, daemon=True).start()
     if Path('/bootshare/config.json').exists():
         initialize()
         if not MAINTENANCE:
