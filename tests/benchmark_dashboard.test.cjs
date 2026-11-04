@@ -1,6 +1,6 @@
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
-const {summarize, comparison, scope, median, seriesName} = require('../tools/dashboard/dashboard.js');
+const {summarize, comparison, scope, median, seriesName, comparisonServer, defaultBaseline} = require('../tools/dashboard/dashboard.js');
 const trial = (server, value, extra={}) => ({server, scenario:'consume-one-parallel', payload_bytes:128, subscribers:1, publishes:20000, checked:true, p50_us:value, ...extra});
 test('medians use trial percentiles, not a pooled latency distribution', () => {
   const cases = summarize([trial('screech', 100), trial('screech', 9), trial('screech', 11)], 'p50_us');
@@ -61,4 +61,20 @@ test('unsafe durability stays explicit and p99 scopes use the measured boundary'
   assert.match(seriesName('screech-unsafe-ack', 'consume-one'), /UNSAFE ACK/);
   assert.equal(scope({}, 'cycle_p99_us'), 'Fetch(1) through confirmed ACK');
   assert.equal(scope({}, 'durable_p99_us'), 'publish to durable ACK');
+});
+
+
+test('cluster comparisons use matching voter counts and distinct workload groups', () => {
+  assert.equal(defaultBaseline(['screech','nats-default','nats-main']),'nats-main');
+  assert.equal(defaultBaseline(['screech-cluster-5','nats-cluster-5-always']),'nats-cluster-5-always');
+  for(const voters of [3,5]) {
+    const screech=`screech-cluster-${voters}`, nats=`nats-cluster-${voters}-always`;
+    assert.equal(comparisonServer(nats),screech);
+    assert.match(seriesName(screech),new RegExp(`${voters} voters.*FULL`));
+    assert.match(seriesName(nats),new RegExp(`${voters} replicas.*always`));
+  }
+  assert.equal(comparisonServer('nats-main'),'screech');
+  const rows=[trial('screech',1),trial('screech-cluster-3',2,{voters:3,stream_replicas:3}),trial('nats-cluster-3-always',3,{voters:3,stream_replicas:3}),trial('screech-cluster-5',4,{voters:5,stream_replicas:5})];
+  assert.equal(summarize(rows,'p50_us').length,3);
+  assert.equal(summarize(rows,'p50_us')[1].series.size,2);
 });

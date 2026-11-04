@@ -12,11 +12,15 @@
     durable_p99_us: {unit: 'µs', note: 'Lower is better. Median of trial publish-to-durable-ACK p99 values.'},
     cycle_p50_us: {unit: 'µs', note: 'Lower is better. Fetch(1) request through confirmed ACK, including client validation.'},
     durable_p50_us: {unit: 'µs', note: 'Lower is better. Durable publish ACK latency, measured separately from the live Core callback.'},
-    server_cpu_seconds: {unit: 's', note: 'Lower is better. Server CPU includes setup, prefill, validation and teardown, not only the timed workload.'},
-    server_rss_kib: {unit: 'MiB', note: 'Lower is better. Final resident memory; this is not peak RSS.'}
+    server_cpu_seconds: {unit: 's', note: 'Lower is better. Server CPU sums clustered voters and includes setup, prefill, validation and teardown, not only the timed workload.'},
+    server_rss_kib: {unit: 'MiB', note: 'Lower is better. Final resident memory, summed across clustered voters; this is not peak RSS.'}
   };
   const SERIES = {
     screech: ['Screech · FULL', '#087f75'], 'screech-unsafe-ack': ['Screech · UNSAFE ACK durability', '#ad301c'], 'screech-before': ['Screech · prior', '#697782'],
+    'screech-cluster-3': ['Screech · 3 voters · FULL', '#087f75'],
+    'screech-cluster-5': ['Screech · 5 voters · FULL', '#087f75'],
+    'nats-cluster-3-always': ['NATS · 3 replicas · always', '#7060b6'],
+    'nats-cluster-5-always': ['NATS · 5 replicas · always', '#7060b6'],
     'nats-main': ['NATS · always', '#7060b6'], 'nats-default': ['NATS · default 2m', '#a66500'],
     'nats-sync-10ms': ['NATS · 10 ms', '#376dae']
   };
@@ -55,7 +59,7 @@
     const groups = new Map();
     for (const row of rows) {
       if (row.checked !== true) throw Error('Unchecked trial');
-      const key = JSON.stringify([row.scenario, row.payload_bytes, row.subscribers, row.publishes]);
+      const key = JSON.stringify([row.scenario, row.payload_bytes, row.subscribers, row.publishes, row.voters || 1, row.stream_replicas || 1]);
       if (!groups.has(key)) groups.set(key, {key, row, title: CASES[row.scenario] || row.scenario, series: new Map()});
       const group = groups.get(key);
       if (!group.series.has(row.server)) group.series.set(row.server, []);
@@ -66,12 +70,19 @@
       median: median(vs), min: vs.length ? Math.min(...vs) : null, max: vs.length ? Math.max(...vs) : null, trials: vs.length
     }]))}));
   }
+  function comparisonServer(baseline) {
+    const clustered = baseline.match(/^(?:nats|screech)-cluster-([35])/);
+    return clustered ? `screech-cluster-${clustered[1]}` : 'screech';
+  }
+  function defaultBaseline(ids) {
+    return ids.includes('nats-main') ? 'nats-main' : ids.find(id => id.startsWith('nats-')) || ids[0];
+  }
   function comparison(value, base, higher) {
     if (value === null || base === null || value <= 0 || base <= 0) return null;
     const factor = higher ? value / base : base / value;
     return {factor, better: factor >= 1, text: factor >= 1 ? `${factor.toFixed(2)}× ${higher ? 'throughput' : 'lower'}` : `${(1 / factor).toFixed(2)}× ${higher ? 'less throughput' : 'higher'}`};
   }
-  const api = {METRICS, median, scope, summarize, comparison, seriesName};
+  const api = {METRICS, median, scope, summarize, comparison, comparisonServer, defaultBaseline, seriesName};
   if (typeof module !== 'undefined') module.exports = api;
   if (!root.document) return;
   const $ = id => document.getElementById(id), data = root.BENCHMARK_DATA;
@@ -111,7 +122,7 @@
       input.addEventListener('change', () => { if (input.checked) state.visible.add(id); else state.visible.delete(id); render(); });
       label.append(input, document.createTextNode(name)); $('servers').append(label);
     }
-    if (!ids.includes(state.baseline)) state.baseline = ids.includes('nats-main') ? 'nats-main' : ids[0];
+    if (!ids.includes(state.baseline)) state.baseline = defaultBaseline(ids);
     $('baseline').value = state.baseline;
   }
   function render() {
@@ -127,14 +138,16 @@
     for (const g of groups) {
       const r = g.row, selected = [...g.series].filter(([id]) => state.visible.has(id));
       const card = el('article', undefined, 'case'), top = el('div', undefined, 'case-top'); top.append(el('h2', g.title));
-      const own = g.series.get('screech'), base = g.series.get(state.baseline);
+      const ownId = comparisonServer(state.baseline);
+      const own = g.series.get(ownId), base = g.series.get(state.baseline);
       const cmp = comparison(own ? own.median : null, base ? base.median : null, meta.higher);
-      if (cmp && state.baseline !== 'screech') {
-        const badge = el('span', cmp.text, `badge${cmp.better ? '' : ' slower'}`); badge.title = `Screech vs ${seriesName(state.baseline,r.scenario)}`; top.append(badge);
+      if (cmp && state.baseline !== ownId) {
+        const badge = el('span', cmp.text, `badge${cmp.better ? '' : ' slower'}`); badge.title = `${seriesName(ownId,r.scenario)} vs ${seriesName(state.baseline,r.scenario)}`; top.append(badge);
       }
       const clients = r.consumer_connections !== undefined ? ` · ${r.publishers} publishers · ${r.consumer_connections} consumers · ${r.streams || 1} stream(s)` : coreOnly(r.scenario) || r.scenario === 'core-stream' ? ` · ${r.subscribers} subscriber(s)` : '';
       const topology = r.core_subjects !== undefined ? ` · ${nf.format(r.core_subjects)} subject(s) · ${nf.format(r.unused_wildcards)} nonmatching wildcard subscriptions per subscriber` : '';
-      const details = `${nf.format(r.payload_bytes)} B · ${nf.format(r.publishes)} publishes${clients}${topology}`;
+      const replication = r.voters > 1 ? ` · ${r.voters} voters · R${r.stream_replicas} streams and consumers · one host` : '';
+      const details = `${nf.format(r.payload_bytes)} B · ${nf.format(r.publishes)} publishes${clients}${topology}${replication}`;
       card.append(top, el('p', details, 'case-details'));
       const max = Math.max(...selected.map(([,s]) => s.median || 0), 1);
       for (const [id, s] of selected) {

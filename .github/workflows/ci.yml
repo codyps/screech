@@ -93,7 +93,7 @@ jobs:
     name: Checked NATS comparisons
     needs: test
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       TRIALS: ${{ inputs.trials || '3' }}
     steps:
@@ -124,6 +124,7 @@ jobs:
           cargo build --release --locked
           go -C upstream build -o "$GITHUB_WORKSPACE/bin/nats-server" .
           go -C tools/bench build -o "$GITHUB_WORKSPACE/bin/bench-driver" .
+          go -C tools/bench test .
           git -C upstream rev-parse HEAD > results/nats-commit.txt
       - name: Standard cases · FULL, always, 10 ms, default
         run: |
@@ -139,6 +140,15 @@ jobs:
             --nats-commit "$(cat results/nats-commit.txt)" \
             --nats-default --nats-sync-interval 10ms --screech-unsafe-ack --trials "$TRIALS" \
             --scale-only --output results/concurrent.json
+      - name: Clustered JetStream cases · 3 and 5 voters
+        run: |
+          for voters in 3 5; do
+            python3 scripts/benchmark.py --screech target/release/screech-server \
+              --nats bin/nats-server --driver bin/bench-driver \
+              --nats-commit "$(cat results/nats-commit.txt)" \
+              --cluster-voters "$voters" --trials "$TRIALS" \
+              --output "results/cluster-$voters.json"
+          done
       - name: JetStream performance target reports
         run: |
           python3 scripts/check_jetstream_targets.py --standard results/standard.json --concurrent results/concurrent.json --server screech --minimum-trials "$TRIALS" --report-only --output results/jetstream-full-targets.json
@@ -180,6 +190,8 @@ jobs:
           python3 scripts/render_benchmarks.py \
             --input 'CI · standard cases' results/standard.json \
             --input 'CI · larger JetStream cases' results/concurrent.json \
+            --input 'CI · cluster · 3 voters' results/cluster-3.json \
+            --input 'CI · cluster · 5 voters' results/cluster-5.json \
             --output _site --revision "$GITHUB_SHA" \
             --repository "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
             --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
