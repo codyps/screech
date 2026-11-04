@@ -315,7 +315,7 @@ class Cluster:
             block.error_release.set()
             assert block.replied.wait(3), 'EIO reply was not delivered to QEMU'
             proof['reply_sent'] = block.proof['reply_sent']
-            proof['subsequent_io_held'] = block.proof['subsequent_io_held']
+            proof['subsequent_io_failed'] = block.proof['subsequent_io_failed']
             deadline = time.monotonic() + 5
             while True:
                 observed = self.vms[leader].call('io-errors')

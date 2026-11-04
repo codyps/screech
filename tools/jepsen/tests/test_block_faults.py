@@ -96,7 +96,7 @@ class BlockFaults(unittest.TestCase):
         with self.assertRaises(socket.timeout):
             self.client.reply()
 
-    def test_eio_delivery_waits_for_canary_arming_and_then_prevents_further_io_until_power_loss(self):
+    def test_eio_delivery_waits_for_canary_arming_and_then_fails_all_io_without_persisting(self):
         for operation, name in [(READ, 'read'), (WRITE, 'write'), (FLUSH, 'flush')]:
             self.disk.arm('eio', name, lambda: [{'id': 'request-1'}], [{'physical': 0, 'length': 65536}])
             fields = {'data': b'n' * 4096} if operation == WRITE else {'length': 4096} if operation == READ else {}
@@ -110,11 +110,12 @@ class BlockFaults(unittest.TestCase):
             self.assertEqual((errno.EIO, b''), self.client.reply(4096 if operation == READ else 0))
             self.assertTrue(self.disk.replied.wait(2))
             self.assertTrue(self.disk.proof['reply_sent'])
-            self.assertTrue(self.disk.proof['subsequent_io_held'])
-            self.client.send(operation, **fields)
-            self.client.socket.settimeout(.05)
-            with self.assertRaises(socket.timeout):
-                self.client.reply()
+            self.assertTrue(self.disk.proof['subsequent_io_failed'])
+            for subsequent in (WRITE, FLUSH, READ):
+                args = {'data': b'x' * 4096} if subsequent == WRITE else {'length': 4096} if subsequent == READ else {}
+                self.client.send(subsequent, **args)
+                self.assertEqual((errno.EIO, b''), self.client.reply(4096 if subsequent == READ else 0))
+            self.assertEqual(b'o' * 4096, self.path.read_bytes()[:4096])
             self.client.socket.close()
             self.disk.close()
             self.disk = Disk(self.path)

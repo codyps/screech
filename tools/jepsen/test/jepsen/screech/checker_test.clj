@@ -123,6 +123,10 @@
                                             :error_after_canary true :subsequent_io_held true
                                             :guest_errors ["I/O error, dev vda"])) %))]
     (is (true? (cli/active-proof? nodes proof :vm-eio-flush)))
+    (let [persistent (update proof :io_faults
+                             #(mapv (fn [f] (assoc f :subsequent_io_held false :subsequent_io_failed true)) %))]
+      (is (true? (cli/active-proof? nodes persistent :vm-eio-flush)))
+      (is (false? (cli/active-proof? nodes (assoc-in persistent [:io_faults 0 :subsequent_io_failed] false) :vm-eio-flush))))
     (is (false? (cli/active-proof? nodes (assoc-in proof [:io_faults 0 :errno] 0) :vm-eio-flush)))
     (is (false? (cli/active-proof? nodes (assoc-in proof [:io_faults 0 :reply_sent] false) :vm-eio-flush)))
     (is (false? (cli/active-proof? nodes (assoc-in proof [:io_faults 0 :guest_errors] []) :vm-eio-flush)))

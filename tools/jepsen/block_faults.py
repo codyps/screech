@@ -101,7 +101,10 @@ class Disk:
             if self.dead.is_set():
                 raise EOFError()
             if self.failed:
-                return 0, b'', True  # No later I/O can drain before the cut.
+                # Fail the rest of the device too. Holding later bios can keep
+                # Linux from finishing the failed writeback and reporting EIO
+                # to the voter. No failed write/flush can persist the canary.
+                return errno.EIO, b'', False
             if offset + length > self.size or length > 32 * 1024**2:
                 return errno.EINVAL, b'', False
             if self.rule and NAMES.get(operation) == self.rule[1]:
@@ -188,7 +191,7 @@ class Disk:
                 connection.sendall(struct.pack('!IIQ', 0x67446698, error, cookie) + result)
                 if error == errno.EIO and self.proof and self.proof.get('errno') == errno.EIO:
                     self.failed = True
-                    self.proof['subsequent_io_held'] = True
+                    self.proof['subsequent_io_failed'] = True
                     self.proof['reply_sent'] = True
                     self.replied.set()
 
