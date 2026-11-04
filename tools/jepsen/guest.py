@@ -118,6 +118,9 @@ class Control(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
+    def dispatch(self, request):
+        return act(request)
+
     def do_POST(self):
         if not hmac.compare_digest(self.headers.get('Authorization', ''), 'Bearer ' + self.server.token):
             self.send_error(403)
@@ -125,7 +128,7 @@ class Control(BaseHTTPRequestHandler):
         try:
             length = int(self.headers['Content-Length'])
             assert 0 < length < 16 * 1024 * 1024
-            response = act(json.loads(self.rfile.read(length)))
+            response = self.dispatch(json.loads(self.rfile.read(length)))
         except Exception as error:
             traceback.print_exc()
             response = {'error': str(error), 'type': type(error).__name__}

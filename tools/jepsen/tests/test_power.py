@@ -1,0 +1,107 @@
+"""Fault-driver controls: real sockets and dispatch ordering, no simulated storage."""
+import copy
+import json
+from pathlib import Path
+import socket
+import struct
+import tempfile
+import threading
+import unittest
+from unittest.mock import patch
+
+from cluster_vm import Cluster, check_power_canary
+from ethernet import Hub, receive_exact
+import voter_guest
+
+
+class Controls(unittest.TestCase):
+    def test_reboot_control_rejects_reused_kernel_and_wrong_disk_evidence(self):
+        arm = {'boot_id': 'old'}
+        good = {'boot_id': 'new', 'canary': {'clean': 'durable-canary-v1', 'dirty': 'stable-before-unsynced-overwrite'}}
+        self.assertTrue(check_power_canary(arm, good)['unsynced_lost'])
+        for path, value in [(('boot_id',), 'old'), (('boot_id',), None),
+                            (('canary', 'clean'), 'lost'), (('canary', 'dirty'), 'still-unsynced'), (('canary',), None)]:
+            broken = copy.deepcopy(good)
+            target = broken
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = value
+            with self.assertRaises((AssertionError, TypeError)):
+                check_power_canary(arm, broken)
+
+    def test_recovery_never_recreates_missing_control_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp) / 'n1'
+            with patch.multiple(voter_guest, DIRECTORY=directory, FRESH_DISK=False):
+                with self.assertRaises(AssertionError):
+                    voter_guest.initialize()
+            self.assertFalse((directory / 'synced-canary').exists())
+            self.assertFalse((directory / 'dirty-canary').exists())
+
+    def test_group_sends_every_kill_before_waiting_for_any_exit(self):
+        calls = []
+        lock = threading.Lock()
+        def record(kind, node):
+            with lock:
+                calls.append((kind, node))
+        class Process:
+            def __init__(self, node): self.node = node
+            def poll(self): return None
+            def kill(self): record('kill', self.node)
+            def wait(self, timeout): record('wait', self.node)
+        class Monitor:
+            def __init__(self): self.paused = False
+            def command(self, op):
+                if op == 'stop': self.paused = True
+                return {'status': 'paused' if self.paused else 'running'}
+            def close(self): pass
+        class Voter:
+            def __init__(self, node):
+                self.node, self.lock = node, threading.RLock()
+                self.process, self.qmp = Process(node), Monitor()
+            def call(self, op, **payload):
+                record('arm', self.node)
+                return {'armed': True, 'boot_id': self.node + '-old', 'member': int(self.node[1:])}
+        with tempfile.TemporaryDirectory() as temp:
+            cluster = Cluster.__new__(Cluster)
+            cluster.output, cluster.events, cluster.damages = Path(temp), [], []
+            cluster.vms = {f'n{i}': Voter(f'n{i}') for i in range(1, 6)}
+            result = cluster.power_cut(cluster.vms)
+            self.assertTrue(result['guest_killed'])
+            self.assertEqual(5, sum(kind == 'kill' for kind, _ in calls))
+            first_wait = next(i for i, event in enumerate(calls) if event[0] == 'wait')
+            self.assertTrue(all(kind != 'kill' for kind, _ in calls[first_wait:]))
+            self.assertTrue(result['event']['all_paused_before_kill'])
+            self.assertEqual(set(cluster.vms), set(result['event']['old_boot_ids']))
+            saved = json.loads((Path(temp) / 'power-events.json').read_text())
+            self.assertEqual('SIGKILL', saved['cuts'][0]['signal'])
+            with self.assertRaises(AssertionError):
+                cluster.power_cut(['n1', 'n1'])
+
+    def test_ethernet_frames_survive_fragmented_tcp_and_disconnect(self):
+        hub = Hub()
+        peers = [socket.create_connection(('127.0.0.1', hub.port)) for _ in range(3)]
+        for peer in peers: peer.settimeout(3)
+        try:
+            # Register every connection before transmitting; no guest traffic yet.
+            import time
+            deadline = time.monotonic() + 3
+            while len(hub.peers) != 3:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.001)
+            frame = b'ethernet-payload'
+            packet = struct.pack('!I', len(frame)) + frame
+            for part in [packet[:1], packet[1:3], packet[3:8], packet[8:]]:
+                peers[0].sendall(part)
+            for peer in peers[1:]:
+                self.assertEqual(packet, receive_exact(peer, len(packet)))
+            peers[2].close()
+            peers[0].sendall(packet)
+            self.assertEqual(packet, receive_exact(peers[1], len(packet)))
+        finally:
+            for peer in peers: peer.close()
+            hub.close()
+
+
+if __name__ == '__main__':
+    unittest.main()

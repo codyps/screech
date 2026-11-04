@@ -10,6 +10,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--recheck', type=Path, help='Recheck saved consumer histories in a completed campaign')
     args = parser.parse_args()
+    if not args.recheck:
+        subprocess.run(['python3', '-m', 'unittest', 'discover', '-s', 'tests', '-v'],
+                       cwd=REPO / 'tools/jepsen', check=True)
     runtime = json.loads((REPO / 'results/jepsen-runtime/runtime.json').read_text())
     classpath = (REPO / 'results/jepsen-runtime/classpath.txt').read_text().strip()
     expression = """(require 'jepsen.screech.checker-test 'jepsen.screech.consumer-test)

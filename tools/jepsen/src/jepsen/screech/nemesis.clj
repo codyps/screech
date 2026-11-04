@@ -7,6 +7,7 @@
             [jepsen.screech.db :as sd]))
 
 (defn heal! [test]
+  (when (= "independent-vms" (:topology test)) (sd/action test "heal" nil {}))
   (net/heal! (:net test) test)
   (doseq [node (:nodes test)]
     (db/resume! (:db test) test node)
@@ -21,6 +22,9 @@
           nodes (or (:value op) (:nodes test))
           value (case (:f op)
                   :heal (heal! test)
+                  :power-cut (sd/action test "power-cut" nil {:nodes (vec nodes)})
+                  (:power-bitflip :power-truncate :power-wipe :power-blank)
+                  (sd/action test "power-damage" nil {:kind (subs (name (:f op)) 6)})
                   :verify (sd/action test "verify" nil {:nodes (:nodes test)})
                   :partition (net/drop-all! test (n/complete-grudge [(take 2 (:nodes test)) (drop 2 (:nodes test))]))
                   (:kill :start :pause :resume)
@@ -39,7 +43,7 @@
       (assoc op :value value)))
   (teardown! [_ test] (heal! test))
   n/Reflection
-  (fs [_] #{:kill :start :pause :resume :heal :partition :wipe :bitflip :truncate :verify}))
+  (fs [_] #{:kill :start :pause :resume :heal :partition :wipe :bitflip :truncate :verify :power-cut :power-bitflip :power-truncate :power-wipe :power-blank}))
 
 (defn op [f nodes] {:type :info :f f :value nodes})
 (defn cycle-for [scenario nodes]
@@ -49,6 +53,12 @@
         b (vec (drop (inc half) nodes))]
     (case scenario
       :baseline [(gen/sleep 5)]
+      :vm-power [(gen/sleep 3) (op :power-cut (vec (take (inc half) nodes))) (gen/sleep 2) (op :heal nil)
+                 (gen/sleep 5) (op :power-cut nodes) (gen/sleep 2) (op :heal nil) (gen/sleep 5)]
+      :vm-damage [(gen/sleep 3) (op :power-bitflip nodes) (op :heal nil) (gen/sleep 7)
+                  (op :power-truncate nodes) (op :heal nil) (gen/sleep 7)]
+      :vm-wipe [(gen/sleep 3) (op :power-wipe nodes) (op :heal nil) (gen/sleep 10)]
+      :vm-blank [(gen/sleep 3) (op :power-blank nodes) (op :heal nil) (gen/sleep 10)]
       :power [(gen/sleep 3) (op :kill (take (inc half) nodes)) (gen/sleep 3) (op :heal nil)
               (gen/sleep 3) (op :kill nodes) (gen/sleep 3) (op :heal nil)]
       :pause-kill [(gen/sleep 3) (op :pause a) (gen/sleep 3) (op :kill pivot)

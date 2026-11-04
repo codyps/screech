@@ -23,7 +23,8 @@
                         :when (= "consumer-lifecycle" (:workload opts))
                         :let [stem (str/replace (.getName spec) #"\.json$" "")
                               store (io/file root "runs" stem "store"
-                                             (str "screech-lazyfs-consumer-lifecycle-" (:scenario opts)))
+                                             (str (if (= "independent-vms" (:topology opts)) "screech-vm-" "screech-lazyfs-")
+                                                  "consumer-lifecycle-" (:scenario opts)))
                               run (first (filter #(re-matches #"\d.*" (.getName %)) (.listFiles store)))
                               _ (assert run (str "Missing history for " stem))
                               history (read-history (io/file run "history.edn"))]]

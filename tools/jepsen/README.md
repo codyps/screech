@@ -170,15 +170,92 @@ consumer creation, deletion and recreation, three retention policies and retries
 of publication IDs. They do not cover every consumer option, retention count/age
 limit, stream deletion/recreation or full cross-stream linearizability.
 
+## Independent voter VMs and native power loss
+
+`cluster_vm.py` places each voter in its own QEMU process, kernel, RAM and native
+ext4 disk image. It uses the same Jepsen workloads and consumer checker. It needs
+the same bootstrap/runtime setup as the LazyFS runner, with about 1 GiB of guest
+RAM and two virtual CPUs per voter by default. Host root, Docker, KVM, TAP devices
+and host network changes are unnecessary.
+
+```sh
+python3 tools/jepsen/cluster_vm.py \
+  --runtime results/jepsen-runtime/runtime.json \
+  --output results/jepsen-native-five --nodes 5 \
+  --time-limit 45 --final-time-limit 180
+```
+
+The default workload is `consumer-lifecycle`. Use `--workloads queue` or
+`--workloads queue,consumer-lifecycle` to select queue histories too. The following
+native scenarios are the default matrix:
+
+| Scenario | Fault |
+| --- | --- |
+| `baseline` | Seed and audit consumer fixtures after the power-loss control. |
+| `vm-power` | Simultaneously cut power to a majority, recover, then cut power to all voters and recover. |
+| `vm-damage` | Cut all VMs; flip the active database header on a minority, restart all; later repeat with truncated active databases. |
+| `vm-wipe` | Cut all VMs, erase a minority's entire voter stores including manifests/watermarks, then restart all. |
+| `vm-blank` | Cut all VMs, archive a minority's old disk images and attach newly formatted empty ext4 disks, then restart all. |
+
+A loopback Ethernet hub forwards opaque frames between each VM's private NICs,
+using QEMU's [TCP socket network framing](https://github.com/qemu/qemu/blob/master/net/socket.c).
+Each guest runs the actual TCP/Raft stack. A separate management NIC and stable
+TCP forwarding keep Jepsen controls and public client addresses reachable across
+reboots; no replication or application messages are synthesized. Every voter has
+a distinct kernel boot ID, checked again after recovery.
+
+A group power cut pauses the voter threads without syncing, overwrites a previously
+allocated control file without fsync, then stops all target virtual CPUs through
+QMP. After every target reports paused, the driver sends SIGKILL to every QEMU
+process before waiting for any of them to exit. No guest shutdown, filesystem sync
+or QMP quit occurs before the cut. The dispatch interval must be below 250 ms and
+is recorded in `power-events.json`. All VM disks use `cache=none`.
+
+Before workloads start, a real all-voter cut establishes the fault controls.
+Every reboot must produce a new kernel boot ID, preserve the fsynced canary and
+lose its unsynced overwrite. Recovery must never recreate missing control files;
+only an explicitly fresh, formatted test disk may initialize them. The guests
+suppress periodic writeback and use an ext4 journal commit interval of 600 seconds
+to expose reliance on unsynced data; explicit fsync and disk flush semantics remain
+required. The settings are local to the disposable guest kernels.
+
+Disk mutations happen after the original power loss in a maintenance boot of the
+affected disk. This boot checks the cold-reboot controls and never starts Screech.
+The driver persists the injected file damage before the ordinary voter boot. For
+`vm-blank`, it preserves the original image and provisions an empty replacement.
+At most one of three or two of five stores are damaged, retaining a healthy quorum's
+history. The test records the old identities and requires every damaged slot to
+return as a different admitted voter. All normal starts use the same ordinary
+`--store ... --cluster-config ...` command and the same static slot/address
+configuration. No bootstrap, join or repair command is involved in product recovery.
+
+Final audits verify the confirmed ACK, retention, deduplication and recreation
+obligations through every public node. The independent-node inspection additionally
+requires full membership, no outstanding joint replacement, equal durable positions,
+separate kernels and verified reboot controls for every power cut. A reused kernel,
+missing canary, unverified cut or unfinished voter replacement fails the run.
+
+Artifacts include each VM's serial logs, its final disk, archived replacement disks,
+`boots.json` with QEMU commands/boot IDs, `power-events.json`, normal Jepsen histories,
+per-node canary/convergence records and `results.json`. Consumer histories can be
+replayed with `check.py --recheck` just like LazyFS histories. Use a fresh output
+directory for every campaign. The driver defaults to a one-hour overall deadline;
+`--memory` sets guest MiB per voter and `--timeout` changes that deadline.
+
 ## Scope
 
 The queue workload derives from the
 [NATS Jepsen investigation](https://jepsen.io/analyses/nats-2.12.1); the consumer
 workload adds Screech protocol histories. Neither suite is a full linearizability
-or general exactly-once test. All voters share one guest kernel and backing virtual
-disk. LazyFS models loss of unsynced file data, rather than arbitrary controller
-corruption, coherent rollback of an entire quorum, independent-machine power loss,
-or every filesystem metadata/reordering behavior. These histories are correctness
+or general exactly-once test. The LazyFS runner shares one guest kernel and backing
+virtual disk; the independent-VM runner uses separate guest kernels and block
+images. Both run on one physical host. LazyFS models loss of unsynced file data,
+rather than arbitrary controller
+corruption, coherent rollback of an entire quorum or every filesystem
+metadata/reordering behavior. Native VM power cuts discard each target kernel and
+its page cache; physical-host power loss and storage-controller failures are not
+simulated, and host storage must honor flushes. Disk damage tests require a
+mountable filesystem or a provisioned replacement block volume. These histories are correctness
 checks and are not throughput/latency benchmarks or production certification.
 
 ## Checked queue runs

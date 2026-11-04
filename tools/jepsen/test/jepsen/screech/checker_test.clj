@@ -49,3 +49,32 @@
     (is (true? (:valid? (checker/check power test ack {}))))
     (reset! (:stats database) {:canaries 3})
     (is (false? (:valid? (checker/check power test ack {}))))))
+
+(def power-check {:old_boot_id "old" :new_boot_id "new" :fsynced_preserved true :unsynced_lost true})
+(def power-checks
+  (into {} (for [node nodes] [(keyword node) (assoc power-check :old_boot_id (str "old-" node) :new_boot_id (str "new-" node))])))
+(def vm-proof
+  {:independent_vms true :converged true
+   :boot_ids {:n1 "kernel-1" :n2 "kernel-2" :n3 "kernel-3"}
+   :power_canaries (into {} (for [[node check] power-checks] [node {:verified true :boots 2 :checks [check]}]))
+   :power_events [{:nodes nodes :signal "SIGKILL" :all_paused_before_kill true :dispatch_skew_ms 1
+                   :old_boot_ids (into {} (map (fn [[node check]] [node (:old_boot_id check)]) power-checks))
+                   :verified power-checks}]})
+
+(deftest independent-vm-evidence-must-prove-cold-reboots-and-cache-loss
+  (is (true? (cli/independent-proof? nodes vm-proof)))
+  (doseq [[path value]
+          [[[:boot_ids :n3] "kernel-1"]
+           [[:boot_ids :n3] nil]
+           [[:power_canaries :n2 :boots] 1]
+           [[:power_canaries :n2 :checks] []]
+           [[:power_canaries :n2 :checks 0 :fsynced_preserved] false]
+           [[:power_canaries :n2 :checks 0 :unsynced_lost] false]
+           [[:power_canaries :n2 :checks 0 :new_boot_id] "old-n2"]
+           [[:power_events] []]
+           [[:power_events 0 :signal] "SIGTERM"]
+           [[:power_events 0 :all_paused_before_kill] false]
+           [[:power_events 0 :dispatch_skew_ms] 251]
+           [[:power_events 0 :verified] {:n1 power-check}]
+           [[:power_events 0 :old_boot_ids :n2] "different-kernel"]]]
+    (is (false? (cli/independent-proof? nodes (assoc-in vm-proof path value))) (str path))))

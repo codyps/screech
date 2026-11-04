@@ -20,23 +20,29 @@
                                 :config {:cluster_id (:cluster-id test) :node_id id
                                          :secret (:cluster-secret test) :peers peers
                                          :initial_voters (vec (range 1 (inc (count nodes))))}})
-      (swap! stats update :canaries (fnil inc 0))))
+      (swap! stats update (if (= "independent-vms" (:topology test)) :vm-nodes :canaries) (fnil inc 0))))
   (teardown! [_ test node] (action test "teardown" node {}))
   db/LogFiles
-  (log-files [_ _ node]
+  (log-files [_ test node]
+    (if (= "independent-vms" (:topology test))
+      {(str (node-dir node) "/server.log") "server.log"
+       (str (node-dir node) "/power-canary.json") "power-canary.json"
+       (str (node-dir node) "/convergence.json") "convergence.json"}
     {(str (node-dir node) "/server.log") "server.log"
      (str (node-dir node) "/lazyfs.log") "lazyfs.log"
      (str (node-dir node) "/lazyfs-stdout.log") "lazyfs-stdout.log"
      (str (node-dir node) "/canary.json") "canary.json"
-     (str (node-dir node) "/convergence.json") "convergence.json"})
+     (str (node-dir node) "/convergence.json") "convergence.json"}))
   db/Primary
   (primaries [_ _] [])
-  (setup-primary! [_ test node] (action test "ready" node {:nodes (:nodes test)}))
+  (setup-primary! [_ test node]
+    (action test (if (= "independent-vms" (:topology test)) "preflight" "ready") node {:nodes (:nodes test)}))
   db/Kill
   (kill! [_ test node]
     (let [result (action test "kill" node {})]
-      (assert (:cache_clear_acknowledged result))
-      (swap! stats update :cache-clears (fnil inc 0))
+      (if (= "independent-vms" (:topology test))
+        (do (assert (:guest_killed result)) (swap! stats update :vm-cuts (fnil inc 0)))
+        (do (assert (:cache_clear_acknowledged result)) (swap! stats update :cache-clears (fnil inc 0))))
       result))
   (start! [_ test node] (action test "start" node {}))
   db/Pause
