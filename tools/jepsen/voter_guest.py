@@ -264,9 +264,19 @@ def act(request):
         # overwrite is unsynced; do no sync/shutdown operation before hypervisor kill.
         with (DIRECTORY / 'dirty-canary').open('r+b', buffering=0) as file:
             file.write(request['marker'].encode())
-        states = [p.read_text().split('State:', 1)[1].splitlines()[0].strip()[0]
-                  for p in Path(f'/proc/{SERVER.pid}/task').glob('*/status')] if SERVER is not None and SERVER.poll() is None else []
+        deadline = time.monotonic() + 1
+        while True:
+            states = [p.read_text().split('State:', 1)[1].splitlines()[0].strip()[0]
+                      for p in Path(f'/proc/{SERVER.pid}/task').glob('*/status')] if SERVER is not None and SERVER.poll() is None else []
+            if not states or all(s not in ('T', 't') for s in states):
+                break
+            # The sync-error tracer briefly ptrace-stops individual threads.
+            # Resample; a genuinely stopped voter must still fail this witness.
+            if pause or time.monotonic() >= deadline:
+                break
+            time.sleep(.001)
         return {'boot_id': BOOT_ID, 'member': member, 'armed': True,
+                'thread_states': states,
                 'server_not_stopped': bool(states) and all(s not in ('T', 't') for s in states)}
     if op == 'damage':
         assert MAINTENANCE and SERVER is None

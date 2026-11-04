@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from cluster_vm import Cluster, check_power_canary
 from ethernet import Hub, receive_exact
@@ -157,6 +157,26 @@ class Controls(unittest.TestCase):
             self.assertTrue(proof['server_not_stopped'])
             self.assertEqual(7, proof['member'])
             self.assertEqual(b'x' * len(voter_guest.STABLE), (directory / 'dirty-canary').read_bytes())
+
+    def test_active_cut_retries_transient_trace_stops_but_rejects_stopped_voters(self):
+        for states, expected in [(['t', 'S'], True), (['T', 'T'], False)]:
+            with self.subTest(states=states), tempfile.TemporaryDirectory() as temp:
+                directory = Path(temp)
+                (directory / 'dirty-canary').write_bytes(voter_guest.STABLE)
+                process = Mock(pid=123)
+                process.poll.return_value = None
+                status = Mock()
+                status.read_text.side_effect = [f'State:\t{s} (state)\n' for s in states]
+                with patch.multiple(voter_guest, DIRECTORY=directory, SERVER=process), \
+                     patch('voter_guest.Path.exists', return_value=True), \
+                     patch('voter_guest.Path.glob', return_value=[status]), \
+                     patch('voter_guest.time.monotonic', side_effect=[0, 0, 2]), \
+                     patch('voter_guest.time.sleep'):
+                    result = voter_guest.act(dict(op='arm-power', pause=False, member=7,
+                                                  marker='x' * len(voter_guest.STABLE)))
+                self.assertEqual(expected, result['server_not_stopped'])
+                self.assertEqual([states[-1]], result['thread_states'])
+                process.send_signal.assert_not_called()
 
     def test_request_completion_cannot_be_reopened_by_a_late_begin_notification(self):
         cluster = Cluster.__new__(Cluster)
