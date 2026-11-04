@@ -114,7 +114,12 @@ per-stream replica placement or sharding.
 SQLite WAL FULL atomically persists complete Raft entries and required term/vote
 state before persistence-dependent replication messages. Entries contain application
 transitions and their payloads. Record/content indexes refer into those entries and
-expose only the durably committed prefix. Recovery rebuilds indexes from that prefix,
+expose only the committed prefix. Commit-index notifications and reconstructible
+indexes use SQLite NORMAL transactions; accepted entries, payloads, terms and votes
+always use FULL. Raft permits asynchronous commit-index persistence. A lost commit
+notification cannot remove an accepted payload: the next leader establishes a
+current-term committed prefix before exposing its recovered model.
+Recovery rebuilds indexes from that prefix,
 then reconstructs the model from a validated checkpoint and its committed tail.
 Uncommitted accepted entries remain available to Raft for conflict replacement.
 
@@ -124,8 +129,21 @@ database against this watermark, rejecting rolled-back history even without a
 reachable leader. Missing or corrupt watermarks require quorum repair. A database
 ahead of the watermark is safe to resume after interrupted publication. SQLite is
 the only source of replicated application state; the watermark can only reject a
-store. Atomic watermark publication adds file and directory syncs when the durable
-position changes. Its throughput/latency cost still needs measurement and optimization.
+store. The fence has two fixed-size authenticated records with consecutive
+generations. Both must validate; a torn or invalid record requires quorum repair
+even if the other record is readable. This prevents silently resuming from an older
+vote or accepted-log promise. Each update syncs the changed record before releasing
+persistence-dependent messages. Signed JSON fences upgrade automatically during
+ordinary startup through an atomic file replacement and directory sync; older
+binaries cannot open an upgraded local fence.
+
+Read-only responses use Raft ReadIndex quorum checks, without appending empty log
+entries. A committed mutation supplies the quorum observation for its own reply;
+duplicate replies and empty batches still require ReadIndex. These observations
+are not timed leases and are not reused for newly arriving client requests.
+Raft's persistence-independent leader messages may start follower writes while
+the leader flushes locally. Term/vote changes, follower ACKs and client success
+remain behind their required persistence boundaries.
 
 Checkpoints atomically publish the complete snapshot and reclaim its covered log
 prefix. Snapshot metadata binds the model, event position, term/index, configuration,
@@ -136,7 +154,10 @@ are committed or replaced.
 
 A returning member whose log falls behind the retained prefix receives a complete
 snapshot, then its tail. Transfer uses authenticated chunks, an overall digest,
-explicit byte budgets and a 30-second transfer deadline. No incomplete transfer
+explicit byte budgets and a 30-second transfer deadline. Peer connections persist
+across messages; framing, authentication and incarnation checks apply to every
+message. Failed connections are discarded and Raft retries through a new connection.
+No incomplete transfer
 changes the recovery root. Installation, hard state and covered-prefix deletion
 share a FULL transaction. A donor may purge data or publish a newer image while an
 older transfer is in flight; the already-constructed transfer retains its bytes.

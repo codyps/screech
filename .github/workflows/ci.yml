@@ -76,6 +76,7 @@ jobs:
           python3 scripts/cluster_tests.py target/debug/screech-server --output results/cluster-process-tests.json
           python3 scripts/cluster_recovery_tests.py target/debug/screech-server --output results/cluster-recovery-tests.json
           python3 scripts/cluster_nats_regression_tests.py target/debug/screech-server --shim ./sqlite-io-fault.so --output results/cluster-nats-regressions.json
+          python3 scripts/cluster_quorum_tests.py target/debug/screech-server --output results/cluster-quorum-tests.json
       - name: Unsafe consumer ACK buffering and durable publication fences
         run: python3 scripts/unsafe_ack_tests.py target/debug/screech-server --shim ./sqlite-io-fault.so --output results/unsafe-ack-tests.json
       - name: Retained content exceeds process memory budget
@@ -151,6 +152,7 @@ jobs:
           done
       - name: JetStream performance target reports
         run: |
+          python3 scripts/check_cluster_targets.py --three results/cluster-3.json --five results/cluster-5.json --minimum-trials "$TRIALS" --report-only --output results/cluster-targets.json
           python3 scripts/check_jetstream_targets.py --standard results/standard.json --concurrent results/concurrent.json --server screech --minimum-trials "$TRIALS" --report-only --output results/jetstream-full-targets.json
           python3 scripts/check_jetstream_targets.py --standard results/standard.json --concurrent results/concurrent.json --server screech-unsafe-ack --minimum-trials "$TRIALS" --report-only --output results/jetstream-unsafe-ack-targets.json
       - name: Profile Core forwarding and confirmed consumer ACKs

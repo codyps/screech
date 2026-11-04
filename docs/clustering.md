@@ -46,8 +46,12 @@ hints let new learners reply to replacement leaders before receiving the committ
 routing map in a snapshot. A synced local recovery watermark fences stale vote,
 commit and accepted-log positions even when leader discovery cannot complete.
 Missing/corrupt watermarks force quorum repair; SQLite remains the sole log/data
-authority. Watermark publication adds durability syncs, so throughput and tail
-latency must be measured before production use. Retired or wrong-incarnation senders
+authority. Fixed-size authenticated fence records avoid per-update file allocation
+and directory syncs; either damaged record forces quorum recovery. ReadIndex
+replaces logged read barriers, and persistence-independent leader replication
+overlaps local and follower flushes. Accepted payloads and votes remain FULL;
+reconstructible indexes and commit notifications can persist asynchronously.
+Retired or wrong-incarnation senders
 are fenced before voting; untrustworthy old state never bootstraps the replacement.
 Committed leader removal explicitly steps down the old leader. Application writer
 sessions also fence retiring workers across same-term configuration transitions,

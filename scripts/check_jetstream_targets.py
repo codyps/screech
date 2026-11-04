@@ -8,7 +8,8 @@ from pathlib import Path
 from benchmark import JETSTREAM_CASES, CONCURRENT_CASES
 
 
-def compare(data, expected, server, minimum_trials=3):
+def compare(data, expected, server, minimum_trials=3, baseline='nats-main',
+            minimum_throughput_ratio=1.1, maximum_p99_ratio=0.9):
     rows = data['rows']
     results = []
     for scenario, size, subscribers, count in expected:
@@ -16,7 +17,7 @@ def compare(data, expected, server, minimum_trials=3):
         metric = {'core-stream':'durable_p99_us', 'consume-one':'cycle_p99_us'}.get(scenario, 'p99_us')
         series = {}
         trials = None
-        for label in [server, 'nats-main']:
+        for label in [server, baseline]:
             matched = [r for r in rows if (r['scenario'],r['payload_bytes'],r['subscribers'],r['publishes'],r['server']) == (*key,label)]
             if len(matched) < minimum_trials:
                 raise ValueError(f'{key} {label}: missing checked trials')
@@ -37,12 +38,12 @@ def compare(data, expected, server, minimum_trials=3):
                 'throughput': statistics.median(r['publishes_per_second'] for r in matched),
                 'p99_us': statistics.median(r[metric] for r in matched),
             }
-        own, base = series[server], series['nats-main']
+        own, base = series[server], series[baseline]
         throughput_ratio = own['throughput'] / base['throughput']
         p99_ratio = own['p99_us'] / base['p99_us']
         results.append({'scenario':scenario,'payload_bytes':size,'subscribers':subscribers,'messages':count,'trials':len(trials),
             'latency_metric':metric,'series':series,'throughput_ratio':throughput_ratio,'p99_ratio':p99_ratio,
-            'passed':throughput_ratio >= 1.1 and p99_ratio <= 0.9})
+            'passed':throughput_ratio >= minimum_throughput_ratio and p99_ratio <= maximum_p99_ratio})
     return results
 
 

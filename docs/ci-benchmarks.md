@@ -25,6 +25,13 @@ Separate three- and five-voter campaigns run all 14 JetStream cases at 1,000
 publications per trial against both servers. There are 513 measured trials at the
 default settings: 270 standard, 75 larger and 168 clustered.
 A manual CI run can set trials (1–10) and nats_ref (branch, tag or SHA).
+The manual `Cluster benchmark targets` workflow runs just the two clustered
+campaigns on a fresh runner and uploads their raw trials and target report. It
+requires at least 90% of NATS always throughput and at most 110% of its p99 for
+every case at both voter counts, using medians of at least three matched checked
+trials. Core-on-stream uses durable ACK p99; Fetch(1) uses the full Fetch/ACK cycle
+p99. One-trial runs cannot certify the target. Main CI also preserves this report
+with the published benchmark artifacts.
 
 ## Storage modes
 

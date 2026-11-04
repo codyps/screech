@@ -1,0 +1,72 @@
+name: Cluster benchmark targets
+on:
+  workflow_dispatch:
+    inputs:
+      trials:
+        description: Checked trials per case (1–10; certification requires at least 3)
+        type: number
+        default: 3
+      nats_ref:
+        description: NATS branch, tag or commit (resolved SHA is recorded)
+        type: string
+        default: main
+permissions:
+  contents: read
+concurrency:
+  group: cluster-benchmarks-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  clustered:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      TRIALS: ${{ inputs.trials || '3' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: nats-io/nats-server
+          ref: ${{ inputs.nats_ref || 'main' }}
+          path: upstream
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          shared-key: release
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: upstream/go.mod
+          cache-dependency-path: |
+            tools/bench/go.sum
+            upstream/go.sum
+      - name: Build production servers and checked driver
+        run: |
+          mkdir -p bin results
+          cargo build --release --locked
+          go -C upstream build -o "$GITHUB_WORKSPACE/bin/nats-server" .
+          go -C tools/bench build -o "$GITHUB_WORKSPACE/bin/bench-driver" .
+          go -C tools/bench test .
+          git -C upstream rev-parse HEAD > results/nats-commit.txt
+      - name: Matched three- and five-voter campaigns
+        run: |
+          for voters in 3 5; do
+            python3 scripts/benchmark.py --screech target/release/screech-server \
+              --nats bin/nats-server --driver bin/bench-driver \
+              --nats-commit "$(cat results/nats-commit.txt)" \
+              --cluster-voters "$voters" --trials "$TRIALS" \
+              --output "results/cluster-$voters.json"
+          done
+      - name: Verify throughput and p99 targets for every clustered case
+        run: |
+          python3 scripts/check_cluster_targets.py --three results/cluster-3.json \
+            --five results/cluster-5.json --minimum-trials "$TRIALS" \
+            --output results/cluster-targets.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: cluster-benchmark-results
+          path: results/
