@@ -44,21 +44,27 @@ struct Args {
     cluster_config: Option<std::path::PathBuf>,
 }
 fn main() -> std::io::Result<()> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    let result = runtime.block_on(run());
+    let args = Args::parse();
+    // Cluster disk work already runs on the Raft owner and durable worker.
+    // Keep the network tasks together so peer messages do not need a second
+    // scheduler handoff between socket readiness and the Raft input queue.
+    let mut builder = if args.cluster_config.is_some() {
+        tokio::runtime::Builder::new_current_thread()
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+    };
+    let runtime = builder.enable_all().build()?;
+    let result = runtime.block_on(run(args));
     // Blocking disk operations cannot be cancelled. Do not let a wedged storage
     // thread prevent process shutdown; unacknowledged outcomes recover on restart.
     runtime.shutdown_timeout(Duration::from_secs(2));
     result
 }
-async fn run() -> std::io::Result<()> {
+async fn run(a: Args) -> std::io::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
         .init();
-    let a = Args::parse();
     if let Some(path) = &a.cluster_config {
         let config: screech::cluster::ClusterConfig =
             serde_json::from_slice(&std::fs::read(path)?).map_err(std::io::Error::other)?;
