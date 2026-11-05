@@ -841,7 +841,6 @@ fn dispatch_messages<S: transport::MessageSender>(
         let mut identities = None;
         for message in messages {
             let background = message.get_msg_type() == raft::eraftpb::MessageType::MsgAppend
-                && !message.entries.is_empty()
                 && foreground
                     .as_ref()
                     .is_some_and(|peers| !peers.contains(&message.to));
