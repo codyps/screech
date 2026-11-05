@@ -65,6 +65,11 @@ ReadIndex checks the term of the accepted-journal promise installed after sync;
 it still requires new context-bound quorum replies. Content reads retain an eager
 SQL snapshot and their independent SQL epoch checks. All application completions
 remain staged until the projection transaction, when present, commits.
+Already queued same-term quorum replies, heartbeats and empty append messages
+can complete that transaction after its time budget expires. New entries,
+snapshots and new terms start a later turn. This lets follower commit updates
+join the accepted-entry projection without waiting or exceeding the eight-input
+batch limit.
 
 Connected peer streams can send small authenticated frames directly with a
 nonblocking socket write. A reserved slot in the same bounded writer queue owns

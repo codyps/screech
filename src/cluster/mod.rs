@@ -563,15 +563,19 @@ fn next_batch_input(
 ) -> Option<Input> {
     let input = rx.try_recv().ok()?;
     // A synchronous accepted-journal flush can consume the time budget while
-    // its quorum acknowledgements arrive. Drain those already queued replies
-    // before COMMIT so acceptance and its projection can share one transaction.
-    // Never wait, skip an earlier input, admit another append past the budget,
-    // or carry a new term across this boundary.
-    let quorum_reply = matches!(&input, Input::Message(message, _, _)
-        if message.term == term && matches!(message.get_msg_type(),
+    // quorum replies or the leader's commit notification arrive. Drain those
+    // already queued completions before COMMIT so accepted entries and their
+    // projection can share one transaction, on followers as well as the leader.
+    // Never wait, skip an input, accept new entries past the time budget, or
+    // carry a new term across this boundary. The eight-input cap still applies.
+    let completion = matches!(&input, Input::Message(message, _, _)
+        if message.term == term && (matches!(message.get_msg_type(),
             raft::eraftpb::MessageType::MsgAppendResponse |
-            raft::eraftpb::MessageType::MsgHeartbeatResponse));
-    if over_budget && !quorum_reply {
+            raft::eraftpb::MessageType::MsgHeartbeatResponse |
+            raft::eraftpb::MessageType::MsgHeartbeat)
+            || (message.get_msg_type() == raft::eraftpb::MessageType::MsgAppend
+                && message.entries.is_empty())));
+    if over_budget && !completion {
         *deferred = Some(input);
         None
     } else {
@@ -1523,7 +1527,7 @@ mod tests {
         assert_eq!(Batch::decode(&encoded).unwrap().contents, contents);
     }
     #[test]
-    fn queued_quorum_replies_cross_the_time_budget_without_skipping_inputs_or_terms() {
+    fn queued_quorum_completions_cross_the_time_budget_without_skipping_inputs_or_terms() {
         use raft::eraftpb::MessageType;
         let message = |kind, term| {
             Input::Message(
@@ -1543,20 +1547,40 @@ mod tests {
         tx.send(message(MessageType::MsgAppendResponse, 3)).unwrap();
         tx.send(message(MessageType::MsgHeartbeatResponse, 3))
             .unwrap();
+        tx.send(message(MessageType::MsgHeartbeat, 3)).unwrap();
         tx.send(message(MessageType::MsgAppend, 3)).unwrap();
+        let Input::Message(mut append, nonce, permit) = message(MessageType::MsgAppend, 3) else {
+            unreachable!()
+        };
+        append.entries.push(raft::eraftpb::Entry {
+            index: 7,
+            term: 3,
+            ..Default::default()
+        });
+        tx.send(Input::Message(append, nonce, permit)).unwrap();
         tx.send(message(MessageType::MsgAppendResponse, 3)).unwrap();
-        for _ in 0..2 {
+        for _ in 0..4 {
             assert!(next_batch_input(&rx, &mut deferred, true, 3).is_some());
             assert!(deferred.is_none());
         }
         assert!(next_batch_input(&rx, &mut deferred, true, 3).is_none());
-        assert!(
-            matches!(deferred.take(), Some(Input::Message(m,_,_)) if m.get_msg_type()==MessageType::MsgAppend)
-        );
+        assert!(matches!(deferred.take(), Some(Input::Message(m,_,_)) if !m.entries.is_empty()));
         assert!(next_batch_input(&rx, &mut deferred, true, 3).is_some());
-        tx.send(message(MessageType::MsgAppendResponse, 4)).unwrap();
+        for kind in [
+            MessageType::MsgAppendResponse,
+            MessageType::MsgHeartbeat,
+            MessageType::MsgAppend,
+            MessageType::MsgSnapshot,
+        ] {
+            tx.send(message(kind, 4)).unwrap();
+            assert!(next_batch_input(&rx, &mut deferred, true, 3).is_none());
+            assert!(matches!(deferred.take(), Some(Input::Message(m,_,_)) if m.term==4));
+        }
+        tx.send(message(MessageType::MsgSnapshot, 3)).unwrap();
         assert!(next_batch_input(&rx, &mut deferred, true, 3).is_none());
-        assert!(matches!(deferred.take(), Some(Input::Message(m,_,_)) if m.term==4));
+        assert!(
+            matches!(deferred.take(), Some(Input::Message(m,_,_)) if m.get_msg_type()==MessageType::MsgSnapshot)
+        );
         tx.send(Input::Stop).unwrap();
         assert!(next_batch_input(&rx, &mut deferred, false, 3).is_some());
         assert!(next_batch_input(&rx, &mut deferred, true, 3).is_none());
