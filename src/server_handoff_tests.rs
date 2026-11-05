@@ -32,6 +32,45 @@ async fn handoff(send: &mpsc::Sender<TcpStream>) -> TcpStream {
 }
 
 #[tokio::test]
+async fn retained_listener_reserves_the_port_across_service_generations() {
+    let listener = Arc::new(TcpListener::bind("127.0.0.1:0").await.unwrap());
+    let address = listener.local_addr().unwrap();
+    for _ in 0..3 {
+        let standby = TcpStream::connect(address).await.unwrap();
+        assert_eq!(
+            standby.try_read(&mut [0; 1]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "a reserved listener served before activation"
+        );
+        let server = Server::from_listener(
+            Config {
+                listen: address,
+                ..Default::default()
+            },
+            listener.clone(),
+        )
+        .unwrap();
+        let (stop, shutdown) = watch::channel(false);
+        let task = tokio::spawn(server.run(shutdown));
+        let mut client = ready(standby).await;
+        stop.send_replace(true);
+        timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(line(&mut client).await.is_empty());
+        // This is the same local bind an outgoing connection would perform.
+        // The port must stay occupied even with no active application service.
+        let outgoing = tokio::net::TcpSocket::new_v4().unwrap();
+        assert_eq!(
+            outgoing.bind(address).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+    }
+}
+
+#[tokio::test]
 async fn handed_off_and_bound_sockets_share_routing_and_shutdown() {
     let server = Server::bind(Config {
         listen: "127.0.0.1:0".parse().unwrap(),

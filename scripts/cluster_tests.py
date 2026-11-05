@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Real three-process Raft histories. Every child is killed/reaped on failure."""
-import argparse,json,socket,sqlite3,subprocess,tempfile,time
+import argparse,errno,json,socket,sqlite3,subprocess,tempfile,time
 from contextlib import closing
 from pathlib import Path
 from wire import Client
@@ -96,7 +96,25 @@ def run(binary):
     with tempfile.TemporaryDirectory(prefix='screech-cluster-') as tmp:
         cluster=Cluster(binary,Path(tmp))
         try:
-            for i in range(1,4):cluster.start(i)
+            cluster.start(1)
+            until=time.monotonic()+10
+            while True:
+                try:
+                    with socket.create_connection(cluster.address(1,'raft'),timeout=.1):pass
+                    break
+                except OSError:
+                    assert cluster.processes[1].poll() is None,cluster.failure_details()
+                    assert time.monotonic()<until,cluster.failure_details()
+                    time.sleep(.02)
+            # No quorum exists yet. Both application endpoints must already be
+            # reserved, so an outgoing ephemeral socket cannot claim them.
+            for kind in ['client','service']:
+                with socket.socket() as outgoing:
+                    try:outgoing.bind(cluster.address(1,kind))
+                    except OSError as error:assert error.errno==errno.EADDRINUSE,error
+                    else:raise AssertionError(('unreserved startup endpoint',kind))
+            results.append(dict(test='client and service ports stay reserved before formation',passed=True))
+            for i in range(2,4):cluster.start(i)
             leader=cluster.wait_leader()
             c=cluster.client(1)
             result=c.request('$JS.API.STREAM.CREATE.T',dict(name='T',subjects=['test.>'],storage='file',num_replicas=3,retention='workqueue',duplicate_window=60000000000));assert 'error' not in result,result

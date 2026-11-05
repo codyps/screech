@@ -926,12 +926,17 @@ fn protocol_error(peer: &Peer, msg: &str) {
 }
 /// Bind before spawning: tests use port 0 without a free-port race.
 pub struct Server {
-    listener: TcpListener,
+    listener: Arc<TcpListener>,
     config: Config,
     identity: Arc<str>,
 }
 impl Server {
     pub async fn bind(config: Config) -> io::Result<Self> {
+        Self::validate_config(&config)?;
+        let listener = Arc::new(TcpListener::bind(config.listen).await?);
+        Self::from_listener(config, listener)
+    }
+    fn validate_config(config: &Config) -> io::Result<()> {
         if config.max_pending == 0
             || config.max_pending > u32::MAX as usize
             || config.limits.payload == 0
@@ -946,7 +951,10 @@ impl Server {
                 "invalid server limits",
             ));
         }
-        let listener = TcpListener::bind(config.listen).await?;
+        Ok(())
+    }
+    pub(crate) fn from_listener(config: Config, listener: Arc<TcpListener>) -> io::Result<Self> {
+        Self::validate_config(&config)?;
         let mut random = [0u8; 16];
         getrandom::fill(&mut random).map_err(|e| io::Error::other(e.to_string()))?;
         let identity: Arc<str> = format!(

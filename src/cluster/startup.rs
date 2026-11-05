@@ -489,6 +489,15 @@ pub async fn run(
         .truncate(false)
         .open(store.with_extension("startup-lock"))?;
     lock.try_lock_exclusive()?;
+    // Reserve both stable application endpoints before discovery opens any
+    // outgoing sockets. An inactive service port can otherwise be selected as
+    // an ephemeral source port, preventing a later leader from binding it.
+    // Keep these listeners across leadership changes and storage generations.
+    let peer = &config.peers[&config.node_id];
+    let listeners = super::LocalListeners {
+        client: Arc::new(TcpListener::bind(peer.client).await?),
+        service: Arc::new(TcpListener::bind(peer.service).await?),
+    };
     let manifest = store.with_extension("node-state");
     let mut record = record_for(&config, &store, &manifest)?;
     save_record(&config, &manifest, &record).await?;
@@ -577,8 +586,18 @@ pub async fn run(
             let hub_runtime = hub.clone();
             let runtime_server = server.clone();
             let slot = config.node_id;
+            let runtime_listeners = listeners.clone();
             let mut task = tokio::spawn(async move {
-                super::run_runtime(runtime, slot, db, runtime_server, halt_rx, hub_runtime).await
+                super::run_runtime(
+                    runtime,
+                    slot,
+                    db,
+                    runtime_server,
+                    halt_rx,
+                    hub_runtime,
+                    runtime_listeners,
+                )
+                .await
             });
             loop {
                 tokio::select! {

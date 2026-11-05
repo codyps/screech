@@ -162,6 +162,11 @@ struct ReadProbe {
     messages: Vec<Message>,
 }
 const REPLICATION_WINDOW: usize = 8;
+#[derive(Clone)]
+struct LocalListeners {
+    client: Arc<TcpListener>,
+    service: Arc<TcpListener>,
+}
 enum Input {
     Message(Message, [u8; 16], tokio::sync::OwnedSemaphorePermit),
     ReadHeartbeat(Message, [u8; 16], tokio::sync::OwnedSemaphorePermit),
@@ -1079,9 +1084,11 @@ async fn run_runtime(
     mut server_config: ServerConfig,
     mut shutdown: watch::Receiver<bool>,
     hub: startup::Hub,
+    listeners: LocalListeners,
 ) -> io::Result<()> {
     let peer = &config.peers[&slot];
-    let clients = TcpListener::bind(peer.client).await?;
+    let clients = listeners.client;
+    let service_listener = listeners.service;
     let db = Arc::new(Mutex::new(database));
     let (tx, rx) = mpsc::sync_channel(256);
     let (checkpoint_path, changes) = {
@@ -1524,7 +1531,7 @@ async fn run_runtime(
                                 .collect();
                         }
                         local.jetstream = Some(handle.clone());
-                        match Server::bind(local).await {
+                        match Server::from_listener(local, service_listener.clone()) {
                             Ok(server) => {
                                 let (stop, rx) = watch::channel(false);
                                 let (send, incoming) =
