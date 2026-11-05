@@ -162,6 +162,7 @@ struct ReadProbe {
 }
 enum Input {
     Message(Message, [u8; 16], tokio::sync::OwnedSemaphorePermit),
+    ReadHeartbeat(Message, [u8; 16], tokio::sync::OwnedSemaphorePermit),
     Propose {
         term: u64,
         configuration: u64,
@@ -576,13 +577,72 @@ fn next_batch_input(
     }
 }
 fn completes_projection(input: &Input, term: u64) -> bool {
-    matches!(input, Input::Message(message, _, _)
+    matches!(input, Input::Message(message, _, _) | Input::ReadHeartbeat(message, _, _)
         if message.term == term && (matches!(message.get_msg_type(),
             raft::eraftpb::MessageType::MsgAppendResponse |
             raft::eraftpb::MessageType::MsgHeartbeatResponse |
             raft::eraftpb::MessageType::MsgHeartbeat)
             || (message.get_msg_type() == raft::eraftpb::MessageType::MsgAppend
                 && message.entries.is_empty())))
+}
+fn step_peer_message(
+    node: &mut RawNode<LogStorage>,
+    message: Message,
+    read_replied: bool,
+) -> raft::Result<()> {
+    let acknowledged = (read_replied
+        && message.get_msg_type() == raft::eraftpb::MessageType::MsgHeartbeat
+        && message.term == node.raft.term
+        && message.from == node.raft.leader_id
+        && message.commit <= node.raft.raft_log.committed)
+        .then(|| (message.from, message.term, message.context.clone()));
+    node.step(message)?;
+    if let Some((to, term, context)) = acknowledged {
+        // The socket path already sent this exact contact response. Still step
+        // the heartbeat for election timers and normal Raft bookkeeping, keeping
+        // any higher-term response and every persistence-dependent message.
+        node.raft.msgs.retain(|message| {
+            !(message.get_msg_type() == raft::eraftpb::MessageType::MsgHeartbeatResponse
+                && message.to == to
+                && message.term == term
+                && message.context == context)
+        });
+    }
+    Ok(())
+}
+fn reply_to_read_heartbeat(active: &startup::Active, message: &Message, nonce: [u8; 16]) -> bool {
+    use transport::MessageSender;
+    if active.role.has_changed().is_err() {
+        return false;
+    }
+    let role = *active.role.borrow();
+    {
+        let db = match active.db.try_lock() {
+            Ok(db) => db,
+            Err(_) => return false,
+        };
+        if !db.can_reply_to_read_heartbeat(role, message, nonce) {
+            return false;
+        }
+    }
+    let slot = if active.config.peers.contains_key(&message.from) {
+        message.from
+    } else {
+        u64::from_le_bytes(nonce[..8].try_into().unwrap())
+    };
+    let Some(sender) = active.peer_senders.get(&slot) else {
+        return false;
+    };
+    sender
+        .try_send(Message {
+            from: active.config.node_id,
+            to: message.from,
+            term: message.term,
+            msg_type: raft::eraftpb::MessageType::MsgHeartbeatResponse,
+            context: message.context.clone(),
+            ..Default::default()
+        })
+        .is_ok()
 }
 fn follower_commit_input(
     rx: &mpsc::Receiver<Input>,
@@ -1034,7 +1094,7 @@ async fn run_runtime(
     let (role_tx, role) = watch::channel(Role::default());
     let (stop, stop_rx) = watch::channel(false);
     let incarnation = db.lock().unwrap().incarnation;
-    let out = network(&config, tx.clone(), stop_rx.clone(), incarnation).await;
+    let out = Arc::new(network(&config, tx.clone(), stop_rx.clone(), incarnation).await);
     let log = LogStorage { db: db.clone() };
     let member = config.node_id;
     let mut node = tokio::task::spawn_blocking(move || {
@@ -1062,6 +1122,7 @@ async fn run_runtime(
         db: db.clone(),
         incarnation,
         session: active_session.clone(),
+        peer_senders: out.clone(),
     });
     let actor_session = active_session.clone();
     let actor_config = config.clone();
@@ -1080,8 +1141,11 @@ async fn run_runtime(
             let mut routes = BTreeMap::new();
             let mut tick = Instant::now();
             let (mut policy, mut policy_index, mut policy_revision) = {
-                let db = node.store().db.lock().unwrap();
-                (db.sender_policy()?, db.conf_index()?, db.membership_revision)
+                let mut db = node.store().db.lock().unwrap();
+                let policy = Arc::new(db.sender_policy()?);
+                let index = db.conf_index()?;
+                db.cache_heartbeat_policy(policy.clone(), index);
+                (policy, index, db.membership_revision)
             };
             let mut deferred_input = None;
             loop {
@@ -1106,6 +1170,7 @@ async fn run_runtime(
                 let mut processed = 0;
                 let mut commit_deadline = None;
                 loop {
+                let read_replied = matches!(&input, Ok(Input::ReadHeartbeat(..)));
                 let accepted_input = matches!(&input, Ok(Input::Message(message, _, _))
                     if message.get_msg_type() == raft::eraftpb::MessageType::MsgAppend
                         && !message.entries.is_empty());
@@ -1120,7 +1185,7 @@ async fn run_runtime(
                         },
                     ),
                     Ok(Input::Fault) => return Err(error("replica storage failed; quarantined")),
-                    Ok(Input::Message(message, nonce, permit)) => {
+                    Ok(Input::Message(message, nonce, permit) | Input::ReadHeartbeat(message, nonce, permit)) => {
                         incoming_lease = Some(permit);
                         if policy.accepts(&message, nonce) {
                             tracing::trace!(from=message.from,to=message.to,kind=?message.get_msg_type(),index=message.index,commit=message.commit,"authenticated peer message");
@@ -1130,7 +1195,7 @@ async fn run_runtime(
                             if message.get_msg_type() == raft::eraftpb::MessageType::MsgSnapshot {
                                 tracing::debug!(from=message.from,to=message.to,index=message.get_snapshot().get_metadata().index, conf=?message.get_snapshot().get_metadata().get_conf_state(),"received snapshot");
                             }
-                            if let Err(error)=node.step(message) {tracing::debug!(%error,"peer Raft step rejected");}
+                            if let Err(error)=step_peer_message(node, message, read_replied) {tracing::debug!(%error,"peer Raft step rejected");}
                         } else {
                             tracing::debug!(from=message.from,to=message.to,kind=?message.get_msg_type(),"fenced peer message");
                         }
@@ -1307,15 +1372,16 @@ async fn run_runtime(
                     crate::fault::point("after_cluster_accept_before_projection_commit");
                 }
                 {
-                    let db = node.store().db.lock().unwrap();
+                    let mut db = node.store().db.lock().unwrap();
                     // Only configuration application and snapshot installation
                     // can change this policy. Check their in-memory token on
                     // ordinary heartbeats, avoiding a SQLite read transaction.
                     // Refresh after EACH input, before authenticating the next.
                     if db.membership_revision != policy_revision {
-                        policy = db.sender_policy()?;
+                        policy = Arc::new(db.sender_policy()?);
                         policy_index = db.conf_index()?;
                         policy_revision = db.membership_revision;
+                        db.cache_heartbeat_policy(policy.clone(), policy_index);
                     }
                 }
                 if policy.replacement_pending() {
@@ -1541,6 +1607,7 @@ async fn run_runtime(
 mod tests {
     use super::*;
     use crate::storage::Append;
+    include!("read_contact_tests.rs");
     #[test]
     fn borrowed_replication_batch_preserves_the_accepted_entry_wire_format() {
         let records = vec![Append {

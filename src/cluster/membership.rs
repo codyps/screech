@@ -28,6 +28,29 @@ pub(crate) struct SenderPolicy {
     incarnation: [u8; 16],
 }
 impl SenderPolicy {
+    pub(super) fn accepts_read_heartbeat(&self, message: &Message, nonce: [u8; 16]) -> bool {
+        message.get_msg_type() == raft::eraftpb::MessageType::MsgHeartbeat
+            && message.term != 0
+            && message.context.len() == 24
+            && message.to == self.node_id
+            && message.from != self.node_id
+            && message.entries.is_empty()
+            && message.get_snapshot().is_empty()
+            && self.conf.voters.contains(&self.node_id)
+            && self
+                .state
+                .identities
+                .get(&self.node_id)
+                .copied()
+                .unwrap_or([0; 16])
+                == self.incarnation
+            && !self.state.retired.contains_key(&self.node_id)
+            && self.conf.voters_outgoing.is_empty()
+            && self.conf.learners.is_empty()
+            && self.conf.learners_next.is_empty()
+            && self.state.replacing.is_none()
+            && self.accepts(message, nonce)
+    }
     pub fn replacement_pending(&self) -> bool {
         self.state.replacing.is_some()
     }
@@ -458,6 +481,60 @@ pub(crate) fn enroll_standby(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn read_contacts_exclude_membership_transitions_and_unenrolled_incarnations() {
+        let message = Message {
+            from: 1,
+            to: 2,
+            term: 1,
+            msg_type: raft::eraftpb::MessageType::MsgHeartbeat,
+            context: vec![1; 24].into(),
+            ..Default::default()
+        };
+        let stable = || SenderPolicy {
+            state: Membership::default(),
+            conf: raft::eraftpb::ConfState {
+                voters: vec![1, 2, 3],
+                ..Default::default()
+            },
+            node_id: 2,
+            incarnation: [0; 16],
+        };
+        assert!(stable().accepts_read_heartbeat(&message, [0; 16]));
+        for case in 0..8 {
+            let mut policy = stable();
+            match case {
+                0 => policy.conf.voters_outgoing = vec![1, 2, 3],
+                1 => policy.conf.learners = vec![4],
+                2 => policy.conf.learners_next = vec![4],
+                3 => {
+                    policy.state.replacing = Some(Replacement {
+                        old: 3,
+                        new: 4,
+                        nonce: [1; 16],
+                    })
+                }
+                4 => {
+                    policy.state.retired.insert(1, 1);
+                }
+                5 => {
+                    policy.state.retired.insert(2, 1);
+                }
+                6 => policy.incarnation = [1; 16],
+                _ => policy.conf.voters = vec![1, 3, 4],
+            }
+            assert!(
+                !policy.accepts_read_heartbeat(&message, [0; 16]),
+                "case {case}"
+            );
+        }
+        let mut enrolled = stable();
+        enrolled.incarnation = [2; 16];
+        enrolled.state.identities.insert(2, [2; 16]);
+        enrolled.state.identities.insert(1, [3; 16]);
+        assert!(enrolled.accepts_read_heartbeat(&message, [3; 16]));
+        assert!(!enrolled.accepts_read_heartbeat(&message, [0; 16]));
+    }
     fn config() -> ClusterConfig {
         ClusterConfig {
             cluster_id: "members".into(),

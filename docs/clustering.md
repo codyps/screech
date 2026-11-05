@@ -37,6 +37,14 @@ after 250 microseconds, the actor sends the original context-bound probes to the
 remaining voters. Completed reads and obsolete leader epochs discard these
 retries; the ordinary heartbeat remains a further retry. All responses still
 require a fresh quorum. Joint configurations and learners retain full fanout.
+A follower can answer a context-bound read heartbeat on the peer transport when
+its term and commit are already recorded, its accepted journal covers that
+commit, and its healthy membership and incarnation match the published role.
+This memory-only check uses a nonblocking lock; advancing commits or terms and
+membership transitions follow the ordinary durable worker. The original
+heartbeat still reaches Raft for election timers and bookkeeping. The leader
+still requires distinct voters' fresh responses for each read and applies the
+committed prefix before releasing the client reply.
 Bulk content reads and checkpoint hydration group references by accepted-entry
 index, decoding each batch once while preserving output order and validating
 every content identity. Only one decoded batch is retained at a time.

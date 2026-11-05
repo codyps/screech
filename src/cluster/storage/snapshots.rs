@@ -333,6 +333,7 @@ impl Database {
         self.snapshot_position = (index, snapshot.get_metadata().term, image.sequence);
         self.seal()?;
         self.accepted_tip = Some((last, last_term));
+        self.heartbeat_hard = Some(next);
         self.membership_revision = self.membership_revision.wrapping_add(1);
         crate::fault::point("after_cluster_snapshot_install");
         Ok(())

@@ -41,6 +41,8 @@ pub(crate) struct Database {
     pub snapshot_position: (u64, u64, u64),
     entries_bytes: u64,
     accepted_tip: Option<(u64, u64)>,
+    heartbeat_hard: Option<HardState>,
+    heartbeat_policy: Option<(u64, u64, Arc<super::membership::SenderPolicy>)>,
     // Actor-local invalidation token, never a durability or recovery witness.
     pub(super) membership_revision: u64,
     projection_batch: bool,
@@ -208,6 +210,8 @@ impl Database {
             snapshot_position: (0, 0, 0),
             entries_bytes: 0,
             accepted_tip: None,
+            heartbeat_hard: None,
+            heartbeat_policy: None,
             membership_revision: 0,
             projection_batch: false,
             projection_transaction: Cell::new(false),
@@ -287,6 +291,7 @@ impl Database {
                 db.entry(last)?.term
             },
         ));
+        db.heartbeat_hard = Some(db.hard()?);
         Ok(db)
     }
     pub fn meta(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
@@ -311,6 +316,41 @@ impl Database {
         // This is the canonical journal promise, installed only after sync and
         // verified against the independent SQL witness before opening a voter.
         self.watermark.durable_term(self.incarnation)
+    }
+    pub(super) fn cache_heartbeat_policy(
+        &mut self,
+        policy: Arc<super::membership::SenderPolicy>,
+        configuration: u64,
+    ) {
+        self.heartbeat_policy = Some((self.membership_revision, configuration, policy));
+    }
+    pub(super) fn can_reply_to_read_heartbeat(
+        &self,
+        role: super::Role,
+        message: &raft::eraftpb::Message,
+        nonce: [u8; 16],
+    ) -> bool {
+        let Some(hard) = &self.heartbeat_hard else {
+            return false;
+        };
+        let Some((revision, configuration, policy)) = &self.heartbeat_policy else {
+            return false;
+        };
+        // Only a no-op heartbeat can bypass the owner: no term, commit, log or
+        // membership change is permitted. This reads memory only, under the DB
+        // mutex; it never starts a SQL scope or waits for storage.
+        !self.failed
+            && *revision == self.membership_revision
+            && *configuration == role.configuration
+            && role.leader == message.from
+            && role.term == message.term
+            && hard.term == message.term
+            && self.durable_term().ok() == Some(message.term)
+            && message.commit <= hard.commit
+            && self
+                .accepted_tip
+                .is_some_and(|(last, _)| hard.commit <= last)
+            && policy.accepts_read_heartbeat(message, nonce)
     }
     pub fn last(&self) -> io::Result<u64> {
         self.projection_sql()?;
@@ -490,6 +530,7 @@ impl Database {
         if let Some(last) = entries.last() {
             self.accepted_tip = Some((last.index, last.term));
         }
+        self.heartbeat_hard = Some(hard.cloned().unwrap_or(old));
         crate::fault::point("after_cluster_persist");
         Ok(())
     }

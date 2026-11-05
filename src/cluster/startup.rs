@@ -39,6 +39,7 @@ pub(super) struct Active {
     pub db: Arc<Mutex<Database>>,
     pub incarnation: [u8; 16],
     pub session: Arc<AtomicU64>,
+    pub peer_senders: Arc<BTreeMap<u64, transport::PeerSender>>,
 }
 #[derive(Clone)]
 pub(super) struct Hub(Arc<RwLock<Shared>>);
@@ -341,7 +342,9 @@ async fn listener(
                         let active=hub.0.read().unwrap().active.clone();
                         let Some(active)=active else {return Ok(());};
                             let (message,nonce,permit)=tokio::time::timeout(Duration::from_secs(30),receive_message(&active.config,&mut stream,bytes.clone(),Some(first))).await??;
-                            active.tx.try_send(Input::Message(message,nonce,permit)).map_err(error)?;
+                            let replied=reply_to_read_heartbeat(&active,&message,nonce);
+                            let input=if replied {Input::ReadHeartbeat(message,nonce,permit)} else {Input::Message(message,nonce,permit)};
+                            active.tx.try_send(input).map_err(error)?;
                             first=tokio::time::timeout(Duration::from_secs(30),stream.read_u32()).await??;
                         }
                     }
