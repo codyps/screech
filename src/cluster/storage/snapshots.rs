@@ -69,11 +69,13 @@ impl Database {
         self.projection_sql()?;
         let row: Option<(Vec<u8>, Vec<u8>)> = self
             .conn
-            .query_row(
+            .prepare_cached(
                 "SELECT data,digest FROM snapshot_bodies WHERE generation=?1 AND seq=?2",
-                params![sql(key.generation)?, sql(key.sequence)?],
-                |r| Ok((r.get(0)?, r.get(1)?)),
             )
+            .map_err(error)?
+            .query_row(params![sql(key.generation)?, sql(key.sequence)?], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .optional()
             .map_err(error)?;
         row.map(|(data, hash)| {
@@ -300,12 +302,24 @@ impl Database {
                 tx.execute("DELETE FROM entries", []).map_err(error)?;
             }
             tx.execute_batch(
-                "DELETE FROM event_index;DELETE FROM body_index;DELETE FROM snapshot_bodies;",
+                "DELETE FROM event_index;DELETE FROM body_index;
+                 CREATE TEMP TABLE IF NOT EXISTS checkpoint_live(
+                   generation INTEGER NOT NULL,seq INTEGER NOT NULL,
+                   PRIMARY KEY(generation,seq)) WITHOUT ROWID;
+                 DELETE FROM checkpoint_live;",
             )
             .map_err(error)?;
             {
-                let mut insert = tx.prepare_cached("INSERT INTO snapshot_bodies VALUES(?1,?2,?3,?4)").map_err(error)?;
+                // Every body was validated above. Retained immutable bodies can
+                // remain in place across FULL roots instead of dirtying their
+                // payload pages again. Compare bytes too: a matching digest
+                // column alone must never authenticate existing SQL contents.
+                let mut insert = tx.prepare_cached("INSERT INTO snapshot_bodies VALUES(?1,?2,?3,?4)
+                    ON CONFLICT(generation,seq) DO UPDATE SET data=excluded.data,digest=excluded.digest
+                    WHERE snapshot_bodies.data!=excluded.data OR snapshot_bodies.digest!=excluded.digest").map_err(error)?;
+                let mut keep = tx.prepare_cached("INSERT INTO checkpoint_live VALUES(?1,?2)").map_err(error)?;
                 for (key, bytes, hash) in rows {
+                    keep.execute(params![sql(key.generation)?, sql(key.sequence)?]).map_err(error)?;
                     insert.execute(params![
                         sql(key.generation)?,
                         sql(key.sequence)?,
@@ -314,6 +328,10 @@ impl Database {
                     ]).map_err(error)?;
                 }
             }
+            tx.execute_batch("DELETE FROM snapshot_bodies WHERE NOT EXISTS(
+                SELECT 1 FROM checkpoint_live AS live
+                WHERE live.generation=snapshot_bodies.generation AND live.seq=snapshot_bodies.seq);
+                DELETE FROM checkpoint_live;").map_err(error)?;
             {
             let mut insert = tx.prepare_cached("INSERT INTO entries VALUES(?1,?2,?3,?4)").map_err(error)?;
             for e in entries {
@@ -565,6 +583,86 @@ mod tests {
         drop(receiver);
         let receiver = Database::open(&dir.path().join("receiver"), &config(2), false).unwrap();
         assert_eq!(receiver.end().unwrap(), 2);
+        assert_eq!(receiver.content(key).unwrap().unwrap().payload, "retained");
+    }
+    #[test]
+    fn checkpoints_reuse_immutable_bodies_prune_orphans_and_replace_corrupt_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut db, data) = donor(dir.path());
+        let key = ContentKey {
+            generation: 1,
+            sequence: 1,
+        };
+        let image = || CheckpointImage {
+            data: data.clone(),
+            live: vec![key],
+            imports: vec![],
+        };
+        db.compact(2, image()).unwrap();
+        let initial = db.snapshot().unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TEMP TABLE body_changes(kind TEXT);
+            CREATE TEMP TRIGGER body_insert AFTER INSERT ON main.snapshot_bodies
+              BEGIN INSERT INTO body_changes VALUES('insert'); END;
+            CREATE TEMP TRIGGER body_update AFTER UPDATE ON main.snapshot_bodies
+              BEGIN INSERT INTO body_changes VALUES('update'); END;
+            CREATE TEMP TRIGGER body_delete AFTER DELETE ON main.snapshot_bodies
+              BEGIN INSERT INTO body_changes VALUES('delete'); END;",
+            )
+            .unwrap();
+        db.compact(2, image()).unwrap();
+        let changes: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM body_changes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(changes, 0, "an unchanged body was rewritten");
+        let mut hard = db.hard().unwrap();
+        hard.commit = 2;
+        db.persist(
+            &[Entry {
+                index: 2,
+                term: 1,
+                ..Default::default()
+            }],
+            Some(&hard),
+        )
+        .unwrap();
+        db.apply(2).unwrap();
+        db.compact(2, image()).unwrap();
+        let next = db.snapshot().unwrap();
+        let receiver_path = dir.path().join("receiver");
+        let mut receiver = Database::open(&receiver_path, &config(2), true).unwrap();
+        receiver
+            .install_snapshot(&initial, None, &[], false)
+            .unwrap_err();
+        let mut received_hard = hard.clone();
+        received_hard.commit = 1;
+        receiver
+            .install_snapshot(&initial, Some(&received_hard), &[], false)
+            .unwrap();
+        receiver
+            .conn
+            .execute_batch(
+                "UPDATE snapshot_bodies SET data=x'00';
+            INSERT INTO snapshot_bodies SELECT 99,99,data,digest FROM snapshot_bodies;",
+            )
+            .unwrap();
+        // The old digest still matches the incoming manifest, but the bytes do
+        // not. Installing a newer valid image must replace those bytes and also
+        // reclaim bodies that its model no longer references.
+        receiver
+            .install_snapshot(&next, Some(&hard), &[], false)
+            .unwrap();
+        let bodies: i64 = receiver
+            .conn
+            .query_row("SELECT count(*) FROM snapshot_bodies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bodies, 1);
+        assert_eq!(receiver.snapshot().unwrap(), next);
+        drop(receiver);
+        let receiver = Database::open(&receiver_path, &config(2), false).unwrap();
+        assert_eq!(receiver.snapshot_base().unwrap(), (2, 1, 2));
         assert_eq!(receiver.content(key).unwrap().unwrap().payload, "retained");
     }
     #[test]
