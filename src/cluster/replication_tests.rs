@@ -1,4 +1,55 @@
 #[test]
+fn a_briefly_partitioned_voter_catches_up_from_recent_committed_entries_after_compaction() {
+    use crate::storage::{CheckpointImage, MemoryStore, Store};
+    use raft::Storage as _;
+    for voters in [3, 5] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sim = Simulation::with_voters(dir.path(), voters);
+        sim.nodes[0].campaign().unwrap();
+        sim.settle(None);
+        for _ in 0..10 {
+            sim.nodes[0].propose(vec![], vec![]).unwrap();
+            sim.settle(Some(voters));
+        }
+        let committed = sim.nodes[0].raft.raft_log.committed;
+        assert!(sim.nodes[(voters - 1) as usize].raft.raft_log.committed < committed);
+        let mut app = crate::durable::Engine::recover(MemoryStore::default()).unwrap();
+        app.checkpoint().unwrap();
+        let data = app.into_store().load_checkpoint().unwrap().unwrap().1.to_vec();
+        sim.nodes[0].store().db.lock().unwrap().compact(0, CheckpointImage {
+            data,
+            live: vec![],
+            imports: vec![],
+        }).unwrap();
+        assert_eq!(sim.nodes[0].store().snapshot(0, voters).unwrap().get_metadata().index, committed);
+        // Reopen the follower's append window just as a real heartbeat reply
+        // does, then inspect the actual Raft output before delivering it.
+        let term = sim.nodes[0].raft.term;
+        sim.nodes[0].step(Message {
+            from: voters,
+            to: 1,
+            term,
+            msg_type: raft::eraftpb::MessageType::MsgHeartbeatResponse,
+            ..Default::default()
+        }).unwrap();
+        pump(&mut sim.nodes[0], &mut sim.pending[0], &sim.send, &BTreeMap::new()).unwrap();
+        let mut sent = Vec::new();
+        for receive in &mut sim.receive {
+            while let Ok(message) = receive.try_recv() { sent.push(message); }
+        }
+        assert!(sent.iter().any(|m| m.to == voters
+            && m.get_msg_type() == raft::eraftpb::MessageType::MsgAppend
+            && !m.entries.is_empty()));
+        assert!(sent.iter().all(|m| m.get_msg_type() != raft::eraftpb::MessageType::MsgSnapshot));
+        for message in sent {
+            sim.nodes[(message.to - 1) as usize].step(message).unwrap();
+        }
+        sim.settle(None);
+        assert!(sim.nodes.iter().all(|node| node.raft.raft_log.committed == committed));
+    }
+}
+
+#[test]
 fn replication_prefers_a_real_caught_up_quorum_and_keeps_outstanding_appends_on_window_changes() {
     let dir = tempfile::tempdir().unwrap();
     let mut sim = Simulation::with_voters(dir.path(), 5);

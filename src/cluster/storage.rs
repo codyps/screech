@@ -3,6 +3,7 @@
 //! snapshot roots. Startup replays before the node can vote or expose data.
 use super::{error, Batch, ClusterConfig};
 mod page_checkpoint;
+mod recent;
 mod snapshots;
 mod watermark;
 use crate::storage::{Content, ContentKey, Record};
@@ -40,6 +41,7 @@ pub(crate) struct Database {
     pub max_log_bytes: u64,
     pub snapshot_position: (u64, u64, u64),
     entries_bytes: u64,
+    recent: recent::Recent,
     accepted_tip: Option<(u64, u64)>,
     heartbeat_hard: Option<HardState>,
     heartbeat_policy: Option<(u64, u64, Arc<super::membership::SenderPolicy>)>,
@@ -209,6 +211,7 @@ impl Database {
             failed: false,
             snapshot_position: (0, 0, 0),
             entries_bytes: 0,
+            recent: recent::Recent::default(),
             accepted_tip: None,
             heartbeat_hard: None,
             heartbeat_policy: None,
@@ -857,14 +860,20 @@ impl Storage for LogStorage {
         let limit = max_size.into().unwrap_or(u64::MAX);
         let mut bytes = 0;
         let mut entries = Vec::new();
-        if low <= db.snapshot_base().map_err(raft_error)?.0 {
+        if low < db.first_log_index().map_err(raft_error)? {
             return Err(raft::Error::Store(StorageError::Compacted));
         }
         if high > db.last().map_err(raft_error)? + 1 {
             return Err(raft::Error::Store(StorageError::Unavailable));
         }
         for idx in low..high {
-            let e = db.entry(idx).map_err(raft_error)?;
+            let e = db
+                .recent
+                .get(idx)
+                .cloned()
+                .map(Ok)
+                .unwrap_or_else(|| db.entry(idx))
+                .map_err(raft_error)?;
             bytes += u64::from(e.compute_size());
             if !entries.is_empty() && bytes > limit {
                 break;
@@ -875,8 +884,12 @@ impl Storage for LogStorage {
     }
     fn term(&self, idx: u64) -> raft::Result<u64> {
         let db = self.db.lock().unwrap();
+        db.first_log_index().map_err(raft_error)?;
         let (base, term, _) = db.snapshot_base().map_err(raft_error)?;
         if idx < base {
+            if let Some(entry) = db.recent.get(idx) {
+                return Ok(entry.term);
+            }
             return Err(raft::Error::Store(StorageError::Compacted));
         }
         if idx == base {
@@ -885,14 +898,11 @@ impl Storage for LogStorage {
         db.log_term(idx).map_err(raft_error)
     }
     fn first_index(&self) -> raft::Result<u64> {
-        Ok(self
-            .db
+        self.db
             .lock()
             .unwrap()
-            .snapshot_base()
-            .map_err(raft_error)?
-            .0
-            + 1)
+            .first_log_index()
+            .map_err(raft_error)
     }
     fn last_index(&self) -> raft::Result<u64> {
         self.db.lock().unwrap().log_last_index().map_err(raft_error)

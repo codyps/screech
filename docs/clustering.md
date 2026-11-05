@@ -158,6 +158,12 @@ round trip. The transfer-size limit still applies. The FULL transaction preserve
 identical retained body rows, compares both bytes and digests before reusing a row,
 and removes bodies absent from the new image. Model validation, manifest checks,
 accepted-suffix preservation and authenticated journal rotation are unchanged.
+After local compaction, a volatile cache keeps at most 256 committed entries and
+8 MiB of encoded entries, including Raft's preceding-term boundary. Briefly
+lagging voters can receive those entries without a full snapshot transfer.
+The covered SQL prefix is still reclaimed; the cache never contains an
+uncommitted suffix or authorizes a durability acknowledgement. Restart and
+incoming snapshot installation discard it and use the durable snapshot boundary.
 On Linux, a separate worker queues dirty WAL data for writeback before page
 checkpoints, reducing bursts of I/O that compete with the accepted journals.
 The [writeback hint](https://man7.org/linux/man-pages/man2/sync_file_range.2.html)

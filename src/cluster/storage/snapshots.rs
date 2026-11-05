@@ -260,6 +260,11 @@ impl Database {
         if !local && next.commit > entries.last().map_or(index, |e| e.index) {
             return Err(error("snapshot committed suffix is missing"));
         }
+        let recent = if local {
+            super::recent::Recent::capture(self, index)?
+        } else {
+            super::recent::Recent::default()
+        };
         // Local compaction preserves the complete accepted suffix. Incoming
         // snapshots discard the old suffix; Ready supplies any valid new entries.
         image.contents.clear();
@@ -373,6 +378,7 @@ impl Database {
         self.refresh_log_bytes()?;
         self.snapshot_position = (index, snapshot.get_metadata().term, image.sequence);
         self.seal()?;
+        self.recent = recent;
         self.accepted_tip = Some((last, last_term));
         self.heartbeat_hard = Some(next);
         self.membership_revision = self.membership_revision.wrapping_add(1);
@@ -471,6 +477,101 @@ mod tests {
         db.persist(&[entry], Some(&hard)).unwrap();
         db.apply(1).unwrap();
         (db, data)
+    }
+    #[test]
+    fn compacted_history_serves_briefly_lagging_voters_then_falls_back_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut db, data) = donor(dir.path());
+        let committed: Vec<_> = (2..=300)
+            .map(|index| Entry {
+                index,
+                term: 1,
+                ..Default::default()
+            })
+            .collect();
+        let mut hard = db.hard().unwrap();
+        hard.commit = 300;
+        db.persist(&committed, Some(&hard)).unwrap();
+        db.apply(300).unwrap();
+        hard.term = 2;
+        hard.vote = 2;
+        db.persist(
+            &[Entry {
+                index: 301,
+                term: 2,
+                ..Default::default()
+            }],
+            Some(&hard),
+        )
+        .unwrap();
+        let image = || CheckpointImage {
+            data: data.clone(),
+            live: vec![ContentKey {
+                generation: 1,
+                sequence: 1,
+            }],
+            imports: vec![],
+        };
+        db.compact(2, image()).unwrap();
+        assert!(db.entry(299).is_err(), "covered SQL prefix was retained");
+        assert!(
+            db.recent.get(301).is_none(),
+            "uncommitted entry entered the cache"
+        );
+        let shared = Arc::new(Mutex::new(db));
+        let log = super::super::LogStorage { db: shared.clone() };
+        assert_eq!(log.first_index().unwrap(), 46);
+        assert_eq!(log.term(45).unwrap(), 1, "missing pre-first-index term");
+        assert!(log.term(44).is_err());
+        assert!(log
+            .entries(45, 46, None, GetEntriesContext::empty(false))
+            .is_err());
+        let entries = log
+            .entries(46, 302, None, GetEntriesContext::empty(false))
+            .unwrap();
+        assert_eq!(entries.len(), 256);
+        assert_eq!(entries.first().unwrap().index, 46);
+        assert_eq!(entries.last().unwrap().term, 2);
+        assert_eq!(
+            log.entries(46, 302, Some(0), GetEntriesContext::empty(false))
+                .unwrap()
+                .len(),
+            1
+        );
+        // Repeating compaction preserves the existing catch-up window even
+        // though those entries have already disappeared from SQL.
+        shared.lock().unwrap().compact(2, image()).unwrap();
+        assert_eq!(log.first_index().unwrap(), 46);
+        shared.lock().unwrap().failed = true;
+        assert!(log.first_index().is_err());
+        assert!(log.term(45).is_err());
+        assert!(log
+            .entries(46, 47, None, GetEntriesContext::empty(false))
+            .is_err());
+        shared.lock().unwrap().failed = false;
+        drop(log);
+        drop(shared);
+        let path = dir.path().join("donor");
+        let mut db = Database::open(&path, &config(1), false).unwrap();
+        assert_eq!(db.first_log_index().unwrap(), 301);
+        assert!(db.recent.get(300).is_none());
+        assert_eq!(db.snapshot_base().unwrap(), (300, 1, 2));
+        assert_eq!(db.entry(301).unwrap().term, 2);
+        hard.commit = 301;
+        db.persist(&[], Some(&hard)).unwrap();
+        db.apply(301).unwrap();
+        db.compact(2, image()).unwrap();
+        assert!(db.recent.get(301).is_some());
+        let mut incoming = db.snapshot().unwrap();
+        incoming.mut_metadata().index = 400;
+        hard.commit = 400;
+        db.install_snapshot(&incoming, Some(&hard), &[], false)
+            .unwrap();
+        assert!(
+            db.recent.get(301).is_none(),
+            "remote image retained old history"
+        );
+        assert_eq!(db.first_log_index().unwrap(), 401);
     }
     #[test]
     fn compaction_keeps_payloads_and_accepted_tail_then_recovers_after_restart() {
