@@ -160,6 +160,7 @@ struct ReadProbe {
     deadline: Instant,
     messages: Vec<Message>,
 }
+const REPLICATION_WINDOW: usize = 8;
 enum Input {
     Message(Message, [u8; 16], tokio::sync::OwnedSemaphorePermit),
     ReadHeartbeat(Message, [u8; 16], tokio::sync::OwnedSemaphorePermit),
@@ -1105,7 +1106,7 @@ async fn run_runtime(
             check_quorum: true,
             pre_vote: true,
             max_size_per_msg: 1024 * 1024,
-            max_inflight_msgs: 8,
+            max_inflight_msgs: REPLICATION_WINDOW,
             applied: log.db.lock().unwrap().hard()?.commit,
             ..Default::default()
         };
@@ -1858,6 +1859,8 @@ mod tests {
                     check_quorum: true,
                     pre_vote: true,
                     applied,
+                    max_inflight_msgs: REPLICATION_WINDOW,
+                    max_size_per_msg: 1024 * 1024,
                     ..Default::default()
                 };
                 nodes.push(
@@ -1944,6 +1947,75 @@ mod tests {
             self.nodes[node]
                 .propose(vec![], postcard::to_allocvec(&batch).unwrap())
                 .unwrap();
+        }
+    }
+    #[test]
+    fn bounded_replication_window_batches_a_lagging_voter_without_committing_a_minority() {
+        use raft::eraftpb::MessageType;
+        let dir = tempfile::tempdir().unwrap();
+        let mut sim = Simulation::with_voters(dir.path(), 5);
+        sim.nodes[0].campaign().unwrap();
+        sim.settle(None);
+        sim.nodes[0].raft.mut_prs().get_mut(5).unwrap().ins = raft::Inflights::new(1);
+        let committed = sim.nodes[0].raft.raft_log.committed;
+        sim.propose(0, 1, b"one");
+        pump(
+            &mut sim.nodes[0],
+            &mut sim.pending[0],
+            &sim.send,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let first = sim.receive[4].try_recv().unwrap();
+        assert_eq!(first.entries.len(), 1);
+        for key in 2..=9 {
+            sim.propose(0, key, b"next");
+            pump(
+                &mut sim.nodes[0],
+                &mut sim.pending[0],
+                &sim.send,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        }
+        assert!(
+            sim.receive[4].try_recv().is_err(),
+            "lagging voter received another outstanding append"
+        );
+        assert_eq!(sim.nodes[0].raft.raft_log.committed, committed);
+        sim.nodes[4].step(first).unwrap();
+        pump(
+            &mut sim.nodes[4],
+            &mut sim.pending[4],
+            &sim.send,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let response = sim.receive[0].try_recv().unwrap();
+        assert_eq!(response.get_msg_type(), MessageType::MsgAppendResponse);
+        sim.nodes[0].step(response).unwrap();
+        pump(
+            &mut sim.nodes[0],
+            &mut sim.pending[0],
+            &sim.send,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            sim.nodes[0].raft.raft_log.committed, committed,
+            "two voters formed a five-voter quorum"
+        );
+        let batch = sim.receive[4].try_recv().unwrap();
+        assert_eq!(
+            batch.entries.len(),
+            8,
+            "pending suffix was not sent as one batch"
+        );
+        sim.nodes[4].step(batch).unwrap();
+        sim.settle(None);
+        for node in &sim.nodes {
+            assert_eq!(node.raft.raft_log.applied, committed + 9);
+            assert_eq!(node.store().db.lock().unwrap().end().unwrap(), 9);
         }
     }
     #[test]
