@@ -151,7 +151,35 @@ enum ConnectionRoute {
     Local(tokio::sync::mpsc::Sender<TcpStream>),
     Remote(TcpStream),
 }
-type Reply = mpsc::SyncSender<io::Result<u64>>;
+#[derive(Clone)]
+enum Reply {
+    Blocking(mpsc::SyncSender<io::Result<u64>>),
+    Async(Arc<Mutex<Option<tokio::sync::oneshot::Sender<io::Result<u64>>>>>),
+}
+impl From<mpsc::SyncSender<io::Result<u64>>> for Reply {
+    fn from(value: mpsc::SyncSender<io::Result<u64>>) -> Self {
+        Self::Blocking(value)
+    }
+}
+impl From<tokio::sync::oneshot::Sender<io::Result<u64>>> for Reply {
+    fn from(value: tokio::sync::oneshot::Sender<io::Result<u64>>) -> Self {
+        Self::Async(Arc::new(Mutex::new(Some(value))))
+    }
+}
+impl Reply {
+    fn send(&self, value: io::Result<u64>) -> Result<(), ()> {
+        match self {
+            Self::Blocking(send) => send.send(value).map_err(|_| ()),
+            Self::Async(send) => send
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or(())?
+                .send(value)
+                .map_err(|_| ()),
+        }
+    }
+}
 struct Pending {
     started: Instant,
     reply: Reply,
@@ -215,6 +243,23 @@ struct Client {
     active_session: Arc<AtomicU64>,
 }
 impl Client {
+    async fn barrier_async(&self) -> io::Result<()> {
+        self.current()?;
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        self.tx
+            .try_send(Input::Read {
+                term: self.term,
+                configuration: self.configuration,
+                session: self.session,
+                reply: reply.into(),
+            })
+            .map_err(error)?;
+        tokio::time::timeout(RPC_TIMEOUT, receive)
+            .await
+            .map_err(|_| error("quorum read timeout"))?
+            .map_err(error)??;
+        self.current()
+    }
     fn barrier(&self) -> io::Result<()> {
         self.current()?;
         let (reply, rx) = mpsc::sync_channel(1);
@@ -223,7 +268,7 @@ impl Client {
                 term: self.term,
                 configuration: self.configuration,
                 session: self.session,
-                reply,
+                reply: Reply::Blocking(reply),
             })
             .map_err(error)?;
         rx.recv_timeout(RPC_TIMEOUT)
@@ -256,7 +301,7 @@ impl Client {
                 session: self.session,
                 activate,
                 data,
-                reply,
+                reply: Reply::Blocking(reply),
             })
             .map_err(error)?;
         rx.recv_timeout(RPC_TIMEOUT)
@@ -329,6 +374,12 @@ impl Replication for Client {
     fn read_barrier(&self) -> Result<(), StoreError> {
         self.barrier().map_err(StoreError::from)
     }
+    fn read_barrier_async(&self) -> Option<crate::storage::ReadBarrierFuture> {
+        let client = self.clone();
+        Some(Box::pin(async move {
+            client.barrier_async().await.map_err(StoreError::from)
+        }))
+    }
     fn append_with_content(
         &self,
         records: &[Append],
@@ -362,7 +413,7 @@ impl Store for ClusterStore {
                 configuration: self.client.configuration,
                 session: self.client.session,
                 replacement: membership::Replacement { old, new, nonce },
-                reply,
+                reply: Reply::Blocking(reply),
             })
             .map_err(|e| StoreError::Io(error(e)))?;
         rx.recv_timeout(RPC_TIMEOUT)
@@ -1628,6 +1679,80 @@ mod tests {
     use crate::storage::Append;
     include!("read_contact_tests.rs");
     include!("replication_tests.rs");
+    #[tokio::test]
+    async fn asynchronous_read_rechecks_the_service_epoch_after_the_reply() {
+        for changed in ["healthy", "term", "configuration", "leader", "session"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut sim = Simulation::new(dir.path());
+            sim.nodes[0].campaign().unwrap();
+            sim.settle(None);
+            let current = Role {
+                leader: 1,
+                term: sim.nodes[0].raft.term,
+                configuration: 0,
+            };
+            let (role, receive_role) = watch::channel(current);
+            let session = Arc::new(AtomicU64::new(7));
+            let (send, receive) = mpsc::sync_channel(1);
+            let client = Client {
+                tx: send,
+                role: receive_role,
+                db: sim.nodes[0].store().db.clone(),
+                id: 1,
+                term: current.term,
+                replicas: 3,
+                configuration: 0,
+                session: 7,
+                active_session: session.clone(),
+            };
+            let task = tokio::spawn(async move { client.barrier_async().await });
+            let input = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Ok(input) = receive.try_recv() {
+                        break input;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let Input::Read {
+                term,
+                configuration,
+                session: request_session,
+                reply,
+            } = input
+            else {
+                panic!("not a fresh read request")
+            };
+            assert_eq!((term, configuration, request_session), (current.term, 0, 7));
+            match changed {
+                "term" => {
+                    role.send_replace(Role {
+                        term: current.term + 1,
+                        ..current
+                    });
+                }
+                "configuration" => {
+                    role.send_replace(Role {
+                        configuration: 1,
+                        ..current
+                    });
+                }
+                "leader" => {
+                    role.send_replace(Role {
+                        leader: 2,
+                        ..current
+                    });
+                }
+                "session" => session.store(8, Ordering::Release),
+                _ => (),
+            }
+            reply.send(Ok(1)).unwrap();
+            assert!(reply.send(Ok(1)).is_err(), "one-shot reply was reused");
+            assert_eq!(task.await.unwrap().is_ok(), changed == "healthy");
+        }
+    }
     #[test]
     fn borrowed_replication_batch_preserves_the_accepted_entry_wire_format() {
         let records = vec![Append {
@@ -1939,7 +2064,7 @@ mod tests {
                 context,
                 Pending {
                     started: Instant::now(),
-                    reply,
+                    reply: Reply::Blocking(reply),
                     read_index: None,
                 },
             );
@@ -2395,7 +2520,7 @@ mod tests {
                 context.clone(),
                 Pending {
                     started: Instant::now(),
-                    reply,
+                    reply: Reply::Blocking(reply),
                     read_index: None,
                 },
             );
@@ -2444,7 +2569,7 @@ mod tests {
                 context.clone(),
                 Pending {
                     started: Instant::now(),
-                    reply,
+                    reply: Reply::Blocking(reply),
                     read_index: None,
                 },
             );
@@ -2601,7 +2726,7 @@ mod tests {
             context.clone(),
             Pending {
                 started: Instant::now(),
-                reply,
+                reply: Reply::Blocking(reply),
                 read_index: None,
             },
         );
@@ -2640,7 +2765,7 @@ mod tests {
                     &BTreeMap::new(),
                     completed,
                 )?;
-                completed.push((second, before));
+                completed.push((Reply::Blocking(second), before));
                 Ok(())
             },
             |_| published = true,

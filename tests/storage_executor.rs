@@ -318,3 +318,52 @@ fn failed_replication_dispatch_cannot_advance_or_expose_the_engine_projection() 
     );
     assert!(engine.begin_group().is_err());
 }
+
+#[tokio::test]
+async fn detached_async_dispatch_fences_owner_failure_before_and_after_quorum() {
+    use screech::storage::ReadBarrierFuture;
+    struct Paused(tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>);
+    impl Replication for Paused {
+        fn read_barrier(&self) -> Result<(), StoreError> {
+            Ok(())
+        }
+        fn read_barrier_async(&self) -> Option<ReadBarrierFuture> {
+            let receive = self.0.try_lock().unwrap().take().unwrap();
+            Some(Box::pin(async move {
+                receive.await.map_err(|_| StoreError::Invalid)
+            }))
+        }
+        fn append_with_content(&self, _: &[Append], _: &[Content]) -> Result<u64, StoreError> {
+            Ok(0)
+        }
+        fn checkpoint_needed(&self) -> Result<bool, StoreError> {
+            Ok(false)
+        }
+    }
+    for failure_during_proof in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let mut store = ExecutorStore::start(Observed {
+            inner: SqliteStore::open(dir.path().join("db")).unwrap(),
+            probe: Arc::new(Probe::default()),
+            replication: Some(Arc::new(Paused(tokio::sync::Mutex::new(Some(receive))))),
+        })
+        .unwrap();
+        let dispatcher = store.replication().unwrap();
+        let mut proof = dispatcher.read_barrier_async().unwrap();
+        if failure_during_proof {
+            tokio::select! {
+                result = &mut proof => panic!("proof completed before quorum: {result:?}"),
+                _ = tokio::task::yield_now() => (),
+            }
+        }
+        assert!(store
+            .checkpoint_job(0, Box::new(|| panic!("owner failure")))
+            .is_err());
+        send.send(()).unwrap();
+        assert!(proof.await.is_err());
+        assert!(dispatcher.read_barrier().is_err());
+        assert!(dispatcher.append_with_content(&[], &[]).is_err());
+        assert!(dispatcher.checkpoint_needed().is_err());
+    }
+}

@@ -77,6 +77,7 @@ jobs:
           python3 scripts/cluster_recovery_tests.py target/debug/screech-server --output results/cluster-recovery-tests.json
           python3 scripts/cluster_nats_regression_tests.py target/debug/screech-server --shim ./sqlite-io-fault.so --output results/cluster-nats-regressions.json
           python3 scripts/cluster_quorum_tests.py target/debug/screech-server --output results/cluster-quorum-tests.json
+          python3 scripts/cluster_direct_read_tests.py target/debug/screech-server --output results/cluster-direct-read-tests.json
           python3 scripts/cluster_journal_tests.py target/debug/screech-server --output results/cluster-journal-tests.json
           python3 scripts/cluster_projection_tests.py target/debug/screech-server --output results/cluster-projection-tests.json
           python3 scripts/cluster_checkpoint_tests.py target/debug/screech-server --output results/cluster-checkpoint-tests.json

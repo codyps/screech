@@ -3,7 +3,8 @@
 //! replication dispatch can go straight to its independently serialized owner.
 //! A disconnected executor is an ambiguous outcome, never durable success.
 use crate::storage::{
-    Append, CheckpointJob, Content, ContentKey, Record, Replication, Store, StoreError,
+    Append, CheckpointJob, Content, ContentKey, ReadBarrierFuture, Record, Replication, Store,
+    StoreError,
 };
 use bytes::Bytes;
 use std::{
@@ -22,7 +23,65 @@ pub struct ExecutorStore {
     checkpoints: bool,
     replicas: usize,
     replication: Option<Arc<dyn Replication>>,
-    failed: AtomicBool,
+    failed: Arc<AtomicBool>,
+}
+// A detached read dispatcher must retain the same owner-loss fence as calls
+// through ExecutorStore. The guard runs on normal exit and panic alike.
+struct OwnerFailure(Arc<AtomicBool>);
+impl Drop for OwnerFailure {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+struct GuardedReplication {
+    inner: Arc<dyn Replication>,
+    failed: Arc<AtomicBool>,
+}
+impl GuardedReplication {
+    fn ready(&self) -> Result<(), StoreError> {
+        if self.failed.load(Ordering::Acquire) {
+            Err(stopped())
+        } else {
+            Ok(())
+        }
+    }
+}
+impl Replication for GuardedReplication {
+    fn read_barrier(&self) -> Result<(), StoreError> {
+        self.ready()?;
+        self.inner.read_barrier()?;
+        self.ready()
+    }
+    fn read_barrier_async(&self) -> Option<ReadBarrierFuture> {
+        let proof = self.inner.read_barrier_async()?;
+        let failed = self.failed.clone();
+        Some(Box::pin(async move {
+            if failed.load(Ordering::Acquire) {
+                return Err(stopped());
+            }
+            proof.await?;
+            if failed.load(Ordering::Acquire) {
+                return Err(stopped());
+            }
+            Ok(())
+        }))
+    }
+    fn append_with_content(
+        &self,
+        records: &[Append],
+        content: &[Content],
+    ) -> Result<u64, StoreError> {
+        self.ready()?;
+        let result = self.inner.append_with_content(records, content)?;
+        self.ready()?;
+        Ok(result)
+    }
+    fn checkpoint_needed(&self) -> Result<bool, StoreError> {
+        self.ready()?;
+        let result = self.inner.checkpoint_needed()?;
+        self.ready()?;
+        Ok(result)
+    }
 }
 impl ExecutorStore {
     pub fn start<S: Store + 'static>(mut store: S) -> Result<Self, StoreError> {
@@ -38,10 +97,13 @@ impl ExecutorStore {
         } else {
             None
         };
+        let failed = Arc::new(AtomicBool::new(false));
+        let owner_failed = OwnerFailure(failed.clone());
         let (jobs, incoming) = mpsc::sync_channel::<Job>(1);
         let owner = std::thread::Builder::new()
             .name("screech-storage-owner".into())
             .spawn(move || {
+                let _failure = owner_failed;
                 while let Ok(job) = incoming.recv() {
                     job(&mut store);
                 }
@@ -53,7 +115,7 @@ impl ExecutorStore {
             checkpoints,
             replicas,
             replication,
-            failed: AtomicBool::new(false),
+            failed,
         })
     }
     fn call<R: Send + 'static>(
@@ -117,6 +179,12 @@ fn stopped() -> StoreError {
     .into()
 }
 impl Store for ExecutorStore {
+    fn replication(&self) -> Option<Arc<dyn Replication>> {
+        Some(Arc::new(GuardedReplication {
+            inner: self.replication.as_ref()?.clone(),
+            failed: self.failed.clone(),
+        }))
+    }
     fn cluster_status(&self) -> Result<serde_json::Value, StoreError> {
         self.call(|s| s.cluster_status())
     }
