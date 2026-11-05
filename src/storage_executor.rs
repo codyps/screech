@@ -1,10 +1,18 @@
 //! One bounded, permanent owner for strict-mode storage. Requests carry owned
-//! inputs and private completion channels; the worker never runs backend code.
-//! Waiting adapters are deliberately serialized until the consensus event pump
-//! exists. A disconnected executor is an ambiguous outcome, never durable success.
-use crate::storage::{Append, CheckpointJob, Content, ContentKey, Record, Store, StoreError};
+//! inputs and private completion channels. Physical I/O stays on this owner;
+//! replication dispatch can go straight to its independently serialized owner.
+//! A disconnected executor is an ambiguous outcome, never durable success.
+use crate::storage::{
+    Append, CheckpointJob, Content, ContentKey, Record, Replication, Store, StoreError,
+};
 use bytes::Bytes;
-use std::{io, sync::mpsc};
+use std::{
+    io,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
+};
 
 type Job = Box<dyn FnOnce(&mut dyn Store) + Send>;
 pub struct ExecutorStore {
@@ -13,6 +21,8 @@ pub struct ExecutorStore {
     external: bool,
     checkpoints: bool,
     replicas: usize,
+    replication: Option<Arc<dyn Replication>>,
+    failed: AtomicBool,
 }
 impl ExecutorStore {
     pub fn start<S: Store + 'static>(mut store: S) -> Result<Self, StoreError> {
@@ -22,6 +32,12 @@ impl ExecutorStore {
         let external = store.external_content();
         let checkpoints = store.supports_checkpoint();
         let replicas = store.replicas();
+        // Single-voter and standalone backends keep their existing owner path.
+        let replication = if replicas > 1 {
+            store.replication()
+        } else {
+            None
+        };
         let (jobs, incoming) = mpsc::sync_channel::<Job>(1);
         let owner = std::thread::Builder::new()
             .name("screech-storage-owner".into())
@@ -36,21 +52,51 @@ impl ExecutorStore {
             external,
             checkpoints,
             replicas,
+            replication,
+            failed: AtomicBool::new(false),
         })
     }
     fn call<R: Send + 'static>(
         &self,
         job: impl FnOnce(&mut dyn Store) -> Result<R, StoreError> + Send + 'static,
     ) -> Result<R, StoreError> {
+        let lost = || {
+            self.failed.store(true, Ordering::Release);
+            stopped()
+        };
         let (reply, completion) = mpsc::sync_channel(1);
         self.jobs
             .as_ref()
-            .ok_or_else(stopped)?
+            .ok_or_else(lost)?
             .send(Box::new(move |store| {
                 let _ = reply.send(job(store));
             }))
-            .map_err(|_| stopped())?;
-        completion.recv().map_err(|_| stopped())?
+            .map_err(|_| lost())?;
+        completion.recv().map_err(|_| lost())?
+    }
+    fn owner_ready(&self) -> Result<(), StoreError> {
+        if self.failed.load(Ordering::Acquire)
+            || self
+                .owner
+                .as_ref()
+                .is_none_or(std::thread::JoinHandle::is_finished)
+        {
+            self.failed.store(true, Ordering::Release);
+            Err(stopped())
+        } else {
+            Ok(())
+        }
+    }
+    fn replicated<R>(
+        &self,
+        dispatch: impl FnOnce(&dyn Replication) -> Result<R, StoreError>,
+    ) -> Option<Result<R, StoreError>> {
+        self.replication.as_ref().map(|replication| {
+            self.owner_ready()?;
+            let result = dispatch(replication.as_ref());
+            self.owner_ready()?;
+            result
+        })
     }
 }
 impl Drop for ExecutorStore {
@@ -78,13 +124,15 @@ impl Store for ExecutorStore {
         self.call(move |s| s.replace_voter(old, new, nonce))
     }
     fn checkpoint_needed(&self) -> Result<bool, StoreError> {
-        self.call(|s| s.checkpoint_needed())
+        self.replicated(|r| r.checkpoint_needed())
+            .unwrap_or_else(|| self.call(|s| s.checkpoint_needed()))
     }
     fn replicas(&self) -> usize {
         self.replicas
     }
     fn read_barrier(&self) -> Result<(), StoreError> {
-        self.call(|s| s.read_barrier())
+        self.replicated(|r| r.read_barrier())
+            .unwrap_or_else(|| self.call(|s| s.read_barrier()))
     }
     fn durable_appends(&self) -> bool {
         true
@@ -104,9 +152,17 @@ impl Store for ExecutorStore {
             headers: Bytes::copy_from_slice(headers),
             payload: Bytes::copy_from_slice(payload),
         };
+        if let Some(result) =
+            self.replicated(|r| r.append_with_content(std::slice::from_ref(&record), &[]))
+        {
+            return result;
+        }
         self.call(move |s| s.append(&record.subject, &record.headers, &record.payload))
     }
     fn append_batch(&mut self, records: &[Append]) -> Result<u64, StoreError> {
+        if let Some(result) = self.replicated(|r| r.append_with_content(records, &[])) {
+            return result;
+        }
         let records = records.to_vec();
         self.call(move |s| s.append_batch(&records))
     }
@@ -115,6 +171,9 @@ impl Store for ExecutorStore {
         records: &[Append],
         content: &[Content],
     ) -> Result<u64, StoreError> {
+        if let Some(result) = self.replicated(|r| r.append_with_content(records, content)) {
+            return result;
+        }
         let records = records.to_vec();
         let content = content.to_vec();
         self.call(move |s| s.append_with_content(&records, &content))

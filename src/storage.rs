@@ -58,6 +58,18 @@ pub struct CheckpointImage {
     pub imports: Vec<Content>,
 }
 pub type CheckpointJob = Box<dyn FnOnce() -> Result<CheckpointImage, StoreError> + Send>;
+/// Dispatch to an independently serialized replication owner. These methods may
+/// wait for consensus, but must not perform physical storage I/O on the caller.
+/// Success retains the Store durability contract; hints cannot authorize GC.
+pub trait Replication: Send + Sync {
+    fn read_barrier(&self) -> Result<(), StoreError>;
+    fn append_with_content(
+        &self,
+        records: &[Append],
+        content: &[Content],
+    ) -> Result<u64, StoreError>;
+    fn checkpoint_needed(&self) -> Result<bool, StoreError>;
+}
 fn content_checksum(content: &Content) -> u32 {
     let mut h = crc32fast::Hasher::new();
     h.update(&content.key.generation.to_le_bytes());
@@ -74,6 +86,9 @@ fn content_checksum(content: &Content) -> u32 {
 }
 /// An atomic durable append log. Metadata and records share one transaction domain.
 pub trait Store: Send {
+    fn replication(&self) -> Option<std::sync::Arc<dyn Replication>> {
+        None
+    }
     fn cluster_status(&self) -> Result<serde_json::Value, StoreError> {
         Err(StoreError::Invalid)
     }

@@ -2,8 +2,8 @@ use bytes::Bytes;
 use screech::{
     durable::{Engine, StreamConfig},
     storage::{
-        Append, CheckpointImage, CheckpointJob, Content, ContentKey, Record, SqliteStore, Store,
-        StoreError,
+        Append, CheckpointImage, CheckpointJob, Content, ContentKey, Record, Replication,
+        SqliteStore, Store, StoreError,
     },
     storage_executor::ExecutorStore,
 };
@@ -17,6 +17,7 @@ struct Probe {
     calls: Mutex<Vec<(&'static str, std::thread::ThreadId)>>,
     fail_read: AtomicBool,
     fail_checkpoint: AtomicBool,
+    fail_replication: AtomicBool,
 }
 impl Probe {
     fn note(&self, name: &'static str) {
@@ -29,8 +30,19 @@ impl Probe {
 struct Observed {
     inner: SqliteStore,
     probe: Arc<Probe>,
+    replication: Option<Arc<dyn Replication>>,
 }
 impl Store for Observed {
+    fn replication(&self) -> Option<Arc<dyn Replication>> {
+        self.replication.clone()
+    }
+    fn replicas(&self) -> usize {
+        if self.replication.is_some() {
+            3
+        } else {
+            1
+        }
+    }
     fn durable_appends(&self) -> bool {
         true
     }
@@ -92,6 +104,7 @@ fn setup(path: &std::path::Path, probe: Arc<Probe>) -> Engine<ExecutorStore> {
     let store = ExecutorStore::start(Observed {
         inner: SqliteStore::open(path).unwrap(),
         probe,
+        replication: None,
     })
     .unwrap();
     let mut engine = Engine::recover_single_voter(store).unwrap();
@@ -174,16 +187,134 @@ fn failed_read_or_checkpoint_quarantines_and_preserves_durable_state() {
 }
 #[test]
 fn executor_loss_is_an_error_and_does_not_become_success() {
+    for replicated in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = Arc::new(Probe::default());
+        let mut store = ExecutorStore::start(Observed {
+            inner: SqliteStore::open(dir.path().join("db")).unwrap(),
+            probe: probe.clone(),
+            replication: replicated.then_some(probe),
+        })
+        .unwrap();
+        assert!(store
+            .checkpoint_job(
+                0,
+                Box::new(|| -> Result<CheckpointImage, StoreError> {
+                    panic!("injected owner failure")
+                })
+            )
+            .is_err());
+        assert!(store.last_sequence().is_err());
+        assert!(store.read_barrier().is_err());
+        assert!(store.append_batch(&[]).is_err());
+        assert!(store.checkpoint_needed().is_err());
+    }
+}
+
+// A dispatch-only test double: no successful nonempty append is issued through
+// it. Real replicated durability and epochs are checked by the cluster suites.
+impl Replication for Probe {
+    fn read_barrier(&self) -> Result<(), StoreError> {
+        self.note("dispatch-barrier");
+        if self.fail_replication.load(Ordering::Acquire) {
+            Err(StoreError::Invalid)
+        } else {
+            Ok(())
+        }
+    }
+    fn append_with_content(&self, records: &[Append], _: &[Content]) -> Result<u64, StoreError> {
+        self.note("dispatch-append");
+        if self.fail_replication.load(Ordering::Acquire) {
+            Err(StoreError::Invalid)
+        } else {
+            assert!(records.is_empty());
+            Ok(0)
+        }
+    }
+    fn checkpoint_needed(&self) -> Result<bool, StoreError> {
+        self.note("dispatch-pressure");
+        Ok(false)
+    }
+}
+
+#[test]
+fn replication_dispatch_avoids_the_proxy_but_reads_and_checkpoints_keep_their_owner() {
     let dir = tempfile::tempdir().unwrap();
-    let mut store =
-        ExecutorStore::start(SqliteStore::open(dir.path().join("db")).unwrap()).unwrap();
-    assert!(store
+    let probe = Arc::new(Probe::default());
+    let mut store = ExecutorStore::start(Observed {
+        inner: SqliteStore::open(dir.path().join("db")).unwrap(),
+        probe: probe.clone(),
+        replication: Some(probe.clone()),
+    })
+    .unwrap();
+    store.read_barrier().unwrap();
+    assert_eq!(store.append_with_content(&[], &[]).unwrap(), 0);
+    assert_eq!(store.append_batch(&[]).unwrap(), 0);
+    assert!(!store.checkpoint_needed().unwrap());
+    assert!(store.get(1).unwrap().is_none());
+    assert_eq!(store.last_sequence().unwrap(), 0);
+    assert!(store.load_checkpoint().unwrap().is_none());
+    let captured = probe.clone();
+    store
         .checkpoint_job(
             0,
-            Box::new(|| -> Result<CheckpointImage, StoreError> {
-                panic!("injected owner failure")
-            })
+            Box::new(move || {
+                captured.note("image-job");
+                Ok(CheckpointImage {
+                    data: b"root".to_vec(),
+                    live: vec![],
+                    imports: vec![],
+                })
+            }),
         )
-        .is_err());
-    assert!(store.last_sequence().is_err());
+        .unwrap();
+    let calls = probe.calls.lock().unwrap();
+    let caller = std::thread::current().id();
+    let owner = calls.iter().find(|(name, _)| *name == "get").unwrap().1;
+    assert_ne!(owner, caller);
+    for (name, thread) in calls.iter() {
+        assert_eq!(
+            *thread,
+            if name.starts_with("dispatch-") {
+                caller
+            } else {
+                owner
+            },
+            "{name} ran on the wrong owner"
+        );
+    }
+}
+
+#[test]
+fn failed_replication_dispatch_cannot_advance_or_expose_the_engine_projection() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = Arc::new(Probe::default());
+    probe.fail_replication.store(true, Ordering::Release);
+    let store = ExecutorStore::start(Observed {
+        inner: SqliteStore::open(dir.path().join("db")).unwrap(),
+        probe: probe.clone(),
+        replication: Some(probe),
+    })
+    .unwrap();
+    let mut engine = Engine::recover_single_voter(store).unwrap();
+    let event = engine
+        .state()
+        .prepare_create(
+            StreamConfig {
+                name: "S".into(),
+                subjects: vec!["a".into()],
+                ..Default::default()
+            },
+            0,
+        )
+        .unwrap();
+    assert!(engine.commit(event).is_err());
+    assert!(engine.is_poisoned());
+    assert!(engine.state().streams.is_empty());
+    let position = engine.voter_progress().unwrap();
+    assert_eq!(
+        (position.durable, position.committed, position.applied),
+        (0, 0, 0)
+    );
+    assert!(engine.begin_group().is_err());
 }
