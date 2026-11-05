@@ -286,26 +286,27 @@ impl Database {
                 "DELETE FROM event_index;DELETE FROM body_index;DELETE FROM snapshot_bodies;",
             )
             .map_err(error)?;
-            for (key, bytes, hash) in rows {
-                tx.execute(
-                    "INSERT INTO snapshot_bodies VALUES(?1,?2,?3,?4)",
-                    params![
+            {
+                let mut insert = tx.prepare_cached("INSERT INTO snapshot_bodies VALUES(?1,?2,?3,?4)").map_err(error)?;
+                for (key, bytes, hash) in rows {
+                    insert.execute(params![
                         sql(key.generation)?,
                         sql(key.sequence)?,
                         bytes,
                         hash.as_slice()
-                    ],
-                )
-                .map_err(error)?;
+                    ]).map_err(error)?;
+                }
             }
+            {
+            let mut insert = tx.prepare_cached("INSERT INTO entries VALUES(?1,?2,?3,?4)").map_err(error)?;
             for e in entries {
                 let b = e.write_to_bytes().map_err(error)?;
-                tx.execute(
-                    "INSERT INTO entries VALUES(?1,?2,?3,?4)",
-                    params![sql(e.index)?, sql(e.term)?, b, crc32fast::hash(&b)],
-                )
+                insert.execute(params![sql(e.index)?, sql(e.term)?, b, crc32fast::hash(&b)])
                 .map_err(error)?;
             }
+            }
+            {
+            let mut insert = tx.prepare_cached("INSERT INTO cluster_meta VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value").map_err(error)?;
             for (key, value) in [
                 ("raft_snapshot", bytes.clone()),
                 ("raft_snapshot_hash", digest(&bytes).to_vec()),
@@ -319,11 +320,9 @@ impl Database {
                 ("event_sequence", image.sequence.to_le_bytes().to_vec()),
                 ("journal_root", root),
             ] {
-                tx.execute(
-                    "INSERT INTO cluster_meta VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    params![key, value],
-                )
+                insert.execute(params![key, value])
                 .map_err(error)?;
+            }
             }
             let mut crc = crc32fast::Hasher::new();
             crc.update(&image.sequence.to_le_bytes());
