@@ -258,6 +258,10 @@ mod tests {
             .await
             .unwrap());
         drop(preceding);
+        // A response can wake its caller before the worker drops Request's
+        // lease. The next request may correctly take the conservative fallback
+        // until that lease is released; synchronize before testing fast dispatch.
+        timeout_for_lease(&handle).await;
         assert_eq!(proofs.calls.load(Ordering::SeqCst), 0);
         assert!(matches!(
             output.try_recv(),
