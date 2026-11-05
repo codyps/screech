@@ -131,7 +131,6 @@ impl Database {
             self.entry(index)?.term
         };
         let contents = self.contents(&image.live)?;
-        crate::durable::validate_cluster_snapshot(&image.data, &contents).map_err(error)?;
         let manifest = contents
             .iter()
             .map(|c| Ok((c.key, digest(&postcard::to_allocvec(c).map_err(error)?))))
@@ -149,9 +148,13 @@ impl Database {
         snap.mut_metadata().index = index;
         snap.mut_metadata().term = term;
         snap.mut_metadata().set_conf_state(self.conf()?);
-        snap.data = postcard::to_allocvec(&image).map_err(error)?.into();
+        // The local image already owns its bodies. Keep the transfer-size limit,
+        // but do not allocate and parse a second copy of every retained payload.
+        if postcard::experimental::serialized_size(&image).map_err(error)? > MAX_SNAPSHOT {
+            return Err(error("snapshot too large"));
+        }
         let hard = self.hard()?;
-        self.install_snapshot(&snap, Some(&hard), &[], true)
+        self.install_image(&snap, image, Some(&hard), &[], true)
     }
     /// Durable activation, covered-prefix reclamation and application recovery
     /// root change together. FULL transaction failure retains the previous image.
@@ -168,7 +171,20 @@ impl Database {
         if snapshot.data.len() > MAX_SNAPSHOT {
             return Err(error("snapshot too large"));
         }
-        let mut image: Image = postcard::from_bytes(&snapshot.data).map_err(error)?;
+        let image: Image = postcard::from_bytes(&snapshot.data).map_err(error)?;
+        self.install_image(snapshot, image, hard, entries, local)
+    }
+    fn install_image(
+        &mut self,
+        snapshot: &Snapshot,
+        mut image: Image,
+        hard: Option<&HardState>,
+        entries: &[Entry],
+        local: bool,
+    ) -> io::Result<()> {
+        if self.failed {
+            return Err(error("replica quarantined"));
+        }
         if image.version != 1 || image.contents.len() != image.manifest.len() {
             return Err(error("invalid snapshot image"));
         }
@@ -211,12 +227,19 @@ impl Database {
         if local && (index != self.view()? || index > old.commit) {
             return Err(error("uncommitted checkpoint"));
         }
-        if base > 0
-            && index == base
-            && (snapshot.get_metadata().term != self.snapshot_position.1
-                || snapshot.data != self.snapshot()?.data)
-        {
-            return Err(error("snapshot conflicts with committed image"));
+        if base > 0 && index == base {
+            // Repeated compaction must still authenticate the complete image,
+            // including its bodies, against the already committed snapshot.
+            let data = if local {
+                postcard::to_allocvec(&image).map_err(error)?
+            } else {
+                snapshot.data.to_vec()
+            };
+            if snapshot.get_metadata().term != self.snapshot_position.1
+                || data.as_slice() != self.snapshot()?.data.as_ref()
+            {
+                return Err(error("snapshot conflicts with committed image"));
+            }
         }
         let mut next = hard.cloned().unwrap_or_else(|| old.clone());
         if next.term < old.term || (next.term == old.term && old.vote != 0 && next.vote != old.vote)
@@ -476,6 +499,73 @@ mod tests {
         assert_eq!(db.end().unwrap(), 2);
         assert_eq!(db.last().unwrap(), 2);
         assert_eq!(db.content(key).unwrap().unwrap().payload, "retained");
+    }
+    #[test]
+    fn invalid_local_checkpoint_preserves_the_complete_recovery_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut db, data) = donor(dir.path());
+        let key = ContentKey {
+            generation: 1,
+            sequence: 1,
+        };
+        let mut malformed = data.clone();
+        malformed[0] = 127;
+        let previous_root = db.meta("journal_root").unwrap();
+        let previous_hard = db.hard().unwrap();
+        let previous_journal =
+            std::fs::read(dir.path().join("donor").with_extension("cluster-watermark")).unwrap();
+        for (model, live) in [
+            (malformed, vec![key]),
+            (data.clone(), vec![]),
+            (data.clone(), vec![key, key]),
+            (
+                data.clone(),
+                vec![ContentKey {
+                    generation: 99,
+                    sequence: 1,
+                }],
+            ),
+        ] {
+            assert!(db
+                .compact(
+                    2,
+                    CheckpointImage {
+                        data: model,
+                        live,
+                        imports: vec![],
+                    },
+                )
+                .is_err());
+            assert_eq!(db.meta("journal_root").unwrap(), previous_root);
+            assert_eq!(db.hard().unwrap(), previous_hard);
+            assert_eq!(db.snapshot_base().unwrap(), (0, 0, 0));
+            assert_eq!(db.end().unwrap(), 2);
+            assert_eq!(db.content(key).unwrap().unwrap().payload, "retained");
+            assert_eq!(
+                std::fs::read(dir.path().join("donor").with_extension("cluster-watermark"))
+                    .unwrap(),
+                previous_journal
+            );
+        }
+        db.compact(
+            2,
+            CheckpointImage {
+                data,
+                live: vec![key],
+                imports: vec![],
+            },
+        )
+        .unwrap();
+        let transferred = db.snapshot().unwrap();
+        let mut receiver = Database::open(&dir.path().join("receiver"), &config(2), true).unwrap();
+        receiver
+            .install_snapshot(&transferred, Some(&previous_hard), &[], false)
+            .unwrap();
+        assert_eq!(receiver.snapshot().unwrap(), transferred);
+        drop(receiver);
+        let receiver = Database::open(&dir.path().join("receiver"), &config(2), false).unwrap();
+        assert_eq!(receiver.end().unwrap(), 2);
+        assert_eq!(receiver.content(key).unwrap().unwrap().payload, "retained");
     }
     #[test]
     fn full_checkpoint_before_journal_rotation_recovers_but_an_older_root_cannot_replace_it() {
