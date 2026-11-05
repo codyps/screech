@@ -568,14 +568,34 @@ fn next_batch_input(
     // projection can share one transaction, on followers as well as the leader.
     // Never wait, skip an input, accept new entries past the time budget, or
     // carry a new term across this boundary. The eight-input cap still applies.
-    let completion = matches!(&input, Input::Message(message, _, _)
+    if over_budget && !completes_projection(&input, term) {
+        *deferred = Some(input);
+        None
+    } else {
+        Some(input)
+    }
+}
+fn completes_projection(input: &Input, term: u64) -> bool {
+    matches!(input, Input::Message(message, _, _)
         if message.term == term && (matches!(message.get_msg_type(),
             raft::eraftpb::MessageType::MsgAppendResponse |
             raft::eraftpb::MessageType::MsgHeartbeatResponse |
             raft::eraftpb::MessageType::MsgHeartbeat)
             || (message.get_msg_type() == raft::eraftpb::MessageType::MsgAppend
-                && message.entries.is_empty())));
-    if over_budget && !completion {
+                && message.entries.is_empty())))
+}
+fn follower_commit_input(
+    rx: &mpsc::Receiver<Input>,
+    deferred: &mut Option<Input>,
+    term: u64,
+    deadline: Instant,
+) -> Option<Input> {
+    let input = rx
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()?;
+    // Holding a follower's query transaction never delays a newly queued
+    // acceptance, epoch change or control request behind the grace period.
+    if !completes_projection(&input, term) {
         *deferred = Some(input);
         None
     } else {
@@ -1084,7 +1104,11 @@ async fn run_runtime(
                 project(&mut node, |node, completed| {
                 let started = Instant::now();
                 let mut processed = 0;
+                let mut commit_deadline = None;
                 loop {
+                let accepted_input = matches!(&input, Ok(Input::Message(message, _, _))
+                    if message.get_msg_type() == raft::eraftpb::MessageType::MsgAppend
+                        && !message.entries.is_empty());
                 match input {
                     Ok(Input::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => { stopped = true; break; },
                     Ok(Input::SnapshotSent(id, ok)) => node.report_snapshot(
@@ -1271,6 +1295,17 @@ async fn run_runtime(
                 pump_ready(node, &mut pending, &out, &routes, completed)?;
                 hedge_reads(node, &pending, &mut read_probes, Instant::now());
                 pump_ready(node, &mut pending, &out, &routes, completed)?;
+                if accepted_input && node.raft.state == StateRole::Follower
+                    && node.raft.raft_log.applied < node.raft.raft_log.last_index()
+                    && !node.store().db.lock().unwrap().conn.is_autocommit()
+                {
+                    // The complete accepted journal and replication ACK are
+                    // already durable/dispatched by pump_ready. Only closing this
+                    // follower's replayable SQL transaction waits for the commit
+                    // notification, bounded to one millisecond of idle time.
+                    commit_deadline = Some(Instant::now() + Duration::from_millis(1));
+                    crate::fault::point("after_cluster_accept_before_projection_commit");
+                }
                 {
                     let db = node.store().db.lock().unwrap();
                     // Only configuration application and snapshot installation
@@ -1291,7 +1326,15 @@ async fn run_runtime(
                 match next_batch_input(&rx, &mut deferred_input,
                     started.elapsed() >= Duration::from_micros(100), node.raft.term) {
                     Some(next) => input = Ok(next),
-                    None => break,
+                    None => {
+                        let next = commit_deadline.filter(|deadline| {
+                            deferred_input.is_none() && *deadline > Instant::now()
+                                && node.raft.state == StateRole::Follower
+                                && node.raft.raft_log.applied < node.raft.raft_log.last_index()
+                        }).and_then(|deadline| follower_commit_input(
+                            &rx, &mut deferred_input, node.raft.term, deadline));
+                        if let Some(next) = next { input = Ok(next); } else { break; }
+                    },
                 }
                 }
                 Ok(Role { leader: node.raft.leader_id, term: node.raft.term, configuration: policy_index })
@@ -1590,6 +1633,53 @@ mod tests {
         );
     }
     #[test]
+    fn follower_commit_wait_defers_new_entries_and_terms_and_respects_its_deadline() {
+        use raft::eraftpb::{Entry, MessageType};
+        let (tx, rx) = mpsc::sync_channel(4);
+        let mut deferred = None;
+        let input = |kind, term, entries: Vec<Entry>| {
+            Input::Message(
+                Message {
+                    from: 1,
+                    to: 2,
+                    term,
+                    msg_type: kind,
+                    entries: entries.into(),
+                    ..Default::default()
+                },
+                [0; 16],
+                Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap(),
+            )
+        };
+        tx.send(input(MessageType::MsgHeartbeat, 3, vec![]))
+            .unwrap();
+        assert!(follower_commit_input(&rx, &mut deferred, 3, Instant::now()).is_some());
+        tx.send(input(
+            MessageType::MsgAppend,
+            3,
+            vec![Entry {
+                index: 7,
+                term: 3,
+                ..Default::default()
+            }],
+        ))
+        .unwrap();
+        tx.send(input(MessageType::MsgHeartbeat, 3, vec![]))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        assert!(follower_commit_input(&rx, &mut deferred, 3, deadline).is_none());
+        assert!(matches!(deferred.take(), Some(Input::Message(m,_,_)) if !m.entries.is_empty()));
+        assert!(follower_commit_input(&rx, &mut deferred, 3, deadline).is_some());
+        tx.send(input(MessageType::MsgHeartbeat, 4, vec![]))
+            .unwrap();
+        assert!(follower_commit_input(&rx, &mut deferred, 3, deadline).is_none());
+        assert!(matches!(deferred.take(), Some(Input::Message(m,_,_)) if m.term==4));
+        assert!(follower_commit_input(&rx, &mut deferred, 3, Instant::now()).is_none());
+        assert!(deferred.is_none());
+        drop(tx);
+        assert!(follower_commit_input(&rx, &mut deferred, 3, deadline).is_none());
+    }
+    #[test]
     fn borrowed_peer_frames_remain_compatible_with_owned_wire_format() {
         #[derive(Serialize, Deserialize)]
         struct OwnedEnvelope {
@@ -1788,6 +1878,98 @@ mod tests {
                 .propose(vec![], postcard::to_allocvec(&batch).unwrap())
                 .unwrap();
         }
+    }
+    #[test]
+    fn follower_acceptance_ack_and_commit_projection_share_a_sql_transaction() {
+        use raft::eraftpb::MessageType;
+        let dir = tempfile::tempdir().unwrap();
+        let mut sim = Simulation::new(dir.path());
+        sim.nodes[0].campaign().unwrap();
+        sim.settle(None);
+        sim.propose(0, 1, b"confirmed");
+        pump(
+            &mut sim.nodes[0],
+            &mut sim.pending[0],
+            &sim.send,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let append = sim.receive[1].try_recv().unwrap();
+        assert_eq!(append.get_msg_type(), MessageType::MsgAppend);
+        let accepted = append.entries.last().unwrap().index;
+        let initial = sim.nodes[1]
+            .store()
+            .db
+            .lock()
+            .unwrap()
+            .projection_changes
+            .load(Ordering::Acquire);
+        let (leader, rest) = sim.nodes.split_at_mut(1);
+        let follower = &mut rest[0];
+        project(
+            follower,
+            |follower, completed| {
+                follower.step(append).unwrap();
+                pump_ready(
+                    follower,
+                    &mut sim.pending[1],
+                    &sim.send,
+                    &BTreeMap::new(),
+                    completed,
+                )?;
+                {
+                    let db = follower.store().db.lock().unwrap();
+                    assert!(!db.conn.is_autocommit());
+                    assert_eq!(db.projection_changes.load(Ordering::Acquire), initial);
+                    assert_eq!(db.durable_term()?, follower.raft.term);
+                }
+                // The normal pump released a durable acceptance response before
+                // closing the follower's query transaction. Obtain a real quorum
+                // commit, then project its notification in that same transaction.
+                let ack = sim.receive[0].try_recv().unwrap();
+                assert_eq!(ack.get_msg_type(), MessageType::MsgAppendResponse);
+                assert!(!ack.reject);
+                assert_eq!(ack.index, accepted);
+                leader[0].step(ack).unwrap();
+                pump(
+                    &mut leader[0],
+                    &mut sim.pending[0],
+                    &sim.send,
+                    &BTreeMap::new(),
+                )?;
+                let notification = sim.receive[1].try_recv().unwrap();
+                assert!(notification.entries.is_empty());
+                assert_eq!(notification.commit, accepted);
+                follower.step(notification).unwrap();
+                pump_ready(
+                    follower,
+                    &mut sim.pending[1],
+                    &sim.send,
+                    &BTreeMap::new(),
+                    completed,
+                )?;
+                let db = follower.store().db.lock().unwrap();
+                assert_eq!(db.view()?, accepted);
+                assert!(!db.conn.is_autocommit());
+                assert_eq!(db.projection_changes.load(Ordering::Acquire), initial);
+                Ok(())
+            },
+            |_| {},
+        )
+        .unwrap();
+        let db = follower.store().db.lock().unwrap();
+        assert!(db.conn.is_autocommit());
+        assert!(db.projection_changes.load(Ordering::Acquire) > initial);
+        assert_eq!(
+            db.content(ContentKey {
+                generation: 1,
+                sequence: 1
+            })
+            .unwrap()
+            .unwrap()
+            .payload,
+            "confirmed"
+        );
     }
     #[test]
     fn partition_replaces_uncommitted_content_and_restart_recovers_only_committed_history() {

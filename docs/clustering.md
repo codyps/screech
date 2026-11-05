@@ -70,6 +70,11 @@ can complete that transaction after its time budget expires. New entries,
 snapshots and new terms start a later turn. This lets follower commit updates
 join the accepted-entry projection without waiting or exceeding the eight-input
 batch limit.
+After dispatching a durable acceptance ACK, an idle follower can keep that SQL
+transaction open for up to one millisecond for the leader's commit notification.
+New entries, epoch changes and control requests end the wait immediately. This
+amortizes follower projection writes while the leader and standalone scheduling
+remain unchanged; replication ACKs still require the complete synced journal.
 
 Connected peer streams can send small authenticated frames directly with a
 nonblocking socket write. A reserved slot in the same bounded writer queue owns

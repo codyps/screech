@@ -20,7 +20,7 @@ def audit_voter(cluster, slot, expected, attempts=30):
                 for sequence, body in expected.items():
                     assert client.get(sequence) == body, (slot, sequence)
                 info = client.request('$JS.API.CONSUMER.INFO.T.D', {})
-                assert info['ack_floor']['consumer_seq'] >= 1, info
+                assert info['ack_floor']['consumer_seq'] == 1, info
                 assert info['num_ack_pending'] == 0, info
                 duplicate = client.publish_with_id(b'ignored', 'stable')
                 assert duplicate['duplicate'] and duplicate['seq'] == 1, duplicate
