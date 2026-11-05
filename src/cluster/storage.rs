@@ -97,6 +97,9 @@ impl Database {
             return Err(error("missing cluster database"));
         }
         let conn = Connection::open(path).map_err(error)?;
+        // Keep transaction control and the ordinary projection lookups cached
+        // together; checkpoint statements may otherwise evict the hot set.
+        conn.set_prepared_statement_cache_capacity(32);
         if !existed {
             // Raft appends and small metadata updates otherwise dirty several
             // 4 KiB WAL pages for a small publication. Existing roots retain
@@ -583,10 +586,18 @@ impl Database {
     }
     fn projection_sql(&self) -> io::Result<()> {
         if self.projection_batch && !self.projection_transaction.get() {
-            self.conn.execute_batch("BEGIN DEFERRED").map_err(error)?;
+            self.projection_statement("BEGIN DEFERRED")?;
             self.projection_transaction.set(true);
         }
         Ok(())
+    }
+    fn projection_statement(&self, sql: &'static str) -> io::Result<()> {
+        self.conn
+            .prepare_cached(sql)
+            .map_err(error)?
+            .execute([])
+            .map(|_| ())
+            .map_err(error)
     }
     pub(super) fn finish_projection(&mut self, commit: bool) -> io::Result<()> {
         if !self.projection_batch {
@@ -594,9 +605,7 @@ impl Database {
         }
         let started = self.projection_transaction.get();
         let result = if started {
-            self.conn
-                .execute_batch(if commit { "COMMIT" } else { "ROLLBACK" })
-                .map_err(error)
+            self.projection_statement(if commit { "COMMIT" } else { "ROLLBACK" })
         } else {
             Ok(())
         };
@@ -613,7 +622,7 @@ impl Database {
         if result.is_err() {
             self.failed = true;
             if !self.conn.is_autocommit() {
-                let _ = self.conn.execute_batch("ROLLBACK");
+                let _ = self.projection_statement("ROLLBACK");
             }
         }
         result
