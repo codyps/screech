@@ -271,7 +271,12 @@ mod tests {
     }
     #[tokio::test]
     async fn urgent_traffic_releases_background_appends_without_reordering_or_lost_wakeups() {
-        for wait_for_writer in [false, true] {
+        for (wait_for_writer, urgent_kind) in [
+            (false, MessageType::MsgHeartbeat),
+            (true, MessageType::MsgHeartbeat),
+            (false, MessageType::MsgAppend),
+            (true, MessageType::MsgAppend),
+        ] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let (tx, _rx) = mpsc::sync_channel(4);
             let (stop, stopping) = watch::channel(false);
@@ -284,6 +289,11 @@ mod tests {
             );
             let mut append = heartbeat(1);
             append.msg_type = MessageType::MsgAppend;
+            append.entries.push(raft::eraftpb::Entry {
+                index: 1,
+                term: 1,
+                ..Default::default()
+            });
             sender
                 .background(append, Instant::now() + Duration::from_secs(30))
                 .unwrap();
@@ -295,7 +305,9 @@ mod tests {
                 );
             }
             // Exercise both a pre-existing wakeup and a writer already waiting.
-            sender.try_send(heartbeat(2)).unwrap();
+            let mut urgent = heartbeat(2);
+            urgent.msg_type = urgent_kind;
+            sender.try_send(urgent).unwrap();
             let (mut input, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
                 .await
                 .unwrap()
@@ -311,10 +323,7 @@ mod tests {
             let (next, _, _) = receive_message(&config(2), &mut input, budget, None)
                 .await
                 .unwrap();
-            assert_eq!(
-                (next.get_msg_type(), next.index),
-                (MessageType::MsgHeartbeat, 2)
-            );
+            assert_eq!((next.get_msg_type(), next.index), (urgent_kind, 2));
             stop.send_replace(true);
         }
     }
