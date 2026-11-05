@@ -3,9 +3,13 @@
 use super::*;
 
 const FAST_MESSAGE_BYTES: u32 = 32 * 1024;
+const BACKGROUND_APPEND_DELAY: Duration = Duration::from_millis(1);
 
 pub(super) trait MessageSender {
     fn try_send(&self, message: Message) -> Result<(), ()>;
+    fn try_send_background(&self, message: Message) -> Result<(), ()> {
+        self.try_send(message)
+    }
 }
 #[cfg(test)]
 impl MessageSender for tokio::sync::mpsc::Sender<Message> {
@@ -21,10 +25,16 @@ struct Connection {
 #[derive(Default)]
 struct State {
     pending: usize,
+    urgent: u64,
     streams: BTreeMap<u64, Connection>,
 }
 enum Write {
     Message(Message),
+    Background {
+        message: Message,
+        deadline: Instant,
+        urgent: u64,
+    },
     Frame {
         to: u64,
         stream: Arc<TcpStream>,
@@ -35,7 +45,7 @@ enum Write {
 impl Write {
     fn to(&self) -> u64 {
         match self {
-            Self::Message(message) => message.to,
+            Self::Message(message) | Self::Background { message, .. } => message.to,
             Self::Frame { to, .. } => *to,
         }
     }
@@ -45,6 +55,7 @@ pub(super) struct PeerSender {
     incarnation: [u8; 16],
     state: Arc<Mutex<State>>,
     send: tokio::sync::mpsc::Sender<Write>,
+    urgent: Arc<tokio::sync::Notify>,
 }
 impl MessageSender for PeerSender {
     fn try_send(&self, message: Message) -> Result<(), ()> {
@@ -94,8 +105,14 @@ impl MessageSender for PeerSender {
             }
         }
         state.pending += 1;
+        state.urgent = state.urgent.wrapping_add(1);
         permit.send(queued);
+        drop(state);
+        self.urgent.notify_one();
         Ok(())
+    }
+    fn try_send_background(&self, message: Message) -> Result<(), ()> {
+        self.background(message, Instant::now() + BACKGROUND_APPEND_DELAY)
     }
 }
 
@@ -121,6 +138,18 @@ fn small_frame(
     )
 }
 impl PeerSender {
+    fn background(&self, message: Message, deadline: Instant) -> Result<(), ()> {
+        let mut state = self.state.lock().unwrap();
+        let permit = self.send.try_reserve().map_err(|_| ())?;
+        let urgent = state.urgent;
+        state.pending += 1;
+        permit.send(Write::Background {
+            message,
+            deadline,
+            urgent,
+        });
+        Ok(())
+    }
     pub(super) fn start(
         config: ClusterConfig,
         address: SocketAddr,
@@ -132,11 +161,34 @@ impl PeerSender {
         let state = Arc::new(Mutex::new(State::default()));
         let writer_state = state.clone();
         let writer_config = config.clone();
+        let urgent = Arc::new(tokio::sync::Notify::new());
+        let writer_urgent = urgent.clone();
         tokio::spawn(async move {
             loop {
                 let write = tokio::select! {
                     _ = stop.changed() => break,
                     next = receive.recv() => { let Some(next) = next else { break }; next }
+                };
+                let write = if let Write::Background {
+                    message,
+                    deadline,
+                    urgent,
+                } = write
+                {
+                    loop {
+                        let notified = writer_urgent.notified();
+                        if writer_state.lock().unwrap().urgent != urgent {
+                            break;
+                        }
+                        tokio::select! {
+                            _ = stop.changed() => return,
+                            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => break,
+                            _ = notified => (),
+                        }
+                    }
+                    Write::Message(message)
+                } else {
+                    write
                 };
                 let to = write.to();
                 let snapshot = matches!(&write, Write::Message(message)
@@ -145,6 +197,7 @@ impl PeerSender {
                     _ = stop.changed() => break,
                     result = tokio::time::timeout(Duration::from_secs(30), async {
                         match write {
+                            Write::Background {..} => unreachable!("background delay is resolved before writing"),
                             Write::Frame { stream, frame, written, .. } => {
                                 write_peer_frame(&stream, &frame[written..]).await
                             }
@@ -195,6 +248,7 @@ impl PeerSender {
             incarnation,
             state,
             send,
+            urgent,
         }
     }
 }
@@ -214,6 +268,88 @@ mod tests {
             msg_type: MessageType::MsgHeartbeat,
             ..Default::default()
         }
+    }
+    #[tokio::test]
+    async fn urgent_traffic_releases_background_appends_without_reordering_or_lost_wakeups() {
+        for wait_for_writer in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (tx, _rx) = mpsc::sync_channel(4);
+            let (stop, stopping) = watch::channel(false);
+            let sender = PeerSender::start(
+                config(1),
+                listener.local_addr().unwrap(),
+                tx,
+                stopping,
+                [7; 16],
+            );
+            let mut append = heartbeat(1);
+            append.msg_type = MessageType::MsgAppend;
+            sender
+                .background(append, Instant::now() + Duration::from_secs(30))
+                .unwrap();
+            if wait_for_writer {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                        .await
+                        .is_err()
+                );
+            }
+            // Exercise both a pre-existing wakeup and a writer already waiting.
+            sender.try_send(heartbeat(2)).unwrap();
+            let (mut input, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let budget = Arc::new(Semaphore::new(MAX_FRAME));
+            let (first, nonce, _) = receive_message(&config(2), &mut input, budget.clone(), None)
+                .await
+                .unwrap();
+            assert_eq!(
+                (first.get_msg_type(), first.index, nonce),
+                (MessageType::MsgAppend, 1, [7; 16])
+            );
+            let (next, _, _) = receive_message(&config(2), &mut input, budget, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                (next.get_msg_type(), next.index),
+                (MessageType::MsgHeartbeat, 2)
+            );
+            stop.send_replace(true);
+        }
+    }
+    #[tokio::test]
+    async fn background_append_deadline_sends_without_any_urgent_message() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (tx, _rx) = mpsc::sync_channel(4);
+        let (stop, stopping) = watch::channel(false);
+        let sender = PeerSender::start(
+            config(1),
+            listener.local_addr().unwrap(),
+            tx,
+            stopping,
+            [0; 16],
+        );
+        let mut append = heartbeat(1);
+        append.msg_type = MessageType::MsgAppend;
+        sender.try_send_background(append).unwrap();
+        let (mut input, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let (message, _, _) = receive_message(
+            &config(2),
+            &mut input,
+            Arc::new(Semaphore::new(MAX_FRAME)),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (message.get_msg_type(), message.index),
+            (MessageType::MsgAppend, 1)
+        );
+        stop.send_replace(true);
     }
     #[tokio::test]
     async fn partial_frame_finishes_before_queued_snapshot_and_small_message() {
@@ -302,6 +438,7 @@ mod tests {
             incarnation: [7; 16],
             state,
             send,
+            urgent: Arc::new(tokio::sync::Notify::new()),
         };
         // Model a writer already holding the previous frame's remainder.
         sender.state.lock().unwrap().streams.insert(
@@ -312,12 +449,19 @@ mod tests {
             },
         );
         for n in 1..=4 {
-            sender.try_send(heartbeat(n)).unwrap();
+            if n % 2 == 0 {
+                sender.try_send_background(heartbeat(n)).unwrap();
+            } else {
+                sender.try_send(heartbeat(n)).unwrap();
+            }
         }
         assert!(sender.try_send(heartbeat(5)).is_err());
+        assert!(sender.try_send_background(heartbeat(5)).is_err());
         assert_eq!(sender.state.lock().unwrap().pending, 5);
         for n in 1..=4 {
-            let Write::Message(message) = receive.try_recv().unwrap() else {
+            let (Write::Message(message) | Write::Background { message, .. }) =
+                receive.try_recv().unwrap()
+            else {
                 panic!("out-of-order frame")
             };
             assert_eq!(message.index, n);
@@ -325,6 +469,7 @@ mod tests {
         sender.state.lock().unwrap().pending = 0;
         drop(receive);
         assert!(sender.try_send(heartbeat(6)).is_err());
+        assert!(sender.try_send_background(heartbeat(6)).is_err());
         assert!(
             tokio::time::timeout(Duration::from_millis(20), input.read_u8())
                 .await

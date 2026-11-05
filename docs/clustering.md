@@ -52,6 +52,13 @@ the previous sorted-map layout, including compatibility with existing roots.
 Steady-state Raft persistence reuses the verified accepted frontier and last
 recorded hard state. A projection rollback invalidates those hints; startup,
 checkpoint roots and application epoch checks retain their direct SQL validation.
+Replication prioritizes a caught-up quorum. Other stable voters keep one append
+outstanding and can wait up to one millisecond on the peer writer, allowing Raft
+to batch the following suffix. Urgent traffic ends that wait without overtaking
+the queued append. The existing queue bound remains in force. Learners, joint
+configurations, membership entries, snapshots and insufficient caught-up quorums
+retain immediate fanout. Persistence-dependent responses and client successes
+still require the same accepted-journal syncs and actual voter majorities.
 Bulk content reads and checkpoint hydration group references by accepted-entry
 index, decoding each batch once while preserving output order and validating
 every content identity. Only one decoded batch is retained at a time.

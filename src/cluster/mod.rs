@@ -3,6 +3,7 @@
 //! leader's NATS service. Connections end on a view change and clients reconnect.
 //! All durable operations and current reads cross the same consensus boundary.
 mod membership;
+mod replication;
 mod startup;
 mod storage;
 mod transport;
@@ -830,14 +831,19 @@ fn pump_ready<S: transport::MessageSender>(
     Ok(())
 }
 fn dispatch_messages<S: transport::MessageSender>(
-    node: &RawNode<LogStorage>,
+    node: &mut RawNode<LogStorage>,
     messages: Vec<Message>,
     out: &BTreeMap<u64, S>,
     routes: &BTreeMap<u64, u64>,
 ) -> io::Result<()> {
     if !messages.is_empty() {
+        let foreground = replication::foreground(node, &messages);
         let mut identities = None;
         for message in messages {
+            let background = message.get_msg_type() == raft::eraftpb::MessageType::MsgAppend
+                && foreground
+                    .as_ref()
+                    .is_some_and(|peers| !peers.contains(&message.to));
             let route = if out.contains_key(&message.to) {
                 message.to
             } else {
@@ -853,7 +859,11 @@ fn dispatch_messages<S: transport::MessageSender>(
                     .unwrap_or(message.to)
             };
             if let Some(tx) = out.get(&route) {
-                let _ = tx.try_send(message);
+                let _ = if background {
+                    tx.try_send_background(message)
+                } else {
+                    tx.try_send(message)
+                };
             }
         }
     }
@@ -1609,6 +1619,7 @@ mod tests {
     use super::*;
     use crate::storage::Append;
     include!("read_contact_tests.rs");
+    include!("replication_tests.rs");
     #[test]
     fn borrowed_replication_batch_preserves_the_accepted_entry_wire_format() {
         let records = vec![Append {
