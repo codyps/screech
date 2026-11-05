@@ -43,6 +43,144 @@ struct Request {
     _permit: Arc<OwnedSemaphorePermit>,
     _catalog: Option<CatalogFence>,
 }
+
+// A concurrent burst can arrive in several network-runtime turns. After a
+// multi-request round, briefly allow the next burst to catch up before starting
+// its durability boundary. Sequential traffic and standalone stores never wait.
+fn collect_group<T>(
+    requests: &mut Vec<T>,
+    ingress: &std_mpsc::Receiver<T>,
+    deferred: &mut Option<T>,
+    previous: usize,
+    wait: Duration,
+    size: impl Fn(&T) -> Option<usize>,
+) {
+    let deadline = std::time::Instant::now() + wait;
+    let mut bytes = size(&requests[0]).unwrap();
+    while requests.len() < 32 {
+        let next = match ingress.try_recv() {
+            Ok(request) => request,
+            Err(std_mpsc::TryRecvError::Empty) if requests.len() < previous => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match ingress.recv_timeout(remaining) {
+                    Ok(request) => request,
+                    Err(_) => break,
+                }
+            }
+            Err(_) => break,
+        };
+        match size(&next) {
+            Some(len) if bytes + len <= 1024 * 1024 => {
+                bytes += len;
+                requests.push(next);
+            }
+            _ => {
+                *deferred = Some(next);
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_admission_preserves_catalog_fence_and_following_request() {
+        let (tx, rx) = std_mpsc::channel();
+        for request in [Some(20), None, Some(30)] {
+            tx.send(request).unwrap();
+        }
+        let mut requests = vec![Some(10)];
+        let mut deferred = None;
+        collect_group(
+            &mut requests,
+            &rx,
+            &mut deferred,
+            16,
+            Duration::from_secs(1),
+            |r| *r,
+        );
+        assert_eq!(requests, [Some(10), Some(20)]);
+        assert_eq!(deferred, Some(None));
+        assert_eq!(rx.try_recv().unwrap(), Some(30));
+    }
+
+    #[test]
+    fn concurrent_admission_keeps_count_and_byte_bounds() {
+        let (tx, rx) = std_mpsc::channel();
+        for _ in 0..40 {
+            tx.send(1).unwrap();
+        }
+        let mut requests = vec![1];
+        let mut deferred = None;
+        collect_group(&mut requests, &rx, &mut deferred, 32, Duration::ZERO, |r| {
+            Some(*r)
+        });
+        assert_eq!(requests.len(), 32);
+        assert_eq!(rx.try_iter().count(), 9);
+        tx.send(1024 * 1024).unwrap();
+        tx.send(2).unwrap();
+        requests.clear();
+        requests.push(1);
+        collect_group(&mut requests, &rx, &mut deferred, 32, Duration::ZERO, |r| {
+            Some(*r)
+        });
+        assert_eq!(requests, [1]);
+        assert_eq!(deferred, Some(1024 * 1024));
+        assert_eq!(rx.try_recv().unwrap(), 2);
+    }
+
+    #[test]
+    fn sequential_admission_does_not_wait_for_another_request() {
+        let (_tx, rx) = std_mpsc::channel();
+        let mut requests = vec![1];
+        let mut deferred = None;
+        // Use a budget far above scheduler jitter to distinguish an immediate
+        // return from incorrectly waiting for the next sequential request.
+        let started = std::time::Instant::now();
+        collect_group(
+            &mut requests,
+            &rx,
+            &mut deferred,
+            1,
+            Duration::from_secs(5),
+            |r| Some(*r),
+        );
+        assert_eq!(requests, [1]);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn burst_admission_accepts_arrivals_then_returns_at_previous_size() {
+        let (tx, rx) = std_mpsc::channel();
+        let (done, wait) = std_mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            tx.send(2).unwrap();
+            tx.send(3).unwrap();
+            // Keep the channel connected until collection has returned.
+            wait.recv().unwrap();
+            drop(tx);
+        });
+        let mut requests = vec![1];
+        let mut deferred = None;
+        collect_group(
+            &mut requests,
+            &rx,
+            &mut deferred,
+            3,
+            Duration::from_secs(1),
+            |r| Some(*r),
+        );
+        assert_eq!(requests, [1, 2, 3]);
+        done.send(()).unwrap();
+        producer.join().unwrap();
+    }
+}
 struct CatalogFence(Arc<std::sync::atomic::AtomicUsize>);
 impl Drop for CatalogFence {
     fn drop(&mut self) {
@@ -156,6 +294,7 @@ impl Handle {
             let mut poll_after_reply = false;
             // ACK-only rounds return an empty vector for the next admission burst.
             let mut request_scratch = Vec::with_capacity(32);
+            let mut previous_group = 1;
             loop {
                 if worker_stop.load(std::sync::atomic::Ordering::Acquire) {
                     break;
@@ -189,29 +328,26 @@ impl Handle {
                 match next {
                     Ok(req) if worker.groupable(&req.message) => {
                         crate::fault::group_gate();
-                        let mut bytes = req.message.payload.len() + req.message.headers.len();
                         let mut requests = std::mem::take(&mut request_scratch);
                         requests.reserve(32);
                         requests.push(req);
-                        while requests.len() < 32 {
-                            match rx.try_recv() {
-                                Ok(req)
-                                    if worker.groupable(&req.message)
-                                        && bytes
-                                            + req.message.payload.len()
-                                            + req.message.headers.len()
-                                            <= 1024 * 1024 =>
-                                {
-                                    bytes += req.message.payload.len() + req.message.headers.len();
-                                    requests.push(req);
-                                }
-                                Ok(req) => {
-                                    deferred = Some(req);
-                                    break;
-                                }
-                                Err(_) => break,
-                            }
-                        }
+                        collect_group(
+                            &mut requests,
+                            &rx,
+                            &mut deferred,
+                            previous_group,
+                            if worker.engine.replicas() > 1 {
+                                Duration::from_micros(64)
+                            } else {
+                                Duration::ZERO
+                            },
+                            |req| {
+                                worker.groupable(&req.message).then_some(
+                                    req.message.payload.len() + req.message.headers.len(),
+                                )
+                            },
+                        );
+                        previous_group = requests.len();
                         let active_consumers = !worker.pulls.is_empty() || worker.has_push();
                         if requests.iter().all(|req| simple_ack(&req.message)) && !active_consumers
                         {
@@ -224,7 +360,7 @@ impl Handle {
                                 || (worker.engine.replicas() > 1
                                     && !worker.duplicate_publication(&requests[0].message)))
                         {
-                            worker.group_requests(requests, &rx, &mut deferred);
+                            previous_group = worker.group_requests(requests, &rx, &mut deferred);
                         } else {
                             let req = requests.pop().unwrap();
                             let has_reply = req.message.reply.is_some();
@@ -238,11 +374,12 @@ impl Handle {
                         }
                     }
                     Ok(req) => {
+                        previous_group = 1;
                         let result = worker.handle(req.message);
                         let _ = req.response.send(result);
                     }
                     Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
-                    Err(std_mpsc::RecvTimeoutError::Timeout) => (),
+                    Err(std_mpsc::RecvTimeoutError::Timeout) => previous_group = 1,
                 }
                 idle_wait = match worker.maintain() {
                     Ok(true) => Duration::ZERO,
@@ -736,13 +873,13 @@ impl<S: Store> Worker<S> {
         requests: Vec<Request>,
         ingress: &std_mpsc::Receiver<Request>,
         deferred: &mut Option<Request>,
-    ) {
+    ) -> usize {
         if self.engine.replicas() == 1 {
             if let Err(error) = self.engine.read_barrier() {
                 for request in requests {
                     let _ = request.response.send(Err(error.to_string()));
                 }
-                return;
+                return 1;
             }
         }
         let pulls_before = self.engine.voter_progress().map(|_| self.pulls.clone());
@@ -752,7 +889,7 @@ impl<S: Store> Worker<S> {
                 for request in requests {
                     let _ = request.response.send(Err(error.to_string()));
                 }
-                return;
+                return 1;
             }
         }
         let mut bytes: usize = requests
@@ -829,6 +966,7 @@ impl<S: Store> Worker<S> {
         for (response, result, _permit) in completed {
             let _ = response.send(committed.clone().and(result));
         }
+        count
     }
     fn time(&self) -> u64 {
         self.clock_base

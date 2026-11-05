@@ -25,6 +25,13 @@ changes close client connections and a replacement leader recovers its local
 committed model. INFO advertises public reconnect endpoints. This deliberately
 uses connection-level forwarding before distributed Core interest routing.
 
+After a concurrent request group, the clustered worker allows up to 64 microseconds
+for the next burst to reach the previous group's size. Requests already queued
+still drain immediately, within the 32-request/1 MiB bounds. Catalog operations
+remain FIFO fences. Sequential requests, idle workers and standalone stores do not
+wait for a burst. Admission finishes before obtaining the group's quorum proof;
+each successful response still follows that group's durable commit.
+
 One ordinary startup command handles formation, restart and repair; bootstrap and
 join flags have been removed. Fresh original voters first persist an authenticated
 formation certificate requiring all initial voters. Historical stores cannot form
