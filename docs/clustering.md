@@ -152,6 +152,12 @@ that executor. Checkpoint pressure uses verified in-memory counters as a
 conservative hint; installation still checks the real committed SQL position and
 preserves the accepted suffix. Recovery and corruption checks keep reading the
 independent SQL witness directly.
+Local checkpoints pass their owned image directly to the same validated installer
+used for received snapshots, avoiding a full payload serialization/deserialization
+round trip. The transfer-size limit still applies. The FULL transaction preserves
+identical retained body rows, compares both bytes and digests before reusing a row,
+and removes bodies absent from the new image. Model validation, manifest checks,
+accepted-suffix preservation and authenticated journal rotation are unchanged.
 On Linux, a separate worker queues dirty WAL data for writeback before page
 checkpoints, reducing bursts of I/O that compete with the accepted journals.
 The [writeback hint](https://man7.org/linux/man-pages/man2/sync_file_range.2.html)

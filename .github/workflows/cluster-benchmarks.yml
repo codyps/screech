@@ -93,7 +93,7 @@ jobs:
           test -x "$perf_binary"
           sudo python3 scripts/profile_cluster.py --screech target/release/screech-server \
             --nats bin/nats-server --driver bin/bench-driver --perf "$perf_binary" \
-            --strace "$(command -v strace)" --voters 5 --output results/cluster-profiles
+            --strace "$(command -v strace)" --voters 5 --messages 9000 --output results/cluster-profiles
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
