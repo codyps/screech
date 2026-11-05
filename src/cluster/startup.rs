@@ -32,7 +32,6 @@ struct Record {
     certificate: Option<Vec<Claim>>,
     instance: Option<Instance>,
 }
-#[derive(Clone)]
 pub(super) struct Active {
     pub config: ClusterConfig,
     pub tx: mpsc::SyncSender<Input>,
@@ -45,7 +44,7 @@ pub(super) struct Active {
 pub(super) struct Hub(Arc<RwLock<Shared>>);
 struct Shared {
     record: Record,
-    active: Option<Active>,
+    active: Option<Arc<Active>>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct View {
@@ -161,7 +160,7 @@ async fn save_record(config: &ClusterConfig, path: &Path, record: &Record) -> io
 }
 impl Hub {
     pub fn install(&self, active: Active) {
-        self.0.write().unwrap().active = Some(active);
+        self.0.write().unwrap().active = Some(Arc::new(active));
     }
     pub fn clear(&self) {
         self.0.write().unwrap().active = None;
@@ -197,15 +196,15 @@ impl Hub {
                 let active_config = active.config.clone();
                 let result = tokio::task::spawn_blocking(move || -> io::Result<View> {
                     let client = Client {
-                        tx: active.tx,
-                        role: active.role,
-                        db: active.db,
+                        tx: active.tx.clone(),
+                        role: active.role.clone(),
+                        db: active.db.clone(),
                         id: active.config.node_id,
                         term: role.term,
                         configuration: role.configuration,
                         replicas: active.config.voters().len(),
                         session: active.session.load(Ordering::Acquire),
-                        active_session: active.session,
+                        active_session: active.session.clone(),
                     };
                     // Establish a fresh quorum observation without appending
                     // another entry for every recovery status poll.
