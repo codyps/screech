@@ -58,11 +58,16 @@ pub struct CheckpointImage {
     pub imports: Vec<Content>,
 }
 pub type CheckpointJob = Box<dyn FnOnce() -> Result<CheckpointImage, StoreError> + Send>;
+pub type ReadBarrierFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), StoreError>> + Send>>;
 /// Dispatch to an independently serialized replication owner. These methods may
 /// wait for consensus, but must not perform physical storage I/O on the caller.
 /// Success retains the Store durability contract; hints cannot authorize GC.
 pub trait Replication: Send + Sync {
     fn read_barrier(&self) -> Result<(), StoreError>;
+    fn read_barrier_async(&self) -> Option<ReadBarrierFuture> {
+        None
+    }
     fn append_with_content(
         &self,
         records: &[Append],

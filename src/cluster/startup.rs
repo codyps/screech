@@ -225,7 +225,7 @@ impl Hub {
                                 member,
                                 nonce,
                                 term: client.term,
-                                reply,
+                                reply: super::Reply::Blocking(reply),
                             })
                             .map_err(error)?;
                         rx.recv_timeout(RPC_TIMEOUT).map_err(error)??;

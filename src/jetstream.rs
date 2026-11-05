@@ -14,6 +14,10 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+#[path = "jetstream_direct_reads.rs"]
+mod direct_reads;
+use direct_reads::DirectReads;
+const REQUEST_SLOTS: usize = 256;
 
 #[derive(Clone)]
 pub struct Outbound {
@@ -36,6 +40,7 @@ pub struct Handle {
     stop: Arc<std::sync::atomic::AtomicBool>,
     done: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
     direct_output: bool,
+    direct_reads: Option<Arc<DirectReads>>,
 }
 struct Request {
     message: Message,
@@ -237,6 +242,7 @@ struct Worker<S> {
     interests: Arc<RwLock<Vec<String>>>,
     quorum_observed: bool,
     checkpoint_checked: Option<u64>,
+    direct_reads: Option<Arc<DirectReads>>,
 }
 impl Handle {
     pub fn start<S: Store + 'static>(store: S) -> Result<Self, durable::Error> {
@@ -253,6 +259,14 @@ impl Handle {
         // can use the existing synchronous Core adapter without blocking that
         // owner. Keep the fixed single-voter driver's output isolation.
         let direct_output = engine.voter_progress().is_none() || engine.replicas() > 1;
+        let direct_reads = engine.replication().map(|replication| {
+            Arc::new(DirectReads::new(
+                engine.state(),
+                replication,
+                engine.failure_flag(),
+            ))
+        });
+        let worker_reads = direct_reads.clone();
         let interests = Arc::new(RwLock::new(
             engine
                 .state()
@@ -273,9 +287,13 @@ impl Handle {
         let (done_tx, done_rx) = oneshot::channel();
         let clock_base = now().max(engine.state().time);
         tokio::task::spawn_blocking(move || {
+            let clock_start = std::time::Instant::now();
+            if let Some(reads) = &worker_reads {
+                reads.clock(clock_base, clock_start);
+            }
             let mut worker = Worker {
                 clock_base,
-                clock_start: std::time::Instant::now(),
+                clock_start,
                 engine,
                 plan: None,
                 effects: RefCell::new(Vec::with_capacity(64)),
@@ -288,6 +306,7 @@ impl Handle {
                 interests: worker_interests,
                 quorum_observed: false,
                 checkpoint_checked: None,
+                direct_reads: worker_reads,
             };
             let mut deferred = None;
             let mut idle_wait = Duration::from_millis(10);
@@ -398,7 +417,7 @@ impl Handle {
         });
         Ok(Self {
             tx,
-            slots: Arc::new(Semaphore::new(256)),
+            slots: Arc::new(Semaphore::new(REQUEST_SLOTS)),
             catalog_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             interests,
             output: Arc::new(Mutex::new(Some(output))),
@@ -407,6 +426,7 @@ impl Handle {
             stop,
             done: Arc::new(Mutex::new(Some(done_rx))),
             direct_output,
+            direct_reads,
         })
     }
     pub fn take_output(&self, observer: Interest) -> Result<mpsc::Receiver<Outbound>, String> {
@@ -477,6 +497,53 @@ impl Handle {
     ) -> Result<PendingRequest, String> {
         if self.stop.load(std::sync::atomic::Ordering::Acquire) {
             return Err("Storage worker stopped".into());
+        }
+        // Preserve queued-command and catalog ordering. The immutable model is
+        // published only after successful commit and before its outputs escape.
+        // Standalone stores have no replication dispatcher and use the worker.
+        if self.slots.available_permits() == REQUEST_SLOTS - 1
+            && self
+                .catalog_pending
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
+        {
+            if let (Some(reads), Ok(runtime), Some(sink)) = (
+                self.direct_reads.as_ref(),
+                tokio::runtime::Handle::try_current(),
+                self.sink.read().unwrap().clone(),
+            ) {
+                if let Some((outbound, proof)) = reads.prepare(&message) {
+                    let reads = reads.clone();
+                    let permit = Arc::new(permit);
+                    let work_permit = permit.clone();
+                    let (response, receiver) = oneshot::channel();
+                    let stop = self.stop.clone();
+                    runtime.spawn(async move {
+                        crate::fault::group_gate_async().await;
+                        let proof = proof.await.map_err(|e| {
+                            reads.fail();
+                            e.to_string()
+                        });
+                        let result = proof.and_then(|()| {
+                            if stop.load(std::sync::atomic::Ordering::Acquire) {
+                                return Err("Storage worker stopped".into());
+                            }
+                            if !reads.healthy() {
+                                return Err("Storage failed: restart required".into());
+                            }
+                            crate::fault::point("before_async_duplicate_reply");
+                            sink(outbound).map(|()| true)
+                        });
+                        let _ = response.send(result);
+                        drop(work_permit);
+                    });
+                    crate::fault::group_ingress();
+                    return Ok(PendingRequest {
+                        response: receiver,
+                        permit,
+                    });
+                }
+            }
         }
         let catalog = [
             "$JS.API.STREAM.CREATE.",
@@ -1016,6 +1083,9 @@ impl<S: Store> Worker<S> {
             self.commit_plan(plan)
         } else {
             self.engine.commit(event).map_err(|e| e.to_string())?;
+            if let Some(reads) = &self.direct_reads {
+                reads.publish(self.engine.state());
+            }
             self.quorum_observed = true;
             Ok(())
         }
@@ -1023,6 +1093,9 @@ impl<S: Store> Worker<S> {
     fn commit_plan(&mut self, plan: durable::GroupPlan) -> Result<(), String> {
         let changed = !plan.is_empty();
         self.engine.commit_group(plan).map_err(|e| e.to_string())?;
+        if let Some(reads) = &self.direct_reads {
+            reads.publish(self.engine.state());
+        }
         self.quorum_observed |= changed;
         Ok(())
     }

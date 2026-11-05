@@ -177,6 +177,13 @@ caught-up voters, broadcasting when too few qualify. Ordinary heartbeats
 retry the pending context against every voter if a selected peer is unavailable.
 Joint configurations and learners retain full probe fanout. Raft still requires
 the current configuration's quorum acknowledgements for each fresh read context.
+Duplicate publications with no preceding admitted request can obtain that fresh
+observation asynchronously from the replication owner. They read an immutable
+model published only after a successful application commit and before its replies.
+Queued work, pending stream catalog changes and expired metadata retain the ordered
+application path. Storage-owner failure, failed quorum observations and service
+epoch changes fence these replies; standalone and single-voter stores retain their
+existing worker path.
 Raft's persistence-independent leader messages may start follower writes while
 the leader flushes locally. Term/vote changes, follower ACKs and client success
 remain behind their required persistence boundaries.
@@ -276,3 +283,9 @@ disappears during enrollment. Publications also continue through leader loss and
 automatic repair; every acknowledged sequence is checked. A full
 restart after replacing the original voters verifies configuration recovery from
 snapshots. The ordinary standalone crash suites remain separate regression gates.
+
+The asynchronous duplicate-read process tests pause a reply after its fresh quorum
+observation, kill and wipe its leader, then verify automatic replacement and the
+confirmed ID across stream deletion and recreation in both three- and five-voter
+clusters. `cluster_quorum_tests.py` separately isolates leaders before their read
+observation and verifies that duplicate and empty replies cannot escape a minority.

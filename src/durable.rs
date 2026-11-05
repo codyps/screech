@@ -1750,13 +1750,27 @@ impl<S: Store> AppendTask<S> {
     }
 }
 
+struct PoisonFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+impl PoisonFlag {
+    fn new(value: bool) -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            value,
+        )))
+    }
+    fn get(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+    fn set(&self, value: bool) {
+        self.0.store(value, std::sync::atomic::Ordering::Release);
+    }
+}
 pub struct Engine<S> {
     state: State,
     store: Option<S>,
     voter: Option<VoterProgress>,
     pending: Option<std::sync::Arc<()>>,
     checkpoint_sequence: u64,
-    poisoned: std::cell::Cell<bool>,
+    poisoned: PoisonFlag,
     log_sequence: u64,
     since_checkpoint: usize,
     log_bytes: usize,
@@ -1782,6 +1796,12 @@ impl<S: Store> Engine<S> {
     }
     pub(crate) fn replicas(&self) -> usize {
         self.store.as_ref().map_or(1, Store::replicas)
+    }
+    pub(crate) fn replication(&self) -> Option<std::sync::Arc<dyn crate::storage::Replication>> {
+        self.store.as_ref()?.replication()
+    }
+    pub(crate) fn failure_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.poisoned.0.clone()
     }
     pub(crate) fn checkpoint_needed(&self) -> Result<bool, Error> {
         Ok(self.storage()?.checkpoint_needed()?)
@@ -1972,7 +1992,7 @@ impl<S: Store> Engine<S> {
             voter: None,
             pending: None,
             checkpoint_sequence: base,
-            poisoned: std::cell::Cell::new(false),
+            poisoned: PoisonFlag::new(false),
             log_sequence: last,
             since_checkpoint: (last - base) as usize,
             log_bytes,

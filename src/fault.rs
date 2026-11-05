@@ -109,6 +109,23 @@ pub fn group_gate() {
 pub fn group_gate() {}
 
 #[cfg(feature = "fault-injection")]
+pub async fn group_gate_async() {
+    let Ok(path) = std::env::var("SCREECH_GROUP_GATE") else {
+        return;
+    };
+    if std::path::Path::new(&format!("{path}.release")).exists() {
+        return;
+    }
+    std::fs::write(format!("{path}.ready"), b"ready").expect("group gate marker");
+    while !std::path::Path::new(&format!("{path}.release")).exists() {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+}
+#[cfg(not(feature = "fault-injection"))]
+#[inline(always)]
+pub async fn group_gate_async() {}
+
+#[cfg(feature = "fault-injection")]
 pub fn group_ingress() {
     use std::io::Write;
     if let Ok(path) = std::env::var("SCREECH_GROUP_GATE") {
