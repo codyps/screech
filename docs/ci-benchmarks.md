@@ -17,6 +17,9 @@ versions, CPU/kernel/filesystem, trial counts and commands are preserved with ra
 Tests and VMs run separately; profiling starts after all benchmark timing finishes.
 Hosted machines are shared and
 unpinned; cross-run differences can reflect hardware and filesystem variation.
+Cluster launch artifacts record the entry slot and the serving Screech slot from
+the existing readiness connection's INFO, plus NATS' readiness-stream leader.
+This records initial placement without changing the public endpoint or routing.
 
 The default campaign runs three checked trials per case, plus warmups. It covers
 Core fanout/wildcards/queues/request-reply, live Core on a stream, sequential and

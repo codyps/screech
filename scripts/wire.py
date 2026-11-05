@@ -14,6 +14,7 @@ class Client:
             if not greeting:
                 raise EOFError('server closed before INFO')
             assert greeting.startswith(b'INFO '), repr(greeting)
+            self.info = json.loads(greeting[5:])
             self.send(b'CONNECT {"verbose":false,"headers":true,"no_responders":true}\r\n')
         except BaseException:
             self.file.close()
