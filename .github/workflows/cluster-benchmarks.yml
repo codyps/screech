@@ -25,7 +25,7 @@ concurrency:
 jobs:
   clustered:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       TRIALS: ${{ inputs.trials || '3' }}
       MESSAGES: ${{ inputs.messages || '3000' }}

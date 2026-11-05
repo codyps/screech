@@ -20,6 +20,7 @@ class BenchmarkCluster:
         self.directory = directory
         self.screech = screech
         self.count = count
+        self.readiness = {}
         held = []
         try:
             for _ in range(count * 3):
@@ -111,6 +112,17 @@ class BenchmarkCluster:
                 result = client.request('$JS.API.STREAM.DELETE.BENCH_READY', {})
                 if not result.get('success'):
                     raise ValueError(f'readiness cleanup: {result}')
+                greeting = getattr(client, 'info', {})
+                greeting = greeting if isinstance(greeting, dict) else {}
+                # A local handoff advertises the gateway port; a remote proxy
+                # advertises the serving node's service port in the same INFO.
+                # Observe placement without changing routing or issuing a probe.
+                serving = next((int(slot) for slot, peer in self.peers.items()
+                    if greeting.get('port') in (int(peer['client'].rsplit(':', 1)[1]),
+                                               int(peer['service'].rsplit(':', 1)[1]))), None)
+                self.readiness = dict(gateway_slot=1, greeting=greeting,
+                    serving_node_slot_at_ready=serving if self.screech else None,
+                    readiness_stream_leader=None if self.screech else info['cluster']['leader'])
                 return
             except (OSError, EOFError, AssertionError, ValueError) as error:
                 last_error = error

@@ -50,6 +50,8 @@ def running(binary, label, durable, directory, args, commands):
         (args.output.parent/f'{args.output.stem}-{label}-launch.json').write_text(json.dumps(commands[-1],indent=2)+'\n')
         try:
             cluster.start()
+            commands[-1]['readiness'] = cluster.readiness
+            (args.output.parent/f'{args.output.stem}-{label}-launch.json').write_text(json.dumps(commands[-1],indent=2)+'\n')
             yield cluster.processes, cluster.port
             cluster.assert_alive()
         finally:

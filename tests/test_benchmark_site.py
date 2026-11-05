@@ -90,11 +90,13 @@ class BenchmarkSiteTests(unittest.TestCase):
                 return {'config':{'num_replicas':3},'cluster':{'leader':'n1','replicas':[{'current':True},{'current':current}]}}
             clients[0].request.side_effect=[info(True),info(False)]
             clients[1].request.side_effect=[info(False),info(True),{'success':True}]
+            clients[1].info={'server_name':'n1','port':cluster.port}
             with patch('benchmark_cluster.Client',side_effect=clients),patch('benchmark_cluster.time.sleep') as sleep:
                 cluster.wait_ready()
             sleep.assert_called_once()
             for client in clients:client.close.assert_called_once()
             self.assertEqual(clients[1].request.call_args[0][0],'$JS.API.STREAM.DELETE.BENCH_READY')
+            self.assertEqual(cluster.readiness['readiness_stream_leader'],'n1')
 
     def test_usage_sums_voters_and_preserves_missing_samples(self):
         processes=[types.SimpleNamespace(pid=1),types.SimpleNamespace(pid=2)]
@@ -130,9 +132,11 @@ class BenchmarkSiteTests(unittest.TestCase):
             cluster=BenchmarkCluster('/server',True,3,Path(tmp))
             client=Mock();client.request.side_effect=[{'voters':[1,2,3]}, {'config':{'num_replicas':3}},
                 {'commit_index':7}, {'success':True}]
+            client.info={'port':int(cluster.peers['2']['service'].rsplit(':',1)[1])}
             with patch('benchmark_cluster.Client',return_value=client),patch.object(cluster,'all_applied',side_effect=[False,True]) as applied,patch('benchmark_cluster.time.sleep'):
                 cluster.wait_ready()
             self.assertEqual(applied.call_args_list,[call(7),call(7)])
             self.assertEqual(client.request.call_count,4)
+            self.assertEqual(cluster.readiness['serving_node_slot_at_ready'],2)
 
 if __name__=='__main__':unittest.main()
