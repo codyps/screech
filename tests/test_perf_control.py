@@ -39,3 +39,32 @@ time.sleep(30)
             with self.assertRaises(TimeoutError):
                 with recording(self.command(directory,'time.sleep(30)\n'),log,ready_timeout=.1):
                     self.fail('profiler was not ready')
+    def test_startup_timeout_retries_before_workload_and_reaps_both_children(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryFile() as log:
+            marker = Path(directory) / 'attempts'
+            command = self.command(directory, f'''from pathlib import Path
+marker=Path({str(marker)!r})
+attempt=int(marker.read_text())+1 if marker.exists() else 1
+marker.write_text(str(attempt))
+assert os.read(control,128)==b'enable\\n'
+if attempt==2: os.write(ack,b'ack\\n')
+time.sleep(30)
+''')
+            with recording(command, log, ready_timeout=.5) as process:
+                self.assertEqual(marker.read_text(), '2')
+                self.assertIsNone(process.poll())
+            self.assertIsNotNone(process.poll())
+    def test_workload_timeout_is_never_retried(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryFile() as log:
+            marker = Path(directory) / 'attempts'
+            command = self.command(directory, f'''from pathlib import Path
+marker=Path({str(marker)!r})
+marker.write_text(marker.read_text()+'x' if marker.exists() else 'x')
+assert os.read(control,128)==b'enable\\n'
+os.write(ack,b'ack\\n')
+time.sleep(30)
+''')
+            with self.assertRaisesRegex(TimeoutError, 'workload'):
+                with recording(command, log):
+                    raise TimeoutError('workload failed')
+            self.assertEqual(marker.read_text(), 'x')

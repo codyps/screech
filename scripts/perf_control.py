@@ -9,6 +9,25 @@ import time
 
 @contextmanager
 def recording(command, log, ready_timeout=15):
+    # Startup can stall on hosted perf before it consumes the enable command.
+    # Retry only that pre-workload timeout, after closing/reaping the first
+    # process. Never retry the profiled body or accept an unacknowledged run.
+    for attempt in range(2):
+        enabled = False
+        try:
+            with _recording_once(command, log, ready_timeout) as process:
+                enabled = True
+                yield process
+            return
+        except TimeoutError:
+            if enabled or attempt == 1:
+                raise
+            log.flush()
+            os.write(log.fileno(), b'perf enable timed out; retrying startup before workload release\n')
+
+
+@contextmanager
+def _recording_once(command, log, ready_timeout):
     control_read, control_write = os.pipe()
     ack_read, ack_write = os.pipe()
     child_fds = [control_read, ack_write]
