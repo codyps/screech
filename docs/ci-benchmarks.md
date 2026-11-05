@@ -38,6 +38,7 @@ every case at both voter counts, using medians of at least three matched checked
 trials. Core-on-stream uses durable ACK p99; Fetch(1) uses the full Fetch/ACK cycle
 p99. One-trial runs cannot certify the target. Main CI also preserves this report
 with the published benchmark artifacts.
+The [five-trial qualification report](cluster-benchmark-results.md) records the measured source, environment and all 28 passing ratios.
 The focused workflow also captures CPU stacks and disk/syscall summaries across
 all five voters, including per-file sync latency distributions. Its separate
 9,000-publication diagnostic workloads cross automatic checkpoint boundaries.
