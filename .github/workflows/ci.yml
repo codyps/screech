@@ -95,7 +95,6 @@ jobs:
     uses: ./.github/workflows/vm.yml
   benchmarks:
     name: Checked NATS comparisons
-    needs: test
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
@@ -144,6 +143,22 @@ jobs:
             --nats-commit "$(cat results/nats-commit.txt)" \
             --nats-default --nats-sync-interval 10ms --screech-unsafe-ack --trials "$TRIALS" \
             --scale-only --output results/concurrent.json
+      - name: Standalone JetStream performance target reports
+        run: |
+          python3 scripts/check_jetstream_targets.py --standard results/standard.json --concurrent results/concurrent.json --server screech --minimum-trials "$TRIALS" --report-only --output results/jetstream-full-targets.json
+          python3 scripts/check_jetstream_targets.py --standard results/standard.json --concurrent results/concurrent.json --server screech-unsafe-ack --minimum-trials "$TRIALS" --report-only --output results/jetstream-unsafe-ack-targets.json
+      - name: Upload standalone timings before clustered cases
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: benchmark-standalone-timings
+          path: |
+            results/standard.json
+            results/standard.jsonl
+            results/concurrent.json
+            results/concurrent.jsonl
+            results/jetstream-*-targets.json
+            results/nats-commit.txt
       - name: Clustered JetStream cases · 3 and 5 voters
         run: |
           for voters in 3 5; do
@@ -153,11 +168,9 @@ jobs:
               --cluster-voters "$voters" --cluster-messages 3000 --trials "$TRIALS" \
               --output "results/cluster-$voters.json"
           done
-      - name: JetStream performance target reports
+      - name: Clustered JetStream performance target report
         run: |
           python3 scripts/check_cluster_targets.py --three results/cluster-3.json --five results/cluster-5.json --minimum-trials "$TRIALS" --report-only --output results/cluster-targets.json
-          python3 scripts/check_jetstream_targets.py --standard results/standard.json --concurrent results/concurrent.json --server screech --minimum-trials "$TRIALS" --report-only --output results/jetstream-full-targets.json
-          python3 scripts/check_jetstream_targets.py --standard results/standard.json --concurrent results/concurrent.json --server screech-unsafe-ack --minimum-trials "$TRIALS" --report-only --output results/jetstream-unsafe-ack-targets.json
       - name: Upload checked timings before profiling
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
