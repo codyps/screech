@@ -8,22 +8,75 @@ const ROOT_KEY: &str = "journal_root";
 const MAX_RECORD: u64 = 34 * 1024 * 1024;
 const ALLOCATION_BYTES: u64 = 1024 * 1024;
 
-fn reserve(file: &File, end: u64) -> io::Result<u64> {
+fn reserve(file: &mut File, end: u64) -> io::Result<u64> {
     let capacity = end
         .checked_add(ALLOCATION_BYTES - 1)
         .ok_or_else(|| error("journal allocation overflow"))?
         / ALLOCATION_BYTES
         * ALLOCATION_BYTES;
+    let previous = file.metadata()?.len();
+    if previous >= capacity {
+        return Ok(previous);
+    }
     #[cfg(target_os = "linux")]
-    match rustix::fs::fallocate(file, rustix::fs::FallocateFlags::empty(), 0, capacity) {
-        Ok(()) => return Ok(capacity),
+    match rustix::fs::fallocate(&*file, rustix::fs::FallocateFlags::empty(), 0, capacity) {
+        Ok(()) => (),
         Err(rustix::io::Errno::OPNOTSUPP | rustix::io::Errno::NOSYS) => (),
         Err(failure) => return Err(failure.into()),
     }
     // Unsupported allocation (including some FUSE filesystems) can still grow
     // safely. No I/O or out-of-space error is ignored; acceptance always syncs.
     file.set_len(capacity)?;
+    // Materialize newly reserved extents together. Otherwise every small append
+    // can make fdatasync wait for an unwritten-extent conversion. Never touch
+    // existing bytes, including unpublished tails. These zeros confer no
+    // authority: only the signed seal and its normal sync publish acceptance.
+    if previous < capacity {
+        let cursor = file.stream_position()?;
+        file.seek(SeekFrom::Start(previous))?;
+        let zeros = [0; 64 * 1024];
+        let mut remaining = capacity - previous;
+        while remaining > 0 {
+            let count = remaining.min(zeros.len() as u64) as usize;
+            file.write_all(&zeros[..count])?;
+            remaining -= count as u64;
+        }
+        file.seek(SeekFrom::Start(cursor))?;
+    }
     Ok(capacity)
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+
+    #[test]
+    fn reservation_initializes_only_new_extents_and_preserves_the_cursor() {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"existing-prefix").unwrap();
+        let cursor = file.stream_position().unwrap();
+        let capacity = reserve(&mut file, ALLOCATION_BYTES + 1).unwrap();
+        assert_eq!(capacity, ALLOCATION_BYTES * 2);
+        assert_eq!(file.stream_position().unwrap(), cursor);
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(&bytes[..cursor as usize], b"existing-prefix");
+        assert!(bytes[cursor as usize..].iter().all(|byte| *byte == 0));
+        // Preserve every old byte on growth, including data past a logical seal.
+        file.seek(SeekFrom::End(-4)).unwrap();
+        file.write_all(b"tail").unwrap();
+        let grown = reserve(&mut file, capacity + 1).unwrap();
+        assert_eq!(grown, ALLOCATION_BYTES * 3);
+        assert_eq!(file.stream_position().unwrap(), capacity);
+        file.seek(SeekFrom::Start(capacity - 4)).unwrap();
+        let mut tail = Vec::new();
+        file.read_to_end(&mut tail).unwrap();
+        assert_eq!(&tail[..4], b"tail");
+        assert!(tail[4..].iter().all(|byte| *byte == 0));
+        assert_eq!(reserve(&mut file, 1).unwrap(), grown);
+        assert_eq!(file.metadata().unwrap().len(), grown);
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Tip {
@@ -251,7 +304,7 @@ impl Watermark {
             .create(true)
             .truncate(true)
             .open(&temporary)?;
-        let capacity = reserve(&file, SEAL_BYTES as u64)?;
+        let capacity = reserve(&mut file, SEAL_BYTES as u64)?;
         file.write_all(&self.encode_seal(&seal, 0, 0)?)?;
         file.write_all(&self.encode_seal(&seal, 0, 1)?)?;
         file.sync_all()?;
@@ -317,7 +370,7 @@ impl Watermark {
         let frame = self.encode_seal(&seal, generation, generation % 2)?;
         let j = self.journal.as_mut().unwrap();
         if seal.end > j.capacity {
-            j.capacity = reserve(&j.file, seal.end)?;
+            j.capacity = reserve(&mut j.file, seal.end)?;
         }
         crate::fault::point("before_cluster_watermark");
         j.file.seek(SeekFrom::Start(j.seal.end))?;
