@@ -1675,6 +1675,7 @@ dependencies = [
  "hmac",
  "imbl",
  "itoa",
+ "libc",
  "memchr",
  "postcard",
  "proptest",

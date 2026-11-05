@@ -5,6 +5,8 @@ use super::*;
 use crate::cluster::Input;
 use rusqlite::{ErrorCode, OpenFlags};
 use std::{path::PathBuf, sync::mpsc, time::Duration};
+#[cfg(target_os = "linux")]
+mod writeback;
 
 // Small, regular passes avoid a large dirty WAL flush delaying the accepted
 // journals on the same device. Activity still gates retained WAL capacity.
@@ -12,6 +14,8 @@ const PROJECTION_CHANGE_BUDGET: u64 = 1024;
 
 pub(crate) struct PageCheckpointer {
     stop: mpsc::Sender<()>,
+    #[cfg(target_os = "linux")]
+    _writeback: writeback::Writeback,
 }
 impl PageCheckpointer {
     pub fn start(
@@ -36,6 +40,8 @@ impl PageCheckpointer {
         let mut wal = path.into_os_string();
         wal.push("-wal");
         let wal = PathBuf::from(wal);
+        #[cfg(target_os = "linux")]
+        let writeback = writeback::Writeback::start(wal.clone(), fault.clone())?;
         let (stop, stopped) = mpsc::channel();
         let mut checkpointed = changes.load(Ordering::Acquire);
         std::thread::Builder::new()
@@ -85,7 +91,11 @@ impl PageCheckpointer {
                     }
                 }
             })?;
-        Ok(Self { stop })
+        Ok(Self {
+            stop,
+            #[cfg(target_os = "linux")]
+            _writeback: writeback,
+        })
     }
 }
 

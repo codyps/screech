@@ -63,6 +63,13 @@ delivery reservation supplies its fresh quorum observation, while an empty or
 error-only plan obtains a new ReadIndex before releasing replies. Requests can
 join a group only before its consensus operation starts. Standalone scheduling
 is unchanged. Commit notifications and query indexes persist asynchronously.
+On Linux, a separate worker queues dirty WAL data for writeback before page
+checkpoints, reducing bursts of I/O that compete with the accepted journals.
+The [writeback hint](https://man7.org/linux/man-pages/man2/sync_file_range.2.html)
+provides no durability observation: every accepted-journal sync, SQLite checkpoint
+ordering rule and FULL snapshot-root commit is retained. Unsupported filesystems
+keep the normal sync path; observed I/O errors fence the voter. The worker pins
+its generation's WAL descriptor and never follows replacement store paths.
 Retired or wrong-incarnation senders
 are fenced before voting; untrustworthy old state never bootstraps the replacement.
 Committed leader removal explicitly steps down the old leader. Application writer
