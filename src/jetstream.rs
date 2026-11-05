@@ -221,7 +221,8 @@ impl Handle {
                         } else if worker.engine.supports_groups()
                             && (requests.len() > 1
                                 || active_consumers
-                                || worker.engine.replicas() > 1)
+                                || (worker.engine.replicas() > 1
+                                    && !worker.duplicate_publication(&requests[0].message)))
                         {
                             worker.group_requests(requests, &rx, &mut deferred);
                         } else {
@@ -649,6 +650,21 @@ impl<S: Store> Worker<S> {
                 .streams
                 .values()
                 .all(|s| s.config.name.len() <= 256 && s.consumers.keys().all(|n| n.len() <= 256))
+    }
+    fn duplicate_publication(&self, message: &Message) -> bool {
+        // A lone duplicate needs no speculative model or staged mutation.
+        // handle() rechecks the ID/window and obtains a fresh ReadIndex before
+        // replying; this selection hint never supplies a quorum observation.
+        !message.headers.is_empty()
+            && !message.subject.starts_with("$JS.API.")
+            && self.state().streams.values().any(|stream| {
+                stream
+                    .config
+                    .subjects
+                    .iter()
+                    .any(|filter| crate::core::matches(filter, &message.subject))
+                    && stream.duplicate(&message.headers, self.time()).is_some()
+            })
     }
     fn output_capacity(&self) -> usize {
         if self.plan.is_none() {
