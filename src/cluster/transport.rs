@@ -3,7 +3,7 @@
 use super::*;
 
 const FAST_MESSAGE_BYTES: u32 = 32 * 1024;
-const BACKGROUND_APPEND_DELAY: Duration = Duration::from_millis(2);
+const BACKGROUND_APPEND_DELAY: Duration = Duration::from_millis(4);
 
 pub(super) trait MessageSender {
     fn try_send(&self, message: Message) -> Result<(), ()>;
