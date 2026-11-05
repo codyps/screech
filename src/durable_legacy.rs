@@ -129,6 +129,7 @@ mod tests {
             .streams
             .into_iter()
             .map(|(name, s)| {
+                let s = std::sync::Arc::unwrap_or_clone(s.0);
                 let messages = s
                     .messages
                     .into_iter()

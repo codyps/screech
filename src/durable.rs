@@ -8,6 +8,9 @@ use bytes::Bytes;
 use imbl::{OrdMap, OrdSet};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+#[cfg(test)]
+#[path = "durable_catalog_tests.rs"]
+mod catalog_tests;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -275,12 +278,32 @@ pub enum Event {
     },
 }
 #[derive(Default, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-// Catalogs are small mutable maps; growing indexes below are persistent trees.
-// Cloned projections share tree nodes and copy only paths changed by a transition.
+// Staged transactions share the catalog and unchanged stream metadata. A write
+// copies only its catalog path and the stream it actually changes.
 pub struct State {
-    pub streams: BTreeMap<String, Stream>,
+    pub streams: OrdMap<String, Shared<Stream>>,
     pub generation: u64,
     pub time: u64,
+}
+/// Copy-on-write catalog value; transparent serialization preserves checkpoints.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Shared<T>(std::sync::Arc<T>);
+impl<T> From<T> for Shared<T> {
+    fn from(value: T) -> Self {
+        Self(std::sync::Arc::new(value))
+    }
+}
+impl<T> std::ops::Deref for Shared<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+impl<T: Clone> std::ops::DerefMut for Shared<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        std::sync::Arc::make_mut(&mut self.0)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pending {
@@ -1384,7 +1407,7 @@ impl State {
                 deliveries,
             } => {
                 self.time = self.time.max(time);
-                let s = self.streams.get_mut(&stream).unwrap();
+                let s: &mut Stream = self.streams.get_mut(&stream).unwrap();
                 for delivery in &deliveries {
                     s.reserve_delivery(&consumer, generation, delivery, time);
                 }
@@ -1426,7 +1449,7 @@ impl State {
             }
             Event::Update { config, time } => {
                 self.time = self.time.max(time);
-                let s = self.streams.get_mut(&config.name).unwrap();
+                let s: &mut Stream = self.streams.get_mut(&config.name).unwrap();
                 s.config = config;
                 s.dedup_expiry = s
                     .dedup
@@ -1452,7 +1475,7 @@ impl State {
                 }
             }
             Event::Remove { stream, sequences } => {
-                let s = self.streams.get_mut(&stream).unwrap();
+                let s: &mut Stream = self.streams.get_mut(&stream).unwrap();
                 for n in sequences {
                     s.remove(n);
                 }
@@ -1475,14 +1498,15 @@ impl State {
                         interest: OrdMap::new(),
                         dedup: OrdMap::new(),
                         dedup_expiry: OrdSet::new(),
-                    },
+                    }
+                    .into(),
                 );
             }
             Event::Delete { name } => {
                 self.streams.remove(&name);
             }
             Event::Purge { name } => {
-                let s = self.streams.get_mut(&name).unwrap();
+                let s: &mut Stream = self.streams.get_mut(&name).unwrap();
                 let ids: Vec<_> = s.messages.keys().copied().collect();
                 for n in ids {
                     s.remove(n);
@@ -1490,7 +1514,7 @@ impl State {
             }
             Event::Publish { stream, message } => {
                 self.time = self.time.max(message.time);
-                let s = self.streams.get_mut(&stream).unwrap();
+                let s: &mut Stream = self.streams.get_mut(&stream).unwrap();
                 s.expire(message.time);
                 s.last_sequence = message.sequence;
                 s.last_msg_id = header(&message.headers, "Nats-Msg-Id").unwrap_or("").into();
@@ -1553,7 +1577,7 @@ impl State {
             } => {
                 self.time = self.time.max(time);
                 self.generation = generation;
-                let s = self.streams.get_mut(&stream).unwrap();
+                let s: &mut Stream = self.streams.get_mut(&stream).unwrap();
                 let eligible: Vec<_> = s
                     .messages
                     .values()
@@ -1626,7 +1650,7 @@ impl State {
                 name,
                 generation,
             } => {
-                let s = self.streams.get_mut(&stream).unwrap();
+                let s: &mut Stream = self.streams.get_mut(&stream).unwrap();
                 s.consumers.remove(&name);
                 if s.config.retention == Retention::Interest {
                     let ids: Vec<_> = s
@@ -1648,7 +1672,7 @@ impl State {
                 delivery: d,
             } => {
                 self.time = self.time.max(time);
-                let s = self.streams.get_mut(&stream).unwrap();
+                let s: &mut Stream = self.streams.get_mut(&stream).unwrap();
                 s.reserve_delivery(&consumer, generation, &d, time);
             }
 
@@ -1662,7 +1686,7 @@ impl State {
                 action,
             } => {
                 self.time = self.time.max(time);
-                let s = self.streams.get_mut(&stream).unwrap();
+                let s: &mut Stream = self.streams.get_mut(&stream).unwrap();
                 let c = s.consumers.get_mut(&consumer).unwrap();
                 c.acknowledge(sequence, consumer_sequence, time, action)
                     .for_each(|n| s.acknowledge(n, generation));
@@ -1670,8 +1694,8 @@ impl State {
 
             Event::Expire { time } => {
                 self.time = time;
-                for s in self.streams.values_mut() {
-                    s.expire(time);
+                for name in self.streams.keys().cloned().collect::<Vec<_>>() {
+                    self.streams.get_mut(&name).unwrap().expire(time);
                 }
             }
         }
@@ -2002,7 +2026,8 @@ impl<S: Store> Engine<S> {
         }
         let mut imports = Vec::new();
         if self.storage()?.external_content() {
-            for stream in self.state.streams.values_mut() {
+            for name in self.state.streams.keys().cloned().collect::<Vec<_>>() {
+                let stream: &mut Stream = self.state.streams.get_mut(&name).unwrap();
                 let sequences: Vec<_> = stream
                     .messages
                     .iter()

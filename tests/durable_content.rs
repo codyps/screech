@@ -51,7 +51,7 @@ fn publish<S: Store>(engine: &mut Engine<S>, time: u64) {
 }
 fn equal(disk: &Engine<SqliteStore>, memory: &Engine<MemoryStore>) {
     let mut resolved = disk.state().clone();
-    let stream = resolved.streams.get_mut("S").unwrap();
+    let stream: &mut Stream = resolved.streams.get_mut("S").unwrap();
     let selected: Vec<_> = stream.messages.values().collect();
     let messages = disk.read_messages(&selected).unwrap();
     for message in messages {
@@ -328,7 +328,7 @@ proptest! {
                 }
             }
             let mut resolved = disk.state().clone();
-            let stream = resolved.streams.get_mut("S").unwrap();
+            let stream: &mut Stream = resolved.streams.get_mut("S").unwrap();
             for seq in stream.messages.keys().copied().collect::<Vec<_>>() {
                 stream.messages.insert(seq,disk.read_message(&stream.messages[&seq]).unwrap());
             }

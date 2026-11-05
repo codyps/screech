@@ -45,6 +45,10 @@ membership transitions follow the ordinary durable worker. The original
 heartbeat still reaches Raft for election timers and bookkeeping. The leader
 still requires distinct voters' fresh responses for each read and applies the
 committed prefix before releasing the client reply.
+Staged application transactions share a persistent stream catalog and unchanged
+stream objects. Mutating a stream copies its metadata privately; aborting the
+transaction leaves the committed model untouched. Checkpoint serialization keeps
+the previous sorted-map layout, including compatibility with existing roots.
 Bulk content reads and checkpoint hydration group references by accepted-entry
 index, decoding each batch once while preserving output order and validating
 every content identity. Only one decoded batch is retained at a time.
