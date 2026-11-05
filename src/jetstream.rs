@@ -310,7 +310,7 @@ impl Handle {
             };
             let mut deferred = None;
             let mut idle_wait = Duration::from_millis(10);
-            let mut poll_after_reply = false;
+            let mut reply_poll = Duration::ZERO;
             // ACK-only rounds return an empty vector for the next admission burst.
             let mut request_scratch = Vec::with_capacity(32);
             let mut previous_group = 1;
@@ -319,11 +319,11 @@ impl Handle {
                     break;
                 }
                 let next = deferred.take().map(Ok).unwrap_or_else(|| {
-                    if poll_after_reply {
+                    if !reply_poll.is_zero() {
                         // Reply-driven clients often issue their next request at once.
                         // Briefly poll to avoid a sleep/wakeup on that round trip;
                         // idle connections and strictly durable stores still sleep.
-                        let until = std::time::Instant::now() + Duration::from_micros(128);
+                        let until = std::time::Instant::now() + reply_poll;
                         loop {
                             match rx.try_recv() {
                                 Ok(request) => return Ok(request),
@@ -340,7 +340,7 @@ impl Handle {
                     }
                     rx.recv_timeout(idle_wait)
                 });
-                poll_after_reply = false;
+                reply_poll = Duration::ZERO;
                 // A fresh client request must obtain its own observation. Only
                 // requests already in flight in this turn can share a commit.
                 worker.quorum_observed = false;
@@ -372,7 +372,11 @@ impl Handle {
                         {
                             let (replied, scratch) = worker.ack_requests(requests);
                             request_scratch = scratch;
-                            poll_after_reply = replied && worker.engine.buffers_consumer_state();
+                            reply_poll = if replied && worker.engine.buffers_consumer_state() {
+                                Duration::from_micros(128)
+                            } else {
+                                Duration::ZERO
+                            };
                         } else if worker.engine.supports_groups()
                             && (requests.len() > 1
                                 || active_consumers
@@ -386,9 +390,14 @@ impl Handle {
                             let result = worker.handle(req.message);
                             // Keep grouped and active-consumer scheduling unchanged.
                             // Publication success still follows the FULL store commit.
-                            poll_after_reply = has_reply
+                            reply_poll = if has_reply
                                 && result.as_ref().is_ok_and(|handled| *handled)
-                                && worker.engine.buffers_consumer_state();
+                                && worker.engine.buffers_consumer_state()
+                            {
+                                Duration::from_micros(32)
+                            } else {
+                                Duration::ZERO
+                            };
                             let _ = req.response.send(result);
                         }
                     }
