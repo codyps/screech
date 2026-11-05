@@ -155,6 +155,10 @@ struct Pending {
     reply: Reply,
     read_index: Option<u64>,
 }
+struct ReadProbe {
+    deadline: Instant,
+    messages: Vec<Message>,
+}
 enum Input {
     Message(Message, [u8; 16], tokio::sync::OwnedSemaphorePermit),
     Propose {
@@ -428,14 +432,7 @@ impl Store for ClusterStore {
     }
     fn get_contents(&self, keys: &[ContentKey]) -> Result<Vec<Content>, StoreError> {
         self.client
-            .read(|db| {
-                keys.iter()
-                    .map(|key| {
-                        db.content(*key)?
-                            .ok_or_else(|| error("missing committed content"))
-                    })
-                    .collect()
-            })
+            .read(|db| db.contents(keys))
             .map_err(StoreError::from)
     }
     fn validate_content(
@@ -580,7 +577,7 @@ fn next_batch_input(
         Some(input)
     }
 }
-fn start_read(node: &mut RawNode<LogStorage>, context: &[u8], round: usize) {
+fn start_read(node: &mut RawNode<LogStorage>, context: &[u8], round: usize) -> Vec<Message> {
     node.read_index(context.to_vec());
     let conf = node.raft.prs().conf().to_conf_state();
     // During membership changes leave Raft's full joint-quorum fanout intact.
@@ -589,7 +586,7 @@ fn start_read(node: &mut RawNode<LogStorage>, context: &[u8], round: usize) {
         || !conf.learners_next.is_empty()
         || !conf.voters.contains(&node.raft.id)
     {
-        return;
+        return Vec::new();
     }
     let needed = conf.voters.len() / 2;
     let committed = node.raft.raft_log.committed;
@@ -607,17 +604,50 @@ fn start_read(node: &mut RawNode<LogStorage>, context: &[u8], round: usize) {
     });
     peers.sort_unstable();
     if peers.len() < needed || peers.is_empty() {
-        return;
+        return Vec::new();
     }
     let start = round % peers.len();
     // Suppress only this newly created round's redundant initial probes.
     // Periodic bcast_heartbeat reissues the pending context to ALL voters,
     // so an unavailable selected peer cannot strand a read. Raft still counts
     // distinct current-voter acknowledgements for every fresh read context.
-    node.raft.msgs.retain(|message| {
-        message.get_msg_type() != raft::eraftpb::MessageType::MsgHeartbeat
+    let mut deferred = Vec::new();
+    node.raft.msgs.retain_mut(|message| {
+        let selected = message.get_msg_type() != raft::eraftpb::MessageType::MsgHeartbeat
             || message.get_context() != context
-            || (0..needed).any(|n| peers[(start + n) % peers.len()] == message.to)
+            || (0..needed).any(|n| peers[(start + n) % peers.len()] == message.to);
+        if !selected {
+            deferred.push(std::mem::take(message));
+        }
+        selected
+    });
+    deferred
+}
+fn hedge_reads(
+    node: &mut RawNode<LogStorage>,
+    pending: &BTreeMap<Vec<u8>, Pending>,
+    probes: &mut BTreeMap<Vec<u8>, ReadProbe>,
+    now: Instant,
+) {
+    probes.retain(|context, probe| {
+        if node.raft.state != StateRole::Leader
+            || pending
+                .get(context)
+                .is_none_or(|request| request.read_index.is_some())
+            || probe
+                .messages
+                .iter()
+                .any(|message| message.term != node.raft.term)
+        {
+            return false;
+        }
+        if now < probe.deadline {
+            return true;
+        }
+        // These are the original context-bound probes, not cached responses.
+        // Raft still requires a fresh quorum and verifies its current membership.
+        node.raft.msgs.append(&mut probe.messages);
+        false
     });
 }
 fn pump_ready(
@@ -1013,6 +1043,7 @@ async fn run_runtime(
             getrandom::fill(&mut nonce).map_err(error)?;
             let mut serial = 0u64;
             let mut read_round = 0usize;
+            let mut read_probes = BTreeMap::<Vec<u8>, ReadProbe>::new();
             // New learners must reply to replacement leaders before receiving
             // a snapshot containing the committed placement map. These routes
             // are transport hints only; membership still gates every message.
@@ -1024,8 +1055,12 @@ async fn run_runtime(
             };
             let mut deferred_input = None;
             loop {
+                let wait = read_probes.values().map(|probe|
+                    probe.deadline.saturating_duration_since(Instant::now()))
+                    .min().unwrap_or(Duration::from_millis(20))
+                    .min(Duration::from_millis(20));
                 let mut input = deferred_input.take().map(Ok)
-                    .unwrap_or_else(|| rx.recv_timeout(Duration::from_millis(20)));
+                    .unwrap_or_else(|| rx.recv_timeout(wait));
                 if matches!(&input, Ok(Input::Stop) | Err(mpsc::RecvTimeoutError::Disconnected)) {
                     break;
                 }
@@ -1163,7 +1198,13 @@ async fn run_runtime(
                             serial = serial.checked_add(1).ok_or_else(|| error("proposal IDs exhausted"))?;
                             let mut context = nonce.to_vec();
                             context.extend_from_slice(&serial.to_le_bytes());
-                            start_read(node, &context, read_round);
+                            let messages = start_read(node, &context, read_round);
+                            if !messages.is_empty() {
+                                read_probes.insert(context.clone(), ReadProbe {
+                                    deadline: Instant::now() + Duration::from_micros(250),
+                                    messages,
+                                });
+                            }
                             read_round = read_round.wrapping_add(1);
                             pending.insert(context, Pending {started: Instant::now(),reply,read_index:None});
                         }
@@ -1217,6 +1258,8 @@ async fn run_runtime(
                     node.tick();
                     tick = Instant::now();
                 }
+                pump_ready(node, &mut pending, &out, &routes, completed)?;
+                hedge_reads(node, &pending, &mut read_probes, Instant::now());
                 pump_ready(node, &mut pending, &out, &routes, completed)?;
                 {
                     let db = node.store().db.lock().unwrap();
@@ -1949,6 +1992,107 @@ mod tests {
         }
     }
     #[test]
+    fn delayed_read_probes_reach_another_quorum_without_a_tick_or_log_write() {
+        for count in [3, 5] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut sim = Simulation::with_voters(dir.path(), count);
+            sim.nodes[0].campaign().unwrap();
+            sim.settle(None);
+            let before = {
+                let db = sim.nodes[0].store().db.lock().unwrap();
+                (
+                    db.last().unwrap(),
+                    db.hard().unwrap(),
+                    db.view().unwrap(),
+                    db.journal_bytes(),
+                )
+            };
+            let context = b"delayed-fresh-read".to_vec();
+            let messages = start_read(&mut sim.nodes[0], &context, 0);
+            assert_eq!(messages.len(), count as usize - 1 - count as usize / 2);
+            let unavailable = sim.nodes[0]
+                .raft
+                .msgs
+                .iter()
+                .find(|message| message.get_context() == context.as_slice())
+                .unwrap()
+                .to;
+            let (reply, rx) = mpsc::sync_channel(1);
+            sim.pending[0].insert(
+                context.clone(),
+                Pending {
+                    started: Instant::now(),
+                    reply,
+                    read_index: None,
+                },
+            );
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut probes = BTreeMap::from([(context, ReadProbe { deadline, messages })]);
+            sim.settle(Some(unavailable));
+            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            hedge_reads(
+                &mut sim.nodes[0],
+                &sim.pending[0],
+                &mut probes,
+                deadline - Duration::from_micros(1),
+            );
+            assert_eq!(probes.len(), 1);
+            assert!(sim.nodes[0].raft.msgs.is_empty());
+            hedge_reads(&mut sim.nodes[0], &sim.pending[0], &mut probes, deadline);
+            assert!(probes.is_empty());
+            // Sending more probes is not itself a quorum observation.
+            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            sim.settle(Some(unavailable));
+            assert_eq!(rx.try_recv().unwrap().unwrap(), before.2);
+            let db = sim.nodes[0].store().db.lock().unwrap();
+            assert_eq!(
+                (
+                    db.last().unwrap(),
+                    db.hard().unwrap(),
+                    db.view().unwrap(),
+                    db.journal_bytes()
+                ),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn delayed_read_probes_discard_completed_reads_and_old_leader_epochs() {
+        for obsolete in ["completed", "follower", "new-term"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut sim = Simulation::with_voters(dir.path(), 5);
+            sim.nodes[0].campaign().unwrap();
+            sim.settle(None);
+            let context = b"obsolete-read".to_vec();
+            let messages = start_read(&mut sim.nodes[0], &context, 0);
+            let (reply, _rx) = mpsc::sync_channel(1);
+            sim.pending[0].insert(
+                context.clone(),
+                Pending {
+                    started: Instant::now(),
+                    reply,
+                    read_index: None,
+                },
+            );
+            let deadline = Instant::now();
+            let mut probes = BTreeMap::from([(context, ReadProbe { deadline, messages })]);
+            sim.nodes[0].raft.msgs.clear();
+            match obsolete {
+                "completed" => sim.pending[0].clear(),
+                "follower" => {
+                    let term = sim.nodes[0].raft.term;
+                    sim.nodes[0].raft.become_follower(term + 1, 0);
+                }
+                "new-term" => sim.nodes[0].raft.term += 1,
+                _ => unreachable!(),
+            }
+            hedge_reads(&mut sim.nodes[0], &sim.pending[0], &mut probes, deadline);
+            assert!(probes.is_empty());
+            assert!(sim.nodes[0].raft.msgs.is_empty());
+        }
+    }
+    #[test]
     fn initial_read_probes_prefer_caught_up_voters_without_reusing_their_acks() {
         let dir = tempfile::tempdir().unwrap();
         let mut sim = Simulation::with_voters(dir.path(), 5);
@@ -2678,7 +2822,13 @@ mod application_failure_tests {
     }
     #[test]
     fn missing_required_content_and_invalid_references_fence_consensus() {
-        for kind in ["single", "batch", "reference"] {
+        for kind in [
+            "single",
+            "batch",
+            "batch-identity",
+            "batch-entry",
+            "reference",
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let (client, rx) = client(dir.path());
             let db = client.db.clone();
@@ -2690,11 +2840,12 @@ mod application_failure_tests {
             let result = if kind == "reference" {
                 store.validate_content(key, "wrong-subject", 0, 4)
             } else {
-                db.lock()
-                    .unwrap()
-                    .conn
-                    .execute("DELETE FROM body_index", [])
-                    .unwrap();
+                let query = match kind {
+                    "batch-identity" => "UPDATE body_index SET ordinal=1",
+                    "batch-entry" => "UPDATE entries SET data=x'000000'",
+                    _ => "DELETE FROM body_index",
+                };
+                db.lock().unwrap().conn.execute(query, []).unwrap();
                 if kind == "single" {
                     store.get_content(key).map(|_| ())
                 } else {

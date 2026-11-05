@@ -32,6 +32,19 @@ remain FIFO fences. Sequential requests, idle workers and standalone stores do n
 wait for a burst. Admission finishes before obtaining the group's quorum proof;
 each successful response still follows that group's durable commit.
 
+Fresh ReadIndex rounds initially probe a caught-up quorum. If it has not replied
+after 250 microseconds, the actor sends the original context-bound probes to the
+remaining voters. Completed reads and obsolete leader epochs discard these
+retries; the ordinary heartbeat remains a further retry. All responses still
+require a fresh quorum. Joint configurations and learners retain full fanout.
+Bulk content reads and checkpoint hydration group references by accepted-entry
+index, decoding each batch once while preserving output order and validating
+every content identity. Only one decoded batch is retained at a time.
+New accepted-journal allocations materialize their new extents with zeros, so
+small subsequent commits can overwrite initialized storage. Existing bytes are
+preserved. Allocation bytes supply no recovery evidence; complete accepted records
+and the signed seal still synchronize before replication or client success.
+
 One ordinary startup command handles formation, restart and repair; bootstrap and
 join flags have been removed. Fresh original voters first persist an authenticated
 formation certificate requiring all initial voters. Historical stores cannot form

@@ -670,6 +670,60 @@ impl Database {
         })
         .transpose()
     }
+    pub fn contents(&self, keys: &[ContentKey]) -> io::Result<Vec<Content>> {
+        let mut output = vec![None; keys.len()];
+        let mut positions = Vec::with_capacity(keys.len());
+        let mut lookup = self
+            .conn
+            .prepare_cached("SELECT idx,ordinal FROM body_index WHERE generation=?1 AND seq=?2")
+            .map_err(error)?;
+        for (at, key) in keys.iter().copied().enumerate() {
+            let position: Option<(i64, i64)> = lookup
+                .query_row(params![sql(key.generation)?, sql(key.sequence)?], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .optional()
+                .map_err(error)?;
+            match position {
+                Some((index, ordinal)) => positions.push((
+                    u64::try_from(index).map_err(error)?,
+                    usize::try_from(ordinal).map_err(error)?,
+                    key,
+                    at,
+                )),
+                None => {
+                    output[at] = Some(
+                        self.snapshot_content(key)?
+                            .ok_or_else(|| error("missing committed content"))?,
+                    )
+                }
+            }
+        }
+        // Grouped publications share an entry. Decode it once, retaining only
+        // one decoded batch at a time; preserve caller order and repeated keys.
+        positions.sort_unstable_by_key(|position| position.0);
+        let mut cached: Option<(u64, Batch)> = None;
+        for (index, ordinal, key, at) in positions {
+            if cached.as_ref().is_none_or(|(cached, _)| *cached != index) {
+                cached = Some((index, Batch::decode(&self.entry(index)?.data)?));
+            }
+            output[at] = Some(
+                cached
+                    .as_ref()
+                    .unwrap()
+                    .1
+                    .contents
+                    .get(ordinal)
+                    .filter(|content| content.key == key)
+                    .ok_or_else(|| error("invalid content identity"))?
+                    .clone(),
+            );
+        }
+        output
+            .into_iter()
+            .map(|content| content.ok_or_else(|| error("missing committed content")))
+            .collect()
+    }
 }
 fn raft_error(e: io::Error) -> raft::Error {
     raft::Error::Store(StorageError::Other(Box::new(e)))
@@ -871,6 +925,94 @@ mod tests {
             data: postcard::to_allocvec(&batch).unwrap().into(),
             ..Default::default()
         }
+    }
+    #[test]
+    fn bulk_content_preserves_order_duplicates_snapshot_bodies_and_committed_visibility() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Database::open(&dir.path().join("db"), &config(), true).unwrap();
+        let contents: Vec<_> = (1..=7)
+            .map(|sequence| Content {
+                key: ContentKey {
+                    generation: 1,
+                    sequence,
+                },
+                subject: format!("message.{sequence}"),
+                headers: Bytes::from_static(b"binary\0header"),
+                payload: Bytes::from(vec![sequence as u8; 16]),
+            })
+            .collect();
+        let entries: Vec<_> = [0..3, 3..6, 6..7]
+            .into_iter()
+            .enumerate()
+            .map(|(at, range)| {
+                let mut record = entry(at as u64 + 1, 1, b"ignored");
+                let mut batch = Batch::decode(&record.data).unwrap();
+                batch.contents = contents[range].to_vec();
+                record.data = postcard::to_allocvec(&batch).unwrap().into();
+                record
+            })
+            .collect();
+        db.persist(
+            &entries,
+            Some(&HardState {
+                term: 1,
+                vote: 1,
+                commit: 2,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        db.apply(2).unwrap();
+        let snapshot = Content {
+            key: ContentKey {
+                generation: 9,
+                sequence: 1,
+            },
+            ..contents[0].clone()
+        };
+        let data = postcard::to_allocvec(&snapshot).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO snapshot_bodies VALUES(?1,?2,?3,?4)",
+                params![9, 1, &data, Sha256::digest(&data).as_slice()],
+            )
+            .unwrap();
+        let expected = vec![
+            contents[4].clone(),
+            snapshot,
+            contents[0].clone(),
+            contents[4].clone(),
+            contents[2].clone(),
+        ];
+        let keys: Vec<_> = expected.iter().map(|content| content.key).collect();
+        let actual = db.contents(&keys).unwrap();
+        assert_eq!(
+            postcard::to_allocvec(&actual).unwrap(),
+            postcard::to_allocvec(&expected).unwrap()
+        );
+        assert!(db.contents(&[]).unwrap().is_empty());
+        assert!(
+            db.contents(&[contents[6].key]).is_err(),
+            "exposed accepted-only body"
+        );
+        db.conn
+            .execute(
+                "UPDATE body_index SET ordinal=1 WHERE generation=1 AND seq=1",
+                [],
+            )
+            .unwrap();
+        assert!(
+            db.contents(&[contents[0].key]).is_err(),
+            "accepted wrong body identity"
+        );
+        db.conn
+            .execute("UPDATE snapshot_bodies SET digest=zeroblob(32)", [])
+            .unwrap();
+        assert!(
+            db.contents(&[keys[1]]).is_err(),
+            "accepted damaged snapshot body"
+        );
     }
     #[test]
     fn existing_projection_layout_and_accepted_history_survive_smaller_page_defaults() {

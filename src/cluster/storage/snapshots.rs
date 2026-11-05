@@ -129,14 +129,7 @@ impl Database {
         } else {
             self.entry(index)?.term
         };
-        let contents: Vec<_> = image
-            .live
-            .into_iter()
-            .map(|key| {
-                self.content(key)?
-                    .ok_or_else(|| error("checkpoint content missing"))
-            })
-            .collect::<io::Result<_>>()?;
+        let contents = self.contents(&image.live)?;
         crate::durable::validate_cluster_snapshot(&image.data, &contents).map_err(error)?;
         let manifest = contents
             .iter()
