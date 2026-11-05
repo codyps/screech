@@ -66,6 +66,14 @@ it still requires new context-bound quorum replies. Content reads retain an eage
 SQL snapshot and their independent SQL epoch checks. All application completions
 remain staged until the projection transaction, when present, commits.
 
+Connected peer streams can send small authenticated frames directly with a
+nonblocking socket write. A reserved slot in the same bounded writer queue owns
+any partial frame's remainder; later messages wait behind it. Snapshots, large
+frames, connection establishment and blocked sockets use the async writer. Each
+replacement destination retains its own stream, and failed partial writes close
+that stream before another frame can use it. This changes transport scheduling;
+Raft's persistence and quorum requirements still govern message release.
+
 One ordinary startup command handles formation, restart and repair; bootstrap and
 join flags have been removed. Fresh original voters first persist an authenticated
 formation certificate requiring all initial voters. Historical stores cannot form

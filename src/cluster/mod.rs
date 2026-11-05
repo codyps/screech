@@ -5,6 +5,7 @@
 mod membership;
 mod startup;
 mod storage;
+mod transport;
 use crate::{
     server::{Config as ServerConfig, Server},
     storage::{Append, CheckpointJob, Content, ContentKey, Record, Replication, Store, StoreError},
@@ -650,10 +651,10 @@ fn hedge_reads(
         false
     });
 }
-fn pump_ready(
+fn pump_ready<S: transport::MessageSender>(
     node: &mut RawNode<LogStorage>,
     pending: &mut BTreeMap<Vec<u8>, Pending>,
-    out: &BTreeMap<u64, tokio::sync::mpsc::Sender<Message>>,
+    out: &BTreeMap<u64, S>,
     routes: &BTreeMap<u64, u64>,
     completed: &mut Vec<(Reply, u64)>,
 ) -> io::Result<()> {
@@ -743,10 +744,10 @@ fn pump_ready(
     }
     Ok(())
 }
-fn dispatch_messages(
+fn dispatch_messages<S: transport::MessageSender>(
     node: &RawNode<LogStorage>,
     messages: Vec<Message>,
-    out: &BTreeMap<u64, tokio::sync::mpsc::Sender<Message>>,
+    out: &BTreeMap<u64, S>,
     routes: &BTreeMap<u64, u64>,
 ) -> io::Result<()> {
     if !messages.is_empty() {
@@ -807,9 +808,38 @@ fn envelope_frame(envelope: &Envelope<'_>) -> io::Result<Vec<u8>> {
     frame[..4].copy_from_slice(&size.to_be_bytes());
     Ok(frame)
 }
+fn message_chunk(
+    config: &ClusterConfig,
+    chunk: &Chunk<'_>,
+    incarnation: [u8; 16],
+) -> io::Result<Vec<u8>> {
+    let body = postcard::to_allocvec(chunk).map_err(error)?;
+    let mut auth = authenticate(&config.secret, &config.cluster_id, config.node_id, &body);
+    auth.update(&incarnation);
+    let mac = auth.finalize().into_bytes();
+    envelope_frame(&Envelope {
+        cluster: &config.cluster_id,
+        from: config.node_id,
+        body: &body,
+        mac: &mac,
+        incarnation,
+    })
+}
+async fn write_peer_frame(stream: &TcpStream, mut frame: &[u8]) -> io::Result<()> {
+    while !frame.is_empty() {
+        stream.writable().await?;
+        match stream.try_write(frame) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => frame = &frame[n..],
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => (),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
 async fn send_message(
     config: &ClusterConfig,
-    stream: &mut TcpStream,
+    stream: &TcpStream,
     message: &Message,
     incarnation: [u8; 16],
 ) -> io::Result<()> {
@@ -821,26 +851,19 @@ async fn send_message(
     let mut nonce = [0; 16];
     getrandom::fill(&mut nonce).map_err(error)?;
     for (n, data) in body.chunks(1024 * 1024).enumerate() {
-        let chunk = Chunk {
-            nonce,
-            offset: (n * 1024 * 1024) as u64,
-            total: body.len() as u64,
-            hash,
-            data,
-            snapshot: message.get_msg_type() == raft::eraftpb::MessageType::MsgSnapshot,
-        };
-        let body = postcard::to_allocvec(&chunk).map_err(error)?;
-        let mut auth = authenticate(&config.secret, &config.cluster_id, config.node_id, &body);
-        auth.update(&incarnation);
-        let mac = auth.finalize().into_bytes();
-        let frame = envelope_frame(&Envelope {
-            cluster: &config.cluster_id,
-            from: config.node_id,
-            body: &body,
-            mac: &mac,
+        let frame = message_chunk(
+            config,
+            &Chunk {
+                nonce,
+                offset: (n * 1024 * 1024) as u64,
+                total: body.len() as u64,
+                hash,
+                data,
+                snapshot: message.get_msg_type() == raft::eraftpb::MessageType::MsgSnapshot,
+            },
             incarnation,
-        })?;
-        stream.write_all(&frame).await?;
+        )?;
+        write_peer_frame(stream, &frame).await?;
     }
     Ok(())
 }
@@ -931,52 +954,24 @@ async fn network(
     tx: mpsc::SyncSender<Input>,
     stop: watch::Receiver<bool>,
     incarnation: [u8; 16],
-) -> BTreeMap<u64, tokio::sync::mpsc::Sender<Message>> {
-    let mut out = BTreeMap::new();
-    for (&id, peer) in &config.peers {
-        if id != config.node_id {
-            let (send, mut receive) = tokio::sync::mpsc::channel::<Message>(4);
-            out.insert(id, send);
-            let config = config.clone();
-            let address = peer.raft;
-            let mut stop = stop.clone();
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                // A replacement and its retiring voter share one physical
-                // address. Their authenticated destinations need independent
-                // streams: rejecting an old ID must not drop the new ID's next
-                // frame. Bound the cache across repeated replacements.
-                let mut streams: BTreeMap<u64, (TcpStream, Instant)> = BTreeMap::new();
-                loop {
-                    tokio::select! {
-                        _=stop.changed()=>break,
-                        message=receive.recv()=>{let Some(message)=message else{break};
-                            let snapshot=message.get_msg_type()==raft::eraftpb::MessageType::MsgSnapshot;
-                            let result=tokio::select! {
-                                _=stop.changed()=>break,
-                                result=tokio::time::timeout(Duration::from_secs(30),async {
-                                    if !streams.contains_key(&message.to) {
-                                        if streams.len()>=4 {
-                                            if let Some(oldest)=streams.iter().min_by_key(|(_,(_,used))|*used).map(|(id,_)|*id) {streams.remove(&oldest);}
-                                        }
-                                        let connected=TcpStream::connect(address).await?;
-                                        connected.set_nodelay(true)?;
-                                        streams.insert(message.to,(connected,Instant::now()));
-                                    }
-                                    let (stream,used)=streams.get_mut(&message.to).unwrap();
-                                    *used=Instant::now();
-                                    send_message(&config,stream,&message,incarnation).await
-                                })=>result,
-                            };
-                            if !matches!(result,Ok(Ok(()))) { streams.remove(&message.to); }
-                            if snapshot {let _=tx.try_send(Input::SnapshotSent(message.to,matches!(result,Ok(Ok(())))));}
-                        }
-                    }
-                }
-            });
-        }
-    }
-    out
+) -> BTreeMap<u64, transport::PeerSender> {
+    config
+        .peers
+        .iter()
+        .filter(|(id, _)| **id != config.node_id)
+        .map(|(&id, peer)| {
+            (
+                id,
+                transport::PeerSender::start(
+                    config.clone(),
+                    peer.raft,
+                    tx.clone(),
+                    stop.clone(),
+                    incarnation,
+                ),
+            )
+        })
+        .collect()
 }
 
 /// Run a cluster node until shutdown. Store paths and node incarnations are
@@ -2542,10 +2537,10 @@ mod tests {
                 assert_eq!(nonce, [7; 16]);
             }
         });
-        let mut stream = TcpStream::connect(address).await.unwrap();
+        let stream = TcpStream::connect(address).await.unwrap();
         stream.set_nodelay(true).unwrap();
         for message in messages {
-            send_message(&config(1), &mut stream, &message, [7; 16])
+            send_message(&config(1), &stream, &message, [7; 16])
                 .await
                 .unwrap();
         }
