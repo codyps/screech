@@ -14,6 +14,22 @@ from cluster_recovery_tests import damage_store, status, wait_healed
 
 
 def audit(cluster, last, retained):
+    # Cold recovery can replace a fenced incarnation and retire the service
+    # while a read-only audit is in flight. Reconnect to its current epoch;
+    # never retry an invariant failure or accept an incomplete audit.
+    deadline = time.monotonic() + 45
+    while True:
+        try:
+            audit_once(cluster, last, retained)
+            return
+        except (OSError, EOFError):
+            if time.monotonic() >= deadline:
+                raise
+            print('Checkpoint audit: reconnecting after service retirement', flush=True)
+            time.sleep(.05)
+
+
+def audit_once(cluster, last, retained):
     client = cluster.client(cluster.wait_leader())
     try:
         for seq in range(last - retained + 1, last + 1):
