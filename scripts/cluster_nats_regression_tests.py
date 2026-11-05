@@ -196,8 +196,12 @@ def minority_corruption(binary):
                         # actually lost authority and must use quorum repair.
                         journal = paths[slot].with_suffix('.cluster-watermark')
                         accepted = bytearray(journal.read_bytes())
-                        assert len(accepted) > 8192 + 10
-                        accepted[8192 + 10] ^= 1
+                        assert len(accepted) >= 8192
+                        assert accepted[:8] in (b'SCSEAL04', b'SCSEAL05')
+                        # Both formats require both authenticated seal pages.
+                        # Small v5 records leave the append area unused, so
+                        # corrupt an actual authority byte rather than padding.
+                        accepted[128] ^= 1
                         journal.write_bytes(accepted)
             for slot in victims:
                 cluster.start(slot)
