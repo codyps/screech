@@ -748,7 +748,7 @@ fn pump_ready<S: transport::MessageSender>(
         let read_states = ready.take_read_states();
         let epoch_change = !ready.snapshot().is_empty()
             || if let Some(hard) = ready.hs() {
-                let old = node.store().db.lock().unwrap().hard()?;
+                let old = node.store().db.lock().unwrap().recorded_hard()?;
                 hard.term != old.term || hard.vote != old.vote
             } else {
                 false
@@ -789,7 +789,7 @@ fn pump_ready<S: transport::MessageSender>(
         }
         let mut light = node.advance(ready);
         if let Some(commit) = light.commit_index() {
-            let mut hard = node.store().db.lock().unwrap().hard()?;
+            let mut hard = node.store().db.lock().unwrap().recorded_hard()?;
             hard.commit = commit;
             node.store().db.lock().unwrap().persist(&[], Some(&hard))?;
             let entries = membership::apply_configuration(node, commit)?;

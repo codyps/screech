@@ -324,6 +324,20 @@ impl Database {
     ) {
         self.heartbeat_policy = Some((self.membership_revision, configuration, policy));
     }
+    pub(super) fn recorded_hard(&self) -> io::Result<HardState> {
+        if self.failed {
+            return Err(error("replica quarantined"));
+        }
+        // persist() publishes this cache only after native acceptance and the
+        // SQL mutation succeed. A rollback invalidates accepted_tip; startup,
+        // snapshot/root verification and content epochs still read actual SQL.
+        if self.accepted_tip.is_some() {
+            if let Some(hard) = &self.heartbeat_hard {
+                return Ok(hard.clone());
+            }
+        }
+        self.hard()
+    }
     pub(super) fn can_reply_to_read_heartbeat(
         &self,
         role: super::Role,
@@ -448,10 +462,10 @@ impl Database {
         if entries.is_empty() && hard.is_none() {
             return Ok(());
         }
-        let old = self.hard()?;
+        let old = self.recorded_hard()?;
         let durable =
             !entries.is_empty() || hard.is_some_and(|h| h.term != old.term || h.vote != old.vote);
-        let last = self.last()?;
+        let last = self.log_last_index()?;
         if let Some(first) = entries.first() {
             if first.index > last + 1 || entries.windows(2).any(|p| p[1].index != p[0].index + 1) {
                 return Err(error("noncontiguous accepted suffix"));
@@ -898,6 +912,61 @@ impl Storage for LogStorage {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recorded_hard_cache_tracks_suffixes_commits_rollback_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut db = Database::open(&path, &config(), true).unwrap();
+        db.begin_lazy_projection().unwrap();
+        assert_eq!(db.recorded_hard().unwrap(), HardState::default());
+        assert!(db.conn.is_autocommit(), "cached metadata opened SQL");
+        db.finish_projection(true).unwrap();
+        let entry = |index, term| Entry {
+            index,
+            term,
+            ..Default::default()
+        };
+        let mut hard = HardState {
+            term: 1,
+            vote: 1,
+            ..Default::default()
+        };
+        db.persist(&[entry(1, 1), entry(2, 1)], Some(&hard))
+            .unwrap();
+        assert_eq!(db.recorded_hard().unwrap(), db.hard().unwrap());
+        hard.term = 2;
+        hard.vote = 2;
+        db.persist(&[entry(2, 2)], Some(&hard)).unwrap();
+        assert_eq!(db.recorded_hard().unwrap(), hard);
+        db.begin_lazy_projection().unwrap();
+        let journal = db.journal_bytes();
+        hard.commit = 1;
+        db.persist(&[], Some(&hard)).unwrap();
+        assert_eq!(db.recorded_hard().unwrap(), db.hard().unwrap());
+        assert_eq!(
+            db.journal_bytes(),
+            journal,
+            "commit-only update added a sync record"
+        );
+        hard.commit = 2;
+        db.persist(&[entry(3, 2)], Some(&hard)).unwrap();
+        assert_eq!(db.recorded_hard().unwrap(), hard);
+        db.finish_projection(false).unwrap();
+        assert_eq!(db.recorded_hard().unwrap(), db.hard().unwrap());
+        assert_eq!(
+            db.recorded_hard().unwrap().commit,
+            0,
+            "rollback reused speculative metadata"
+        );
+        assert_eq!(db.durable_term().unwrap(), 2);
+        drop(db);
+        let mut reopened = Database::open(&path, &config(), false).unwrap();
+        assert_eq!(reopened.recorded_hard().unwrap(), hard);
+        assert_eq!(reopened.recorded_hard().unwrap(), reopened.hard().unwrap());
+        assert_eq!(reopened.log_last_index().unwrap(), 3);
+        reopened.failed = true;
+        assert!(reopened.recorded_hard().is_err());
+    }
     #[test]
     fn lazy_projection_only_opens_sql_for_mutations_and_keeps_rollback_atomic() {
         let dir = tempfile::tempdir().unwrap();

@@ -49,6 +49,9 @@ Staged application transactions share a persistent stream catalog and unchanged
 stream objects. Mutating a stream copies its metadata privately; aborting the
 transaction leaves the committed model untouched. Checkpoint serialization keeps
 the previous sorted-map layout, including compatibility with existing roots.
+Steady-state Raft persistence reuses the verified accepted frontier and last
+recorded hard state. A projection rollback invalidates those hints; startup,
+checkpoint roots and application epoch checks retain their direct SQL validation.
 Bulk content reads and checkpoint hydration group references by accepted-entry
 index, decoding each batch once while preserving output order and validating
 every content identity. Only one decoded batch is retained at a time.
