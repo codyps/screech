@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Require matched R3/R5 trials within 10% of NATS always throughput and p99."""
+"""Require matched R3/R5 throughput and end-to-end p99 to beat NATS by 20%."""
 import argparse
 import json
 from pathlib import Path
@@ -22,7 +22,7 @@ def compare_cluster(data, voters, minimum_trials=3):
             raise ValueError('wrong cluster replication or durability series')
     expected = [(scenario, size, subs, count) for scenario, size, subs, _ in JETSTREAM_CASES]
     return [dict(voters=voters, **row) for row in compare(data, expected, server, minimum_trials,
-        baseline=baseline, minimum_throughput_ratio=.9, maximum_p99_ratio=1.1)]
+        baseline=baseline, minimum_throughput_ratio=1.2, maximum_p99_ratio=.8)]
 
 
 def main():
@@ -36,7 +36,7 @@ def main():
     results = []
     for voters, path in ((3, args.three), (5, args.five)):
         results.extend(compare_cluster(read_campaign(path, f'R{voters}'), voters, args.minimum_trials))
-    report = dict(minimum_throughput_ratio=.9, maximum_p99_ratio=1.1,
+    report = dict(minimum_throughput_ratio=1.2, maximum_p99_ratio=.8,
         minimum_trials=args.minimum_trials, all_passed=all(row['passed'] for row in results),
         goal_verified=all(row['passed'] and row['trials'] >= 3 for row in results), cases=results)
     args.output.write_text(json.dumps(report, indent=2)+'\n')

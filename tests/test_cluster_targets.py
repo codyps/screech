@@ -17,8 +17,8 @@ class ClusterTargets(unittest.TestCase):
                     own=server.startswith('screech')
                     rows.append(dict(server=server,scenario=scenario,payload_bytes=size,subscribers=subs,
                         publishes=1000,trial=trial,checked=True,voters=voters,stream_replicas=voters,
-                        publishes_per_second=90 if own else 100,p99_us=11 if own else 10,
-                        cycle_p99_us=11 if own else 10,durable_p99_us=11 if own else 10))
+                        publishes_per_second=120 if own else 100,p99_us=8 if own else 10,
+                        cycle_p99_us=8 if own else 10,durable_p99_us=8 if own else 10))
         return dict(environment=dict(voters=voters),rows=rows)
 
     def test_boundaries_and_every_cluster_workload(self):
@@ -30,7 +30,7 @@ class ClusterTargets(unittest.TestCase):
             self.assertEqual(next(r for r in rows if r['scenario']=='core-stream')['latency_metric'],'durable_p99_us')
 
     def test_throughput_and_latency_cannot_hide_each_other(self):
-        for throughput, latency in ((89.9,1),(1000,11.1)):
+        for throughput, latency in ((119.9,1),(1000,8.1)):
             data=self.data()
             for row in data['rows']:
                 if row['server'].startswith('screech'):

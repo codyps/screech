@@ -29,7 +29,7 @@ A manual CI run can set trials (1–10) and nats_ref (branch, tag or SHA).
 The manual `Cluster benchmark targets` workflow runs just the two clustered
 campaigns on a fresh runner and uploads their raw trials and target report; its
 `messages` input controls publications per trial. It
-requires at least 90% of NATS always throughput and at most 110% of its p99 for
+requires at least 120% of NATS always throughput and at most 80% of its p99 for
 every case at both voter counts, using medians of at least three matched checked
 trials. Core-on-stream uses durable ACK p99; Fetch(1) uses the full Fetch/ACK cycle
 p99. One-trial runs cannot certify the target. Main CI also preserves this report
