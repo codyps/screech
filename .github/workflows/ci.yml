@@ -158,6 +158,15 @@ jobs:
           python3 scripts/check_cluster_targets.py --three results/cluster-3.json --five results/cluster-5.json --minimum-trials "$TRIALS" --report-only --output results/cluster-targets.json
           python3 scripts/check_jetstream_targets.py --standard results/standard.json --concurrent results/concurrent.json --server screech --minimum-trials "$TRIALS" --report-only --output results/jetstream-full-targets.json
           python3 scripts/check_jetstream_targets.py --standard results/standard.json --concurrent results/concurrent.json --server screech-unsafe-ack --minimum-trials "$TRIALS" --report-only --output results/jetstream-unsafe-ack-targets.json
+      - name: Upload checked timings before profiling
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: benchmark-timings
+          path: |
+            results/*.json
+            results/*.jsonl
+            results/nats-commit.txt
       - name: Profile Core forwarding and confirmed consumer ACKs
         run: |
           sudo apt-get update

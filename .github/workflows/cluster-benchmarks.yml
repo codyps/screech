@@ -74,6 +74,15 @@ jobs:
           python3 scripts/check_cluster_targets.py --three results/cluster-3.json \
             --five results/cluster-5.json --minimum-trials "$TRIALS" \
             --output results/cluster-targets.json
+      - name: Upload checked timings before profiling
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() && steps.build.outcome == 'success' }}
+        with:
+          name: cluster-benchmark-timings
+          path: |
+            results/cluster-*.json
+            results/cluster-*.jsonl
+            results/nats-commit.txt
       - name: Profile publication CPU and disk calls separately from timing
         if: ${{ always() && steps.build.outcome == 'success' }}
         run: |
