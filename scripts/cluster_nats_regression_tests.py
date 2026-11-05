@@ -319,15 +319,26 @@ def invalid_stored_model_waits_for_quorum(binary):
                 damaged = root[:offset] + bytes([127]) + root[offset + 1:]
                 db.execute("UPDATE cluster_meta SET value=? WHERE key='raft_snapshot'", [damaged])
                 db.execute("UPDATE cluster_meta SET value=? WHERE key='raft_snapshot_hash'", [hashlib.sha256(damaged).digest()])
-            cluster.start(victim)
+            journal = cluster.store_path(victim).with_suffix('.cluster-watermark')
+            promised = journal.read_bytes()
+            log = cluster.root/str(victim)/'server.log'
+            before = log.stat().st_size
+            cluster.start(victim, extra_env={'RUST_LOG':'screech::cluster::startup=info'})
             time.sleep(2)
-            # Byte checksums alone are insufficient: no Raft runtime may start.
-            try:
-                connection = socket.create_connection(cluster.address(victim), timeout=.3)
-                connection.close()
-                raise AssertionError('invalid stored model started a voting runtime')
-            except OSError:
-                pass
+            # Reserved listening ports are not an active service or a voter.
+            # Check the actual startup rejection and unchanged voting promises.
+            rejected = log.read_text()[before:]
+            assert 'stored generation requires quorum recovery' in rejected, rejected
+            assert 'starting cluster generation' not in rejected, rejected
+            assert journal.read_bytes() == promised, 'invalid model changed voting promises'
+            from wire import Client
+            for kind in ['client', 'service']:
+                try:
+                    connection = Client(cluster.address(victim, kind), timeout=.3)
+                    connection.close()
+                    raise AssertionError('invalid stored model started an application service')
+                except (OSError, EOFError):
+                    pass
             assert cluster.processes[victim].poll() is None
             for slot in range(1, 4):
                 if slot != victim:
