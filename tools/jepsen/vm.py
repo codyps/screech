@@ -78,6 +78,7 @@ mount -t tmpfs tmpfs /tmp
 mkdir -p /root
 ln -s /run /var/run
 {load}
+mkdir -p {shlex.quote(str(REPO))}
 mount -t 9p -o trans=virtio,version=9p2000.L,ro nix-store /nix/store || exec sh
 mount -t 9p -o trans=virtio,version=9p2000.L,ro workspace {shlex.quote(str(REPO))} || exec sh
 mount -t 9p -o trans=virtio,version=9p2000.L results /results || exec sh
