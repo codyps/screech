@@ -3,11 +3,36 @@
 import argparse
 import json
 import tempfile
+import time
 from pathlib import Path
 
 from cluster_tests import Cluster
 from cluster_recovery_tests import verify, wait_healed, wait_marker
 from wire import Client
+
+
+def audit_voter(cluster, slot, expected, attempts=30):
+    last = None
+    for _ in range(attempts):
+        try:
+            client = cluster.client(slot)
+            try:
+                for sequence, body in expected.items():
+                    assert client.get(sequence) == body, (slot, sequence)
+                info = client.request('$JS.API.CONSUMER.INFO.T.D', {})
+                assert info['ack_floor']['consumer_seq'] >= 1, info
+                assert info['num_ack_pending'] == 0, info
+                duplicate = client.publish_with_id(b'ignored', 'stable')
+                assert duplicate['duplicate'] and duplicate['seq'] == 1, duplicate
+            finally:
+                client.close()
+            return
+        except (OSError, EOFError, TimeoutError) as error:
+            # Admission can precede activation of the new leader's gateway.
+            # Retry transport failures only; every data assertion stays binding.
+            last = error
+            time.sleep(.1)
+    raise AssertionError(f'voter {slot} did not serve its recovered state') from last
 
 
 def run_case(binary, count, damage):
@@ -72,17 +97,7 @@ def run_case(binary, count, damage):
             else:
                 cluster.await_equal()
             for slot in cluster.processes:
-                client = cluster.client(slot)
-                try:
-                    for sequence, body in expected.items():
-                        assert client.get(sequence) == body, (slot, sequence)
-                    info = client.request('$JS.API.CONSUMER.INFO.T.D', {})
-                    assert info['ack_floor']['consumer_seq'] >= 1, info
-                    assert info['num_ack_pending'] == 0, info
-                    duplicate = client.publish_with_id(b'ignored', 'stable')
-                    assert duplicate['duplicate'] and duplicate['seq'] == 1, duplicate
-                finally:
-                    client.close()
+                audit_voter(cluster, slot, expected)
             # Exercise a complete cold restart after the spill and any replacement.
             for slot in list(cluster.processes):
                 cluster.kill(slot)
