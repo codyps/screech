@@ -60,7 +60,9 @@ impl Watermark {
         if let Ok(mut file) = File::open(&watermark.path) {
             use std::io::Read;
             let mut magic = [0; 8];
-            if file.read_exact(&mut magic).is_ok() && &magic == b"SCSEAL04" {
+            if file.read_exact(&mut magic).is_ok()
+                && (&magic == b"SCSEAL04" || &magic == b"SCSEAL05")
+            {
                 watermark.open_journal()?;
                 return Ok(watermark);
             }
@@ -527,7 +529,21 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("db");
             let mut db = Database::open(&path, &config(), true).unwrap();
-            db.persist(&[entry(1, 1)], Some(&hard(1, 1))).unwrap();
+            // Force the append-area path; small records can live entirely in
+            // authenticated seal pages, making this offset unused allocation.
+            let mut accepted = entry(1, 1);
+            accepted.data = postcard::to_allocvec(&Batch {
+                version: 1,
+                records: vec![crate::storage::Append {
+                    subject: "large-event".into(),
+                    headers: bytes::Bytes::new(),
+                    payload: vec![7; SEAL_BYTES].into(),
+                }],
+                contents: Vec::new(),
+            })
+            .unwrap()
+            .into();
+            db.persist(&[accepted], Some(&hard(1, 1))).unwrap();
             let published = SEAL_BYTES as u64 + db.journal_bytes();
             drop(db);
             let file = path.with_extension("cluster-watermark");

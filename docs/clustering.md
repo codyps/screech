@@ -45,6 +45,19 @@ small subsequent commits can overwrite initialized storage. Existing bytes are
 preserved. Allocation bytes supply no recovery evidence; complete accepted records
 and the signed seal still synchronize before replication or client success.
 
+The accepted journal's `SCSEAL05` seal pages also hold a bounded window of complete
+accepted records, including their payloads and restart promises. Small acceptances
+write one seal page and synchronize once. When a window fills, its records spill
+past the published append prefix before the next seal is written; large records
+use the append area directly. Logical record offsets and the authenticated hash
+chain cover both locations. Both seal pages must authenticate, and recovery must
+find the preceding seal's complete prefix in the current chain. A torn page or
+missing spill fences the voter for automatic quorum repair.
+`SCSEAL04` journals upgrade during ordinary appends, with mixed-version seal pages
+accepted during the transition. Old readers reject the new seal version. The
+independent complete SQL witness and FULL checkpoint-root installation remain
+part of recovery validation.
+
 One ordinary startup command handles formation, restart and repair; bootstrap and
 join flags have been removed. Fresh original voters first persist an authenticated
 formation certificate requiring all initial voters. Historical stores cannot form

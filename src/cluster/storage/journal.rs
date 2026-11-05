@@ -3,7 +3,8 @@
 use super::*;
 use std::io::{Read, SeekFrom};
 
-const MAGIC: &[u8; 8] = b"SCSEAL04";
+const MAGIC: &[u8; 8] = b"SCSEAL05";
+const LEGACY_MAGIC: &[u8; 8] = b"SCSEAL04";
 const ROOT_KEY: &str = "journal_root";
 const MAX_RECORD: u64 = 34 * 1024 * 1024;
 const ALLOCATION_BYTES: u64 = 1024 * 1024;
@@ -49,6 +50,300 @@ fn reserve(file: &mut File, end: u64) -> io::Result<u64> {
 #[cfg(test)]
 mod allocation_tests {
     use super::*;
+
+    fn config() -> ClusterConfig {
+        crate::cluster::storage::tests::config()
+    }
+    fn hard(commit: u64) -> HardState {
+        HardState {
+            term: 1,
+            vote: 1,
+            commit,
+            ..Default::default()
+        }
+    }
+    fn record(index: u64, size: usize) -> Entry {
+        Entry {
+            index,
+            term: 1,
+            data: Batch::encode(
+                &[crate::storage::Append {
+                    subject: format!("entry.{index}"),
+                    headers: bytes::Bytes::new(),
+                    payload: vec![index as u8; size].into(),
+                }],
+                &[],
+            )
+            .unwrap()
+            .into(),
+            ..Default::default()
+        }
+    }
+    fn backup(db: &Database, path: &Path) {
+        db.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        std::fs::copy(path, path.with_extension("sql-before")).unwrap();
+    }
+    fn restore_sql(path: &Path) {
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        std::fs::copy(path.with_extension("sql-before"), path).unwrap();
+    }
+
+    #[test]
+    fn inline_records_replay_complete_entries_and_promises_without_append_area_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut db = Database::open(&path, &config(), true).unwrap();
+        backup(&db, &path);
+        for index in 1..=4 {
+            db.persist(&[record(index, 128)], Some(&hard(index)))
+                .unwrap();
+        }
+        let journal = db.watermark.journal.as_ref().unwrap();
+        assert_eq!(journal.seal.spilled_end().unwrap(), SEAL_BYTES as u64);
+        assert!(!journal.seal.inline.is_empty());
+        let expected = db.position().unwrap();
+        drop(db);
+        // The complete canonical log is in the two seal pages. Discarding only
+        // unused physical allocation must not remove any accepted information.
+        OpenOptions::new()
+            .write(true)
+            .open(path.with_extension("cluster-watermark"))
+            .unwrap()
+            .set_len(SEAL_BYTES as u64)
+            .unwrap();
+        restore_sql(&path);
+        let mut db = Database::open(&path, &config(), false).unwrap();
+        assert_eq!(db.position().unwrap(), expected);
+        for index in 1..=4 {
+            assert_eq!(db.entry(index).unwrap(), record(index, 128));
+            assert_eq!(
+                db.record(index).unwrap().unwrap().payload.as_ref(),
+                vec![index as u8; 128]
+            );
+        }
+        db.persist(&[record(5, 128)], Some(&hard(5))).unwrap();
+        drop(db);
+        assert_eq!(
+            Database::open(&path, &config(), false)
+                .unwrap()
+                .hard()
+                .unwrap(),
+            hard(5)
+        );
+    }
+
+    #[test]
+    fn inline_windows_spill_and_large_records_recover_after_losing_sql_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut db = Database::open(&path, &config(), true).unwrap();
+        backup(&db, &path);
+        for index in 1..=40 {
+            let size = if index == 20 { 16 * 1024 } else { 256 };
+            db.persist(&[record(index, size)], Some(&hard(index)))
+                .unwrap();
+        }
+        let journal = db.watermark.journal.as_ref().unwrap();
+        assert!(journal.seal.spilled_end().unwrap() > SEAL_BYTES as u64);
+        assert!(!journal.seal.inline.is_empty());
+        let expected = db.position().unwrap();
+        drop(db);
+        restore_sql(&path);
+        let db = Database::open(&path, &config(), false).unwrap();
+        assert_eq!(db.position().unwrap(), expected);
+        for index in 1..=40 {
+            let size = if index == 20 { 16 * 1024 } else { 256 };
+            assert_eq!(db.entry(index).unwrap(), record(index, size));
+        }
+    }
+
+    #[test]
+    fn damaged_inline_records_or_either_seal_require_quorum_repair() {
+        for damage in ["inline", "signed-inline", "older-seal", "truncate"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db");
+            let mut db = Database::open(&path, &config(), true).unwrap();
+            db.persist(&[record(1, 128)], Some(&hard(1))).unwrap();
+            let journal = db.watermark.journal.as_ref().unwrap();
+            let current = journal.generation as usize % 2;
+            assert!(!journal.seal.inline.is_empty());
+            let resigned = if damage == "signed-inline" {
+                let mut damaged = journal.seal.clone();
+                damaged.inline[10] ^= 1;
+                Some(
+                    db.watermark
+                        .encode_seal(&damaged, journal.generation, current as u64)
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            drop(db);
+            let file = path.with_extension("cluster-watermark");
+            let mut bytes = std::fs::read(&file).unwrap();
+            match damage {
+                "inline" => {
+                    let range = current * SLOT_BYTES..(current + 1) * SLOT_BYTES;
+                    let at = bytes[range.clone()]
+                        .windows(32)
+                        .position(|window| window == [1; 32])
+                        .unwrap();
+                    bytes[range.start + at] ^= 1;
+                }
+                "older-seal" => bytes[(1 - current) * SLOT_BYTES + 128] ^= 1,
+                "signed-inline" => bytes[current * SLOT_BYTES..(current + 1) * SLOT_BYTES]
+                    .copy_from_slice(&resigned.unwrap()),
+                _ => bytes.truncate(SEAL_BYTES - 1),
+            }
+            std::fs::write(&file, bytes).unwrap();
+            assert!(
+                Database::open(&path, &config(), false).is_err(),
+                "{damage} resumed voting"
+            );
+        }
+    }
+
+    fn convert_to_legacy_journal(db: &Database, path: &Path) -> Vec<u8> {
+        let file = path.with_extension("cluster-watermark");
+        let mut bytes = std::fs::read(&file).unwrap();
+        let journal = db.watermark.journal.as_ref().unwrap();
+        let start = journal.seal.spilled_end().unwrap() as usize;
+        bytes[start..start + journal.seal.inline.len()].copy_from_slice(&journal.seal.inline);
+        for slot in 0..2 {
+            let range = slot * SLOT_BYTES..(slot + 1) * SLOT_BYTES;
+            let (generation, seal) = db
+                .watermark
+                .decode_seal(&bytes[range.clone()], slot as u64)
+                .unwrap();
+            let body = postcard::to_allocvec(&LegacySeal {
+                root: seal.root,
+                position: seal.position,
+                end: seal.end,
+                hash: seal.hash,
+            })
+            .unwrap();
+            let mut frame = [0; SLOT_BYTES];
+            frame[..8].copy_from_slice(LEGACY_MAGIC);
+            frame[8..16].copy_from_slice(&generation.to_le_bytes());
+            frame[16..24].copy_from_slice(&(slot as u64).to_le_bytes());
+            frame[24..28].copy_from_slice(&(body.len() as u32).to_le_bytes());
+            frame[28..28 + body.len()].copy_from_slice(&body);
+            let mac = db.watermark.journal_mac(b"seal", &frame[..MAC_AT]);
+            frame[MAC_AT..].copy_from_slice(&mac);
+            bytes[range].copy_from_slice(&frame);
+        }
+        let mut output = OpenOptions::new().write(true).open(file).unwrap();
+        output.write_all(&bytes).unwrap();
+        output.sync_all().unwrap();
+        bytes
+    }
+
+    #[test]
+    fn legacy_journals_upgrade_through_mixed_slots_without_changing_their_hash_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut db = Database::open(&path, &config(), true).unwrap();
+        for index in 1..=2 {
+            db.persist(&[record(index, 128)], Some(&hard(index)))
+                .unwrap();
+        }
+        let expected_tip = db.watermark.tip().unwrap();
+        let legacy = convert_to_legacy_journal(&db, &path);
+        drop(db);
+        let mut db = Database::open(&path, &config(), false).unwrap();
+        assert_eq!(db.watermark.tip().unwrap(), expected_tip);
+        assert!(db
+            .watermark
+            .journal
+            .as_ref()
+            .unwrap()
+            .seal
+            .inline
+            .is_empty());
+        db.persist(&[record(3, 128)], Some(&hard(3))).unwrap();
+        drop(db);
+        let bytes = std::fs::read(path.with_extension("cluster-watermark")).unwrap();
+        assert_ne!(&bytes[..8], &bytes[SLOT_BYTES..SLOT_BYTES + 8]);
+        assert!([LEGACY_MAGIC, MAGIC].contains(&bytes[..8].try_into().unwrap()));
+        let mut db = Database::open(&path, &config(), false).unwrap();
+        assert_eq!(db.entry(3).unwrap(), record(3, 128));
+        db.persist(&[record(4, 128)], Some(&hard(4))).unwrap();
+        drop(db);
+        let bytes = std::fs::read(path.with_extension("cluster-watermark")).unwrap();
+        assert_eq!(&bytes[..8], MAGIC);
+        assert_eq!(&bytes[SLOT_BYTES..SLOT_BYTES + 8], MAGIC);
+        let db = Database::open(&path, &config(), false).unwrap();
+        for index in 1..=4 {
+            assert_eq!(db.entry(index).unwrap(), record(index, 128));
+        }
+        drop(db);
+        // The independent SQL witness must reject rolling the journal back to
+        // an authentic pre-upgrade prefix that forgot newly accepted entries.
+        std::fs::write(path.with_extension("cluster-watermark"), legacy).unwrap();
+        assert!(Database::open(&path, &config(), false).is_err());
+    }
+
+    #[test]
+    fn an_interrupted_spill_preserves_the_previous_inline_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut db = Database::open(&path, &config(), true).unwrap();
+        for index in 1..=32 {
+            backup(&db, &path);
+            let old_headers = std::fs::read(path.with_extension("cluster-watermark")).unwrap();
+            let old_spilled = db
+                .watermark
+                .journal
+                .as_ref()
+                .unwrap()
+                .seal
+                .spilled_end()
+                .unwrap();
+            let position = db.position().unwrap();
+            db.persist(&[record(index, 512)], Some(&hard(index)))
+                .unwrap();
+            let spilled = db
+                .watermark
+                .journal
+                .as_ref()
+                .unwrap()
+                .seal
+                .spilled_end()
+                .unwrap();
+            if spilled > old_spilled {
+                drop(db);
+                // Retain the newly written spill but restore the two seals as
+                // they stood before publishing it. SQL did not accept it yet.
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .open(path.with_extension("cluster-watermark"))
+                    .unwrap();
+                file.write_all(&old_headers[..SEAL_BYTES]).unwrap();
+                file.sync_all().unwrap();
+                restore_sql(&path);
+                let mut recovered = Database::open(&path, &config(), false).unwrap();
+                assert_eq!(recovered.position().unwrap(), position);
+                assert!(recovered.entry(index).is_err());
+                recovered
+                    .persist(&[record(index, 512)], Some(&hard(index)))
+                    .unwrap();
+                drop(recovered);
+                assert_eq!(
+                    Database::open(&path, &config(), false)
+                        .unwrap()
+                        .entry(index)
+                        .unwrap(),
+                    record(index, 512)
+                );
+                return;
+            }
+        }
+        panic!("test did not cross an inline-window spill");
+    }
 
     #[test]
     fn reservation_initializes_only_new_extents_and_preserves_the_cursor() {
@@ -97,6 +392,22 @@ struct Seal {
     position: Position,
     end: u64,
     hash: [u8; 32],
+    inline: Vec<u8>,
+}
+#[derive(Serialize, Deserialize)]
+struct LegacySeal {
+    root: Root,
+    position: Position,
+    end: u64,
+    hash: [u8; 32],
+}
+impl Seal {
+    fn spilled_end(&self) -> io::Result<u64> {
+        self.end
+            .checked_sub(self.inline.len() as u64)
+            .filter(|end| *end >= SEAL_BYTES as u64)
+            .ok_or_else(|| error("invalid inline journal bounds"))
+    }
 }
 #[derive(Serialize, Deserialize)]
 struct Accepted {
@@ -180,7 +491,9 @@ impl Watermark {
         self.journal_auth(b"seal", &frame[..MAC_AT])
             .verify_slice(&frame[MAC_AT..])
             .map_err(error)?;
-        if &frame[..8] != MAGIC || u64::from_le_bytes(frame[16..24].try_into().unwrap()) != slot {
+        if (&frame[..8] != MAGIC && &frame[..8] != LEGACY_MAGIC)
+            || u64::from_le_bytes(frame[16..24].try_into().unwrap()) != slot
+        {
             return Err(error("journal seal authentication failed"));
         }
         let generation = u64::from_le_bytes(frame[8..16].try_into().unwrap());
@@ -188,12 +501,24 @@ impl Watermark {
         if len > MAC_AT - 28 || (generation != 0 && generation % 2 != slot) {
             return Err(error("invalid journal seal bounds"));
         }
-        let seal: Seal = postcard::from_bytes(&frame[28..28 + len]).map_err(error)?;
+        let seal: Seal = if &frame[..8] == MAGIC {
+            postcard::from_bytes(&frame[28..28 + len]).map_err(error)?
+        } else {
+            let legacy: LegacySeal = postcard::from_bytes(&frame[28..28 + len]).map_err(error)?;
+            Seal {
+                root: legacy.root,
+                position: legacy.position,
+                end: legacy.end,
+                hash: legacy.hash,
+                inline: Vec::new(),
+            }
+        };
         if seal.end < SEAL_BYTES as u64
             || seal.position.incarnation != seal.root.position.incarnation
         {
             return Err(error("invalid journal seal position"));
         }
+        seal.spilled_end()?;
         Ok((generation, seal))
     }
     pub(super) fn open_journal(&mut self) -> io::Result<()> {
@@ -238,6 +563,10 @@ impl Watermark {
         previous: Option<&Seal>,
     ) -> io::Result<()> {
         journal.file.seek(SeekFrom::Start(SEAL_BYTES as u64))?;
+        let spilled = journal.seal.spilled_end()? - SEAL_BYTES as u64;
+        let mut records = (&mut journal.file)
+            .take(spilled)
+            .chain(std::io::Cursor::new(&journal.seal.inline));
         let mut end = SEAL_BYTES as u64;
         let mut hash = [0; 32];
         let mut position = journal.seal.root.position.clone();
@@ -245,7 +574,7 @@ impl Watermark {
             previous.is_none_or(|p| p.end == end && p.hash == hash && p.position == position);
         while end < journal.seal.end {
             let mut size = [0; 8];
-            journal.file.read_exact(&mut size)?;
+            records.read_exact(&mut size)?;
             let size = u64::from_le_bytes(size);
             if size == 0
                 || size > MAX_RECORD
@@ -256,14 +585,14 @@ impl Watermark {
                 return Err(error("invalid journal record bounds"));
             }
             let mut body = vec![0; size as usize];
-            journal.file.read_exact(&mut body)?;
+            records.read_exact(&mut body)?;
             let mut signed = Vec::with_capacity(56 + body.len());
             signed.extend_from_slice(&journal.seal.root.id);
             signed.extend_from_slice(&end.to_le_bytes());
             signed.extend_from_slice(&hash);
             signed.extend_from_slice(&size.to_le_bytes());
             signed.extend_from_slice(&body);
-            journal.file.read_exact(&mut hash)?;
+            records.read_exact(&mut hash)?;
             self.journal_auth(b"accepted", &signed)
                 .verify_slice(&hash)
                 .map_err(error)?;
@@ -296,6 +625,7 @@ impl Watermark {
             root,
             end: SEAL_BYTES as u64,
             hash: [0; 32],
+            inline: Vec::new(),
         };
         let temporary = self.path.with_extension("cluster-watermark.tmp");
         let mut file = OpenOptions::new()
@@ -361,20 +691,41 @@ impl Watermark {
             .generation
             .checked_add(1)
             .ok_or_else(|| error("journal generations exhausted"))?;
-        let seal = Seal {
+        let mut seal = Seal {
             root: j.seal.root.clone(),
             position,
             end: j.seal.end + 8 + body.len() as u64 + 32,
             hash,
+            inline: Vec::new(),
         };
+        let record = &signed[16 + 8 + 32..];
+        // Empty Vec length takes one byte; an inline window below 4 KiB takes
+        // at most two. Budget the extra byte before choosing the write path.
+        let fixed = postcard::to_allocvec(&seal).map_err(error)?.len();
+        let budget = (MAC_AT - 28).saturating_sub(fixed + 1);
+        let spill = j.seal.inline.len() + record.len() > budget;
+        if !spill {
+            seal.inline.extend_from_slice(&j.seal.inline);
+            seal.inline.extend_from_slice(record);
+        } else if record.len() <= budget {
+            seal.inline.extend_from_slice(record);
+        }
         let frame = self.encode_seal(&seal, generation, generation % 2)?;
         let j = self.journal.as_mut().unwrap();
         if seal.end > j.capacity {
             j.capacity = reserve(&mut j.file, seal.end)?;
         }
         crate::fault::point("before_cluster_watermark");
-        j.file.seek(SeekFrom::Start(j.seal.end))?;
-        j.file.write_all(&signed[16 + 8 + 32..])?;
+        if spill {
+            // The previous seal still carries this complete window until the
+            // new seal is synced. Spill only beyond its published file prefix.
+            j.file.seek(SeekFrom::Start(j.seal.spilled_end()?))?;
+            j.file.write_all(&j.seal.inline)?;
+            if seal.inline.is_empty() {
+                j.file.write_all(record)?;
+            }
+            crate::fault::point("after_cluster_journal_spill");
+        }
         j.file
             .seek(SeekFrom::Start(generation % 2 * SLOT_BYTES as u64))?;
         j.file.write_all(&frame)?;
