@@ -10,7 +10,12 @@ def request(cluster,subject,body=None,attempts=30):
     for _ in range(attempts):
         try:
             leader=cluster.wait_leader();c=cluster.client(leader)
-            try:return c.request(subject,{} if body is None else body)
+            try:
+                result=c.request(subject,{} if body is None else body)
+                # A retiring service can return an error before its connection
+                # closes. It is a failed probe, not a successful status payload.
+                assert 'error' not in result,result
+                return result
             finally:c.close()
         except (OSError,EOFError,AssertionError,TimeoutError) as e:last=e;time.sleep(.1)
     raise AssertionError(last)
