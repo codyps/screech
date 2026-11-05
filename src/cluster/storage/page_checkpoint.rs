@@ -177,14 +177,24 @@ mod tests {
 
         changes.store(PROJECTION_CHANGE_BUDGET, Ordering::Release);
         let deadline = Instant::now() + Duration::from_secs(5);
-        while std::fs::metadata(&path).unwrap().len() < 9 * 1024 * 1024 {
+        loop {
+            // File growth precedes completion of checkpoint I/O. Observe the
+            // completed backfill instead of assuming a fixed sleep is enough.
+            // NOOP reports progress without checkpointing any frames itself.
+            let (busy, frames, backfilled): (i64, i64, i64) = conn
+                .query_row("PRAGMA wal_checkpoint(NOOP)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .unwrap();
+            if busy == 0 && frames > 0 && backfilled == frames {
+                break;
+            }
             assert!(
                 Instant::now() < deadline,
                 "projection budget did not trigger a checkpoint"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        std::thread::sleep(Duration::from_millis(150));
         conn.execute("INSERT INTO t VALUES(3, x'02')", []).unwrap();
         assert_ne!(
             salt(&path),
