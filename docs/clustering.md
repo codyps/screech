@@ -58,6 +58,14 @@ accepted during the transition. Old readers reject the new seal version. The
 independent complete SQL witness and FULL checkpoint-root installation remain
 part of recovery validation.
 
+The consensus owner starts a SQL snapshot on its first actual SQL read or write,
+keeping validation and projection updates in one transaction. Turns that only
+process cached Raft state or fresh ReadIndex probes need no SQL transaction.
+ReadIndex checks the term of the accepted-journal promise installed after sync;
+it still requires new context-bound quorum replies. Content reads retain an eager
+SQL snapshot and their independent SQL epoch checks. All application completions
+remain staged until the projection transaction, when present, commits.
+
 One ordinary startup command handles formation, restart and repair; bootstrap and
 join flags have been removed. Fresh original voters first persist an authenticated
 formation certificate requiring all initial voters. Historical stores cannot form

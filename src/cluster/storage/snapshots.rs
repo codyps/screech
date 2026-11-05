@@ -66,6 +66,7 @@ impl Database {
             .map(|c| c.unwrap_or_default())
     }
     pub fn snapshot_content(&self, key: ContentKey) -> io::Result<Option<Content>> {
+        self.projection_sql()?;
         let row: Option<(Vec<u8>, Vec<u8>)> = self
             .conn
             .query_row(

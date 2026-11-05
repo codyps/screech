@@ -40,6 +40,16 @@ pub(super) struct Watermark {
     journal: Option<journal::Journal>,
 }
 impl Watermark {
+    pub(super) fn durable_term(&self, incarnation: [u8; 16]) -> io::Result<u64> {
+        if self.journal.is_none() {
+            return Err(error("missing durable accepted journal"));
+        }
+        self.sealed
+            .as_ref()
+            .filter(|position| position.incarnation == incarnation)
+            .map(|position| position.term)
+            .ok_or_else(|| error("missing durable journal epoch"))
+    }
     pub fn open(
         path: &Path,
         config: &ClusterConfig,

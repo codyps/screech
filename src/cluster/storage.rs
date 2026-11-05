@@ -16,6 +16,7 @@ use raft::{
 use rusqlite::{params, Connection, OptionalExtension};
 pub(crate) use snapshots::MAX_SNAPSHOT;
 use std::{
+    cell::Cell,
     fs::{File, OpenOptions},
     io::{self, Write},
     path::Path,
@@ -43,6 +44,8 @@ pub(crate) struct Database {
     // Actor-local invalidation token, never a durability or recovery witness.
     pub(super) membership_revision: u64,
     projection_batch: bool,
+    projection_transaction: Cell<bool>,
+    projection_eager: bool,
     pub(super) projection_changes: Arc<AtomicU64>,
     _lock: File,
     watermark: watermark::Watermark,
@@ -204,6 +207,8 @@ impl Database {
             accepted_tip: None,
             membership_revision: 0,
             projection_batch: false,
+            projection_transaction: Cell::new(false),
+            projection_eager: false,
             projection_changes: Arc::new(AtomicU64::new(0)),
             gate: Arc::new(Mutex::new(())),
             node_id: config.node_id,
@@ -282,6 +287,7 @@ impl Database {
         Ok(db)
     }
     pub fn meta(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
+        self.projection_sql()?;
         self.conn
             .prepare_cached("SELECT value FROM cluster_meta WHERE key=?1")
             .map_err(error)?
@@ -295,7 +301,16 @@ impl Database {
             .transpose()
             .map(|h| h.unwrap_or_default())
     }
+    pub(super) fn durable_term(&self) -> io::Result<u64> {
+        if self.failed {
+            return Err(error("replica quarantined"));
+        }
+        // This is the canonical journal promise, installed only after sync and
+        // verified against the independent SQL witness before opening a voter.
+        self.watermark.durable_term(self.incarnation)
+    }
     pub fn last(&self) -> io::Result<u64> {
+        self.projection_sql()?;
         self.conn
             .prepare_cached("SELECT coalesce(max(idx),0) FROM entries")
             .map_err(error)?
@@ -305,6 +320,7 @@ impl Database {
             .and_then(|n| Ok(n.max(self.snapshot_base()?.0)))
     }
     pub fn end(&self) -> io::Result<u64> {
+        self.projection_sql()?;
         self.conn
             .prepare_cached("SELECT coalesce(max(seq),0) FROM event_index")
             .map_err(error)?
@@ -332,6 +348,7 @@ impl Database {
             || configuration > self.snapshot_position.0)
     }
     fn refresh_log_bytes(&mut self) -> io::Result<()> {
+        self.projection_sql()?;
         self.entries_bytes = self
             .conn
             .query_row(
@@ -344,6 +361,7 @@ impl Database {
         Ok(())
     }
     pub fn entry(&self, idx: u64) -> io::Result<Entry> {
+        self.projection_sql()?;
         if self.failed {
             return Err(error("replica quarantined"));
         }
@@ -550,26 +568,45 @@ impl Database {
         })
     }
     pub(super) fn begin_projection(&mut self) -> io::Result<()> {
-        if self.projection_batch {
+        self.begin_lazy_projection()?;
+        self.projection_eager = true;
+        self.projection_sql()
+    }
+    pub(super) fn begin_lazy_projection(&mut self) -> io::Result<()> {
+        if self.projection_batch || !self.conn.is_autocommit() {
             return Err(error("nested projection batch"));
         }
-        self.conn.execute_batch("BEGIN DEFERRED").map_err(error)?;
         self.projection_batch = true;
+        self.projection_eager = false;
+        self.projection_transaction.set(false);
+        Ok(())
+    }
+    fn projection_sql(&self) -> io::Result<()> {
+        if self.projection_batch && !self.projection_transaction.get() {
+            self.conn.execute_batch("BEGIN DEFERRED").map_err(error)?;
+            self.projection_transaction.set(true);
+        }
         Ok(())
     }
     pub(super) fn finish_projection(&mut self, commit: bool) -> io::Result<()> {
         if !self.projection_batch {
             return Ok(());
         }
-        let result = self
-            .conn
-            .execute_batch(if commit { "COMMIT" } else { "ROLLBACK" })
-            .map_err(error);
+        let started = self.projection_transaction.get();
+        let result = if started {
+            self.conn
+                .execute_batch(if commit { "COMMIT" } else { "ROLLBACK" })
+                .map_err(error)
+        } else {
+            Ok(())
+        };
         self.projection_batch = false;
+        self.projection_transaction.set(false);
+        self.projection_eager = false;
         if !commit || result.is_err() {
             self.accepted_tip = None;
         }
-        if commit && result.is_ok() {
+        if started && commit && result.is_ok() {
             self.projection_changes
                 .store(self.conn.total_changes(), Ordering::Release);
         }
@@ -587,9 +624,11 @@ impl Database {
         apply: impl FnOnce(&Connection) -> io::Result<T>,
     ) -> io::Result<T> {
         if !durable && self.projection_batch {
+            self.projection_sql()?;
             return apply(&self.conn);
         }
         let resume = self.projection_batch;
+        let eager = self.projection_eager;
         if resume {
             self.finish_projection(true)?;
         }
@@ -619,11 +658,16 @@ impl Database {
         };
         restored?;
         if resume && result.is_ok() {
-            self.begin_projection()?;
+            if eager {
+                self.begin_projection()?;
+            } else {
+                self.begin_lazy_projection()?;
+            }
         }
         result
     }
     pub fn record(&self, sequence: u64) -> io::Result<Option<Record>> {
+        self.projection_sql()?;
         let pos: Option<(i64, i64)> = self
             .conn
             .prepare_cached("SELECT idx,ordinal FROM event_index WHERE seq=?1")
@@ -647,6 +691,7 @@ impl Database {
         .transpose()
     }
     pub fn content(&self, key: ContentKey) -> io::Result<Option<Content>> {
+        self.projection_sql()?;
         let pos: Option<(i64, i64)> = self
             .conn
             .prepare_cached("SELECT idx,ordinal FROM body_index WHERE generation=?1 AND seq=?2")
@@ -671,6 +716,7 @@ impl Database {
         .transpose()
     }
     pub fn contents(&self, keys: &[ContentKey]) -> io::Result<Vec<Content>> {
+        self.projection_sql()?;
         let mut output = vec![None; keys.len()];
         let mut positions = Vec::with_capacity(keys.len());
         let mut lookup = self
@@ -802,6 +848,79 @@ impl Storage for LogStorage {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lazy_projection_only_opens_sql_for_mutations_and_keeps_rollback_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Database::open(&dir.path().join("db"), &config(), true).unwrap();
+        let changes = db.projection_changes.load(Ordering::Acquire);
+        db.begin_lazy_projection().unwrap();
+        assert!(db.conn.is_autocommit());
+        db.persist(&[], None).unwrap();
+        assert!(db.conn.is_autocommit());
+        db.finish_projection(true).unwrap();
+        assert_eq!(db.projection_changes.load(Ordering::Acquire), changes);
+        db.begin_lazy_projection().unwrap();
+        db.persist(
+            &[entry(1, 1, b"accepted")],
+            Some(&HardState {
+                term: 1,
+                vote: 1,
+                commit: 1,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        db.apply(1).unwrap();
+        assert!(!db.conn.is_autocommit());
+        assert_eq!(db.end().unwrap(), 1);
+        db.finish_projection(false).unwrap();
+        assert!(db.conn.is_autocommit());
+        assert_eq!(db.end().unwrap(), 0);
+        assert_eq!(db.hard().unwrap().commit, 0);
+        assert!(db
+            .content(ContentKey {
+                generation: 1,
+                sequence: 1
+            })
+            .unwrap()
+            .is_none());
+        // SQL rollback did not roll back a voting promise already synchronized
+        // in the canonical accepted journal. Recovery replays that full prefix.
+        assert_eq!(db.durable_term().unwrap(), 1);
+        drop(db);
+        let db = Database::open(&dir.path().join("db"), &config(), false).unwrap();
+        assert_eq!(db.hard().unwrap().commit, 1);
+        assert_eq!(db.record(1).unwrap().unwrap().subject, "event");
+    }
+
+    #[test]
+    fn full_transactions_resume_the_original_projection_scope() {
+        for eager in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = Database::open(&dir.path().join("db"), &config(), true).unwrap();
+            if eager {
+                db.begin_projection().unwrap();
+            } else {
+                db.begin_lazy_projection().unwrap();
+            }
+            assert!(db.begin_lazy_projection().is_err());
+            db.commit_transaction(true, |tx| {
+                tx.execute("INSERT INTO cluster_meta VALUES('full-test',x'01')", [])
+                    .map_err(error)?;
+                Ok(())
+            })
+            .unwrap();
+            assert!(db.projection_batch);
+            assert_eq!(db.conn.is_autocommit(), !eager);
+            assert!(db.begin_projection().is_err());
+            db.finish_projection(true).unwrap();
+            assert!(db.conn.is_autocommit());
+            assert_eq!(db.meta("full-test").unwrap(), Some(vec![1]));
+            db.failed = true;
+            assert!(db.durable_term().is_err());
+        }
+    }
+
     #[test]
     fn cached_log_budget_survives_suffix_replacement_and_restart() {
         let dir = tempfile::tempdir().unwrap();

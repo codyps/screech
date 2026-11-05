@@ -528,7 +528,7 @@ fn project<R>(
         if db.failed {
             return Err(error("replica quarantined"));
         }
-        db.begin_projection()?;
+        db.begin_lazy_projection()?;
     }
     let mut completed = Vec::new();
     let result = step(node, &mut completed);
@@ -728,7 +728,7 @@ fn pump_ready(
         if pending
             .values()
             .any(|request| request.read_index.is_some_and(|index| index <= view))
-            && node.store().db.lock().unwrap().hard()?.term != node.raft.term
+            && node.store().db.lock().unwrap().durable_term()? != node.raft.term
         {
             return Err(error("durable read epoch does not match Raft"));
         }
@@ -1069,8 +1069,8 @@ async fn run_runtime(
                 }
                 let mut incoming_lease = None;
                 let mut stopped = false;
-                // Include input validation, Raft storage reads and role metadata
-                // in the same projection transaction as this input's Ready work.
+                // The gate orders input validation and Ready work with content
+                // readers. Start SQL lazily when this turn actually mutates it.
                 project(&mut node, |node, completed| {
                 let started = Instant::now();
                 let mut processed = 0;
