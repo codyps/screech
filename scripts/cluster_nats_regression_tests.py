@@ -496,6 +496,8 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path)
     parser.add_argument('--shim', type=lambda value: Path(value).resolve())
     args = parser.parse_args()
+    if args.shim is not None and not args.shim.is_file():
+        parser.error(f"I/O interposer does not exist: {args.shim}")
     result = run(args.binary, args.shim)
     text = json.dumps(result, indent=2)
     print(text)
