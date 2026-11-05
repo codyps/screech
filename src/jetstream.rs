@@ -356,7 +356,7 @@ impl Handle {
                             &mut deferred,
                             previous_group,
                             if worker.engine.replicas() > 1 {
-                                Duration::from_micros(64)
+                                Duration::from_micros(32)
                             } else {
                                 Duration::ZERO
                             },
