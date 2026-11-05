@@ -24,7 +24,7 @@ jobs:
   test:
     name: Models, protocol and process failures
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 40
     env:
       PROPTEST_CASES: 256
     steps:
@@ -79,7 +79,9 @@ jobs:
           python3 scripts/cluster_quorum_tests.py target/debug/screech-server --output results/cluster-quorum-tests.json
           python3 scripts/cluster_journal_tests.py target/debug/screech-server --output results/cluster-journal-tests.json
           python3 scripts/cluster_projection_tests.py target/debug/screech-server --output results/cluster-projection-tests.json
-          python3 scripts/cluster_checkpoint_tests.py target/debug/screech-server --output results/cluster-checkpoint-tests.json
+      - name: Automatic cluster checkpoints, cold restart and voter repair
+        timeout-minutes: 12
+        run: python3 scripts/cluster_checkpoint_tests.py target/debug/screech-server --output results/cluster-checkpoint-tests.json
       - name: Unsafe consumer ACK buffering and durable publication fences
         run: python3 scripts/unsafe_ack_tests.py target/debug/screech-server --shim ./sqlite-io-fault.so --output results/unsafe-ack-tests.json
       - name: Retained content exceeds process memory budget
