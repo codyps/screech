@@ -7,7 +7,7 @@ mod startup;
 mod storage;
 use crate::{
     server::{Config as ServerConfig, Server},
-    storage::{Append, CheckpointJob, Content, ContentKey, Record, Store, StoreError},
+    storage::{Append, CheckpointJob, Content, ContentKey, Record, Replication, Store, StoreError},
 };
 use bytes::Bytes;
 use hmac::{Hmac, Mac};
@@ -117,6 +117,20 @@ pub(crate) struct Batch {
     contents: Vec<Content>,
 }
 impl Batch {
+    fn encode(records: &[Append], contents: &[Content]) -> io::Result<Vec<u8>> {
+        #[derive(Serialize)]
+        struct Borrowed<'a> {
+            version: u8,
+            records: &'a [Append],
+            contents: &'a [Content],
+        }
+        postcard::to_allocvec(&Borrowed {
+            version: 1,
+            records,
+            contents,
+        })
+        .map_err(error)
+    }
     fn decode(data: &[u8]) -> io::Result<Self> {
         let b: Self = postcard::from_bytes(data).map_err(error)?;
         if b.version != 1 {
@@ -298,7 +312,33 @@ impl Client {
 struct ClusterStore {
     client: Client,
 }
+impl Replication for Client {
+    fn read_barrier(&self) -> Result<(), StoreError> {
+        self.barrier().map_err(StoreError::from)
+    }
+    fn append_with_content(
+        &self,
+        records: &[Append],
+        contents: &[Content],
+    ) -> Result<u64, StoreError> {
+        let data = Batch::encode(records, contents)?;
+        if data.len() > 32 * 1024 * 1024 {
+            return Err(StoreError::Invalid);
+        }
+        self.propose(data).map_err(StoreError::from)
+    }
+    fn checkpoint_needed(&self) -> Result<bool, StoreError> {
+        self.current()?;
+        let db = self.db.lock().unwrap();
+        self.current()?;
+        db.checkpoint_pressure(self.configuration)
+            .map_err(StoreError::from)
+    }
+}
 impl Store for ClusterStore {
+    fn replication(&self) -> Option<Arc<dyn Replication>> {
+        Some(Arc::new(self.client.clone()))
+    }
     fn replace_voter(&self, old: u64, new: u64, nonce: [u8; 16]) -> Result<(), StoreError> {
         self.client.current()?;
         let (reply, rx) = mpsc::sync_channel(1);
@@ -364,16 +404,7 @@ impl Store for ClusterStore {
         self.append_with_content(r, &[])
     }
     fn append_with_content(&mut self, r: &[Append], c: &[Content]) -> Result<u64, StoreError> {
-        let data = postcard::to_allocvec(&Batch {
-            version: 1,
-            records: r.to_vec(),
-            contents: c.to_vec(),
-        })
-        .map_err(|e| StoreError::Io(error(e)))?;
-        if data.len() > 32 * 1024 * 1024 {
-            return Err(StoreError::Invalid);
-        }
-        self.client.propose(data).map_err(StoreError::from)
+        Replication::append_with_content(&self.client, r, c)
     }
     fn get(&self, seq: u64) -> Result<Option<Record>, StoreError> {
         self.client
@@ -1414,6 +1445,34 @@ async fn run_runtime(
 mod tests {
     use super::*;
     use crate::storage::Append;
+    #[test]
+    fn borrowed_replication_batch_preserves_the_accepted_entry_wire_format() {
+        let records = vec![Append {
+            subject: "event".into(),
+            headers: Bytes::from_static(b"\0header"),
+            payload: Bytes::from_static(b"record\0"),
+        }];
+        let contents = vec![Content {
+            key: ContentKey {
+                generation: 12,
+                sequence: 37,
+            },
+            subject: "subject".into(),
+            headers: Bytes::new(),
+            payload: Bytes::from_static(b"payload\0"),
+        }];
+        let encoded = Batch::encode(&records, &contents).unwrap();
+        assert_eq!(
+            encoded,
+            postcard::to_allocvec(&Batch {
+                version: 1,
+                records,
+                contents: contents.clone()
+            })
+            .unwrap()
+        );
+        assert_eq!(Batch::decode(&encoded).unwrap().contents, contents);
+    }
     #[test]
     fn queued_quorum_replies_cross_the_time_budget_without_skipping_inputs_or_terms() {
         use raft::eraftpb::MessageType;

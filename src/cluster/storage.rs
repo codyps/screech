@@ -316,6 +316,21 @@ impl Database {
     pub fn log_bytes(&self) -> io::Result<u64> {
         Ok(self.entries_bytes)
     }
+    pub(super) fn checkpoint_pressure(&self, configuration: u64) -> io::Result<bool> {
+        if self.failed {
+            return Err(error("replica quarantined"));
+        }
+        // These verified caches are a conservative scheduling hint, not a
+        // snapshot position or recovery witness. An accepted suffix may request
+        // an early checkpoint; compact() still checks the actual committed SQL
+        // position and retains the full accepted suffix under the storage gate.
+        Ok(self.entries_bytes > self.max_log_bytes / 2
+            || self.journal_bytes() > self.max_log_bytes / 2
+            || self
+                .accepted_tip
+                .is_none_or(|(last, _)| last.saturating_sub(self.snapshot_position.0) >= 8192)
+            || configuration > self.snapshot_position.0)
+    }
     fn refresh_log_bytes(&mut self) -> io::Result<()> {
         self.entries_bytes = self
             .conn

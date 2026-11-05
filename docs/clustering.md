@@ -63,6 +63,13 @@ delivery reservation supplies its fresh quorum observation, while an empty or
 error-only plan obtains a new ReadIndex before releasing replies. Requests can
 join a group only before its consensus operation starts. Standalone scheduling
 is unchanged. Commit notifications and query indexes persist asynchronously.
+Clustered appends and ReadIndex requests dispatch directly to the Raft owner;
+they do not make an extra round trip through the physical-storage executor.
+Content/replay reads, snapshot serialization and checkpoint installation stay on
+that executor. Checkpoint pressure uses verified in-memory counters as a
+conservative hint; installation still checks the real committed SQL position and
+preserves the accepted suffix. Recovery and corruption checks keep reading the
+independent SQL witness directly.
 On Linux, a separate worker queues dirty WAL data for writeback before page
 checkpoints, reducing bursts of I/O that compete with the accepted journals.
 The [writeback hint](https://man7.org/linux/man-pages/man2/sync_file_range.2.html)
