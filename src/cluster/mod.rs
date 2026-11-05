@@ -799,6 +799,14 @@ struct Chunk<'a> {
     data: &'a [u8],
     snapshot: bool,
 }
+fn envelope_frame(envelope: &Envelope<'_>) -> io::Result<Vec<u8>> {
+    let mut frame = Vec::with_capacity(envelope.body.len() + envelope.cluster.len() + 128);
+    frame.extend_from_slice(&[0; 4]);
+    let mut frame = postcard::to_extend(envelope, frame).map_err(error)?;
+    let size = u32::try_from(frame.len() - 4).map_err(error)?;
+    frame[..4].copy_from_slice(&size.to_be_bytes());
+    Ok(frame)
+}
 async fn send_message(
     config: &ClusterConfig,
     stream: &mut TcpStream,
@@ -825,17 +833,13 @@ async fn send_message(
         let mut auth = authenticate(&config.secret, &config.cluster_id, config.node_id, &body);
         auth.update(&incarnation);
         let mac = auth.finalize().into_bytes();
-        let envelope = postcard::to_allocvec(&Envelope {
+        let frame = envelope_frame(&Envelope {
             cluster: &config.cluster_id,
             from: config.node_id,
             body: &body,
             mac: &mac,
             incarnation,
-        })
-        .map_err(error)?;
-        let mut frame = Vec::with_capacity(4 + envelope.len());
-        frame.extend_from_slice(&(envelope.len() as u32).to_be_bytes());
-        frame.extend_from_slice(&envelope);
+        })?;
         stream.write_all(&frame).await?;
     }
     Ok(())
@@ -894,16 +898,23 @@ async fn receive_message<R: AsyncRead + Unpin>(
         if identity != Some(expected) {
             return Err(error("transfer identity changed"));
         }
-        data.extend_from_slice(chunk.data);
+        // Most Raft messages fit one authenticated chunk. Parse that borrowed
+        // payload directly instead of allocating and copying an assembly buffer.
+        let complete = if data.is_empty() && chunk.data.len() as u64 == chunk.total {
+            Some(chunk.data)
+        } else {
+            data.extend_from_slice(chunk.data);
+            (data.len() as u64 == chunk.total).then_some(data.as_slice())
+        };
         if chunk.snapshot {
             crate::fault::point("after_cluster_snapshot_chunk");
         }
-        if data.len() as u64 == chunk.total {
-            let actual: [u8; 32] = Sha256::digest(&data).into();
+        if let Some(encoded) = complete {
+            let actual: [u8; 32] = Sha256::digest(encoded).into();
             if actual != chunk.hash {
                 return Err(error("transfer digest mismatch"));
             }
-            let message = Message::parse_from_bytes(&data).map_err(error)?;
+            let message = Message::parse_from_bytes(encoded).map_err(error)?;
             if message.from != envelope.from || message.to != config.node_id {
                 return Err(error("peer identity mismatch"));
             }
@@ -1611,6 +1622,9 @@ mod tests {
             let decoded: OwnedEnvelope = postcard::from_bytes(&new_frame).unwrap();
             assert_eq!(decoded.body, envelope.body);
             assert_eq!(decoded.mac, envelope.mac);
+            let framed = envelope_frame(&borrowed).unwrap();
+            assert_eq!(&framed[..4], &(old_frame.len() as u32).to_be_bytes());
+            assert_eq!(&framed[4..], old_frame);
         }
     }
     pub(super) fn config(id: u64) -> ClusterConfig {
@@ -2536,6 +2550,86 @@ mod tests {
                 .unwrap();
         }
         receiving.await.unwrap();
+    }
+    #[tokio::test]
+    async fn single_chunk_messages_keep_authentication_identity_and_memory_limits() {
+        for kind in [
+            "valid",
+            "mac",
+            "digest",
+            "source",
+            "destination",
+            "budget",
+            "bounds",
+        ] {
+            let source = config(1);
+            let mut message = Message {
+                from: 1,
+                to: 2,
+                term: 1,
+                msg_type: raft::eraftpb::MessageType::MsgHeartbeat,
+                context: vec![7; 32].into(),
+                ..Default::default()
+            };
+            if kind == "source" {
+                message.from = 3;
+            }
+            if kind == "destination" {
+                message.to = 3;
+            }
+            let body = message.write_to_bytes().unwrap();
+            let hash = if kind == "digest" {
+                [0; 32]
+            } else {
+                Sha256::digest(&body).into()
+            };
+            let chunk = postcard::to_allocvec(&Chunk {
+                nonce: [4; 16],
+                offset: 0,
+                total: if kind == "bounds" {
+                    0
+                } else {
+                    body.len() as u64
+                },
+                hash,
+                data: &body,
+                snapshot: false,
+            })
+            .unwrap();
+            let mut auth = authenticate(&source.secret, &source.cluster_id, 1, &chunk);
+            auth.update(&[8; 16]);
+            let mut mac = auth.finalize().into_bytes().to_vec();
+            if kind == "mac" {
+                mac[0] ^= 1;
+            }
+            let frame = envelope_frame(&Envelope {
+                cluster: &source.cluster_id,
+                from: 1,
+                body: &chunk,
+                mac: &mac,
+                incarnation: [8; 16],
+            })
+            .unwrap();
+            let (mut output, mut input) = tokio::io::duplex(4096);
+            output.write_all(&frame).await.unwrap();
+            drop(output);
+            let budget = if kind == "budget" { 1 } else { 4096 };
+            let bytes = Arc::new(Semaphore::new(budget));
+            let result = receive_message(&config(2), &mut input, bytes.clone(), None).await;
+            if kind == "valid" {
+                let (actual, nonce, permit) = result.unwrap();
+                assert_eq!(actual, message);
+                assert_eq!(nonce, [8; 16]);
+                assert_eq!(bytes.available_permits(), budget - body.len());
+                drop(permit);
+            } else {
+                assert!(result.is_err(), "accepted {kind} message");
+                if kind == "digest" {
+                    assert!(result.unwrap_err().to_string().contains("digest mismatch"));
+                }
+            }
+            assert_eq!(bytes.available_permits(), budget);
+        }
     }
 }
 
