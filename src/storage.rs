@@ -529,15 +529,21 @@ impl SqliteStore {
         if !marker.is_empty() && marker != "screech sqlite v1\n" {
             return Err(StoreError::Invalid);
         }
-        match std::fs::metadata(path) {
+        let fresh = match std::fs::metadata(path) {
             Ok(meta) if meta.len() == 0 => return Err(StoreError::Corrupt(0)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && !marker.is_empty() => {
                 return Err(StoreError::Corrupt(0))
             }
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-            _ => (),
-        }
+            Ok(_) => false,
+            Err(_) => true,
+        };
         let conn = Connection::open(path)?;
+        if fresh {
+            // Small publications otherwise dirty several 4 KiB WAL pages.
+            // Existing stores keep their layout and need no file rewrite.
+            conn.pragma_update(None, "page_size", 1024)?;
+        }
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
@@ -547,7 +553,9 @@ impl SqliteStore {
         // The store already has one exclusive owner. Retain SQLite's locks and WAL
         // allocation between transactions; FULL still synchronizes every commit.
         conn.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
-        conn.pragma_update(None, "wal_autocheckpoint", 4096)?;
+        let page_size: i64 = conn.pragma_query_value(None, "page_size", |row| row.get(0))?;
+        // Keep the checkpoint budget in bytes across new and legacy layouts.
+        conn.pragma_update(None, "wal_autocheckpoint", 16 * 1024 * 1024 / page_size)?;
         conn.pragma_update(None, "journal_size_limit", 32 * 1024 * 1024)?;
         let mode: String = conn.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
         let sync: i64 = conn.pragma_query_value(None, "synchronous", |r| r.get(0))?;
@@ -1055,6 +1063,59 @@ impl Store for SqliteStore {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn small_new_pages_and_existing_layouts_preserve_content_checkpoints_and_full_sync() {
+        for legacy in [None, Some(4096), Some(8192)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("store");
+            if let Some(page_size) = legacy {
+                let conn = Connection::open(&path).unwrap();
+                conn.pragma_update(None, "page_size", page_size).unwrap();
+                conn.execute_batch("CREATE TABLE legacy_marker(value INTEGER);")
+                    .unwrap();
+            }
+            let mut store = SqliteStore::open(&path).unwrap();
+            let page_size: i64 = store
+                .connection
+                .pragma_query_value(None, "page_size", |r| r.get(0))
+                .unwrap();
+            assert_eq!(page_size, legacy.unwrap_or(1024));
+            let checkpoint_pages: i64 = store
+                .connection
+                .pragma_query_value(None, "wal_autocheckpoint", |r| r.get(0))
+                .unwrap();
+            assert_eq!(page_size * checkpoint_pages, 16 * 1024 * 1024);
+            assert_eq!(
+                store
+                    .connection
+                    .pragma_query_value(None, "synchronous", |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                2
+            );
+            let payload = vec![7; 9000];
+            store.append("before", b"headers", &payload).unwrap();
+            drop(store);
+            let mut store = SqliteStore::open(&path).unwrap();
+            assert_eq!(store.get(1).unwrap().unwrap().payload.as_ref(), payload);
+            store.checkpoint(1, b"checkpoint").unwrap();
+            store.append("after", b"", b"retained").unwrap();
+            drop(store);
+            let store = SqliteStore::open(&path).unwrap();
+            assert_eq!(store.last_sequence().unwrap(), 2);
+            assert_eq!(
+                store.load_checkpoint().unwrap().unwrap(),
+                (1, Bytes::from_static(b"checkpoint"))
+            );
+            assert_eq!(store.get(2).unwrap().unwrap().payload, b"retained"[..]);
+            assert_eq!(
+                store
+                    .connection
+                    .pragma_query_value(None, "page_size", |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                page_size
+            );
+        }
+    }
     use super::*;
 
     #[test]
