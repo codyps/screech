@@ -34,6 +34,21 @@ class Cluster:
         for i in list(self.processes):self.kill(i)
     def address(self,i,kind='client'):
         host,port=self.peers[str(i)][kind].rsplit(':',1);return host,int(port)
+    def failure_details(self):
+        details={}
+        for i,p in list(self.processes.items()):
+            node=dict(exit_code=p.poll())
+            try:node['log_tail']=(self.root/str(i)/'server.log').read_text()[-8192:]
+            except OSError as error:node['log_error']=str(error)
+            try:
+                path=self.store_path(i)
+                with closing(sqlite3.connect(f'file:{path}?mode=ro',uri=True,timeout=.1)) as db:
+                    node['metadata']={key:value.hex() for key,value in db.execute(
+                        "SELECT key,value FROM cluster_meta WHERE key IN ('hard','view','conf','conf_index','event_sequence','app_sequence')")}
+                    node['entries']=db.execute('SELECT count(*) FROM entries').fetchone()[0]
+            except (OSError,sqlite3.Error) as error:node['store_error']=str(error)
+            details[i]=node
+        return details
     def wait_leader(self,exclude=()):
         until=time.monotonic()+20
         while time.monotonic()<until:
@@ -45,7 +60,7 @@ class Cluster:
                     c.request('$JS.API.INFO',{});c.close();return i
                 except (OSError,EOFError,AssertionError):pass
             time.sleep(.05)
-        raise TimeoutError('no serving leader')
+        raise TimeoutError(('no serving leader',self.failure_details()))
     def client(self,i):return Client(self.address(i),timeout=8)
     def store_path(self,i):
         node=self.root/str(i);manifest=node/'db.node-state'

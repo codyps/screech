@@ -3,6 +3,8 @@
 import argparse
 import json
 from pathlib import Path
+import shutil
+import sys
 import tempfile
 import time
 
@@ -25,7 +27,7 @@ def audit(cluster, last, retained):
         client.close()
 
 
-def run(binary):
+def run(binary, failure_dir=None):
     last, retained = 8200, 128
     with tempfile.TemporaryDirectory(prefix='screech-auto-checkpoint-') as tmp:
         cluster = Cluster(binary, Path(tmp))
@@ -67,6 +69,16 @@ def run(binary):
             audit(cluster, last, retained)
             return [dict(test='automatic compaction preserves retained payloads, dedup and confirmed ACKs across cold restart and voter repair',
                          publications=last, retained=retained, passed=True)]
+        except BaseException:
+            cluster.close()
+            if failure_dir is not None:
+                saved = failure_dir / f'cluster-{time.time_ns()}'
+                try:
+                    shutil.copytree(cluster.root, saved)
+                    print(f'Failed checkpoint history preserved in {saved}', file=sys.stderr)
+                except OSError as error:
+                    print(f'Could not preserve checkpoint history: {error}', file=sys.stderr)
+            raise
         finally:
             cluster.close()
 
@@ -76,6 +88,6 @@ if __name__ == '__main__':
     parser.add_argument('binary', type=lambda s: str(Path(s).resolve()))
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
-    results = run(args.binary)
+    results = run(args.binary, args.output.with_suffix('.failure'))
     args.output.write_text(json.dumps(results, indent=2) + '\n')
     print(json.dumps(results, indent=2))
