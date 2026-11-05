@@ -162,6 +162,30 @@ struct ReadProbe {
     messages: Vec<Message>,
 }
 const REPLICATION_WINDOW: usize = 8;
+// Only an in-flight fresh quorum read uses this short polling window. Idle
+// actors and publication durability waits sleep normally. Polling consumes the
+// original timeout and never supplies a response or changes quorum accounting.
+fn receive_read_round<T>(
+    receive: &mpsc::Receiver<T>,
+    timeout: Duration,
+) -> Result<T, mpsc::RecvTimeoutError> {
+    let started = Instant::now();
+    let poll = timeout.min(Duration::from_micros(64));
+    loop {
+        match receive.try_recv() {
+            Ok(value) => return Ok(value),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(mpsc::RecvTimeoutError::Disconnected)
+            }
+            Err(mpsc::TryRecvError::Empty) => (),
+        }
+        if started.elapsed() >= poll {
+            break;
+        }
+        std::hint::spin_loop();
+    }
+    receive.recv_timeout(timeout.saturating_sub(started.elapsed()))
+}
 enum Input {
     Message(Message, [u8; 16], tokio::sync::OwnedSemaphorePermit),
     ReadHeartbeat(Message, [u8; 16], tokio::sync::OwnedSemaphorePermit),
@@ -221,8 +245,7 @@ impl Client {
                 reply,
             })
             .map_err(error)?;
-        rx.recv_timeout(RPC_TIMEOUT)
-            .map_err(|_| error("quorum read timeout"))??;
+        receive_read_round(&rx, RPC_TIMEOUT).map_err(|_| error("quorum read timeout"))??;
         // The owner checks its durable epoch and publishes the committed role
         // before releasing ReadIndex replies. Reject a replaced service without
         // another SQL round trip on the application worker.
@@ -1166,7 +1189,11 @@ async fn run_runtime(
                     .min().unwrap_or(Duration::from_millis(20))
                     .min(Duration::from_millis(20));
                 let mut input = deferred_input.take().map(Ok)
-                    .unwrap_or_else(|| rx.recv_timeout(wait));
+                    .unwrap_or_else(|| if read_probes.is_empty() {
+                        rx.recv_timeout(wait)
+                    } else {
+                        receive_read_round(&rx, wait)
+                    });
                 if matches!(&input, Ok(Input::Stop) | Err(mpsc::RecvTimeoutError::Disconnected)) {
                     break;
                 }
