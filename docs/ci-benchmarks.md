@@ -65,13 +65,30 @@ benchmark-site artifact without deploying it. Failed campaigns do not replace th
 last successful page. Benchmark-results retains raw JSON/JSONL and launch metadata;
 benchmark-site contains a self-contained page and raw downloads for that run.
 
-Use Campaign to select standard, larger, three-voter or five-voter workloads.
-Use Metric for throughput, latency percentiles, live-Core durable ACK latency, CPU
-or final RSS. Comparison badges compare Screech with the selected server within the
-same case. Checkboxes show/hide sync modes; Table exposes medians, ranges and counts.
-Search matches case names, payload size and publication count. Campaign, metric,
-baseline, search and view are encoded in the URL for sharing. Series visibility is
-local to the current view. Bar scales are per case; raw numbers remain visible.
+The default view combines all campaigns: each workload tile shows standalone,
+three-voter and five-voter results for both servers. Different publication counts
+and campaigns remain separate bars, each labeled with its sample count; their
+trials are never pooled. Use Benchmark set to restrict the campaigns, or expand
+“Filter server modes and workloads” to hide individual modes or workloads.
+Use Metric for throughput, latency percentiles, live-Core durable ACK latency,
+CPU or final RSS. Table exposes the same results, ranges and per-result ratios.
+
+Each result defaults to its relevant comparison: Screech FULL and unsafe ACK
+compare with NATS always; Screech R3/R5 compare with NATS at the same replica count,
+and clustered NATS compares with the corresponding Screech mode. NATS always
+compares with Screech FULL, while deferred-sync NATS modes (including default 2m
+and 10ms) compare with Screech unsafe ACK. Core results compare the two Core
+servers. Ratios require matching campaign, publication count, replication count,
+and latency boundary. A hidden peer still supplies its baseline; an absent peer
+is explicitly unavailable. The baseline selector can override automatic peers.
+Throughput and latency show a faster/slower multiple; CPU and RSS show less/more
+resource use.
+
+Search matches workload names, payload size and publication count. Benchmark set,
+metric, baseline, search, chart/table view, hidden modes and hidden workloads are
+encoded in the URL for sharing and survive reloads. Bar scales are per workload;
+raw numbers remain visible. All selected campaigns retain their environment
+metadata and individual raw JSON downloads.
 
 Sequential consumer latency samples time ACK confirmation only; Fetch is included
 in overall throughput but excluded from those latency samples. Separate Fetch(1)

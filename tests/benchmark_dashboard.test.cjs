@@ -1,6 +1,6 @@
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
-const {summarize, comparison, scope, median, seriesName, comparisonServer, defaultBaseline} = require('../tools/dashboard/dashboard.js');
+const {summarize, tiles, campaignRows, comparisonPeer, comparison, scope, median, seriesName} = require('../tools/dashboard/dashboard.js');
 const trial = (server, value, extra={}) => ({server, scenario:'consume-one-parallel', payload_bytes:128, subscribers:1, publishes:20000, checked:true, p50_us:value, ...extra});
 test('medians use trial percentiles, not a pooled latency distribution', () => {
   const cases = summarize([trial('screech', 100), trial('screech', 9), trial('screech', 11)], 'p50_us');
@@ -65,16 +65,74 @@ test('unsafe durability stays explicit and p99 scopes use the measured boundary'
 
 
 test('cluster comparisons use matching voter counts and distinct workload groups', () => {
-  assert.equal(defaultBaseline(['screech','nats-default','nats-main']),'nats-main');
-  assert.equal(defaultBaseline(['screech-cluster-5','nats-cluster-5-always']),'nats-cluster-5-always');
   for(const voters of [3,5]) {
     const screech=`screech-cluster-${voters}`, nats=`nats-cluster-${voters}-always`;
-    assert.equal(comparisonServer(nats),screech);
-    assert.match(seriesName(screech),new RegExp(`${voters} voters.*FULL`));
-    assert.match(seriesName(nats),new RegExp(`${voters} replicas.*always`));
+    assert.equal(comparisonPeer(nats),screech);
+    assert.equal(comparisonPeer(screech),nats);
+    assert.match(seriesName(screech),new RegExp(`R${voters}.*FULL`));
+    assert.match(seriesName(nats),new RegExp(`R${voters}.*always`));
   }
-  assert.equal(comparisonServer('nats-main'),'screech');
+  assert.equal(comparisonPeer('nats-main'),'screech');
   const rows=[trial('screech',1),trial('screech-cluster-3',2,{voters:3,stream_replicas:3}),trial('nats-cluster-3-always',3,{voters:3,stream_replicas:3}),trial('screech-cluster-5',4,{voters:5,stream_replicas:5})];
   assert.equal(summarize(rows,'p50_us').length,3);
   assert.equal(summarize(rows,'p50_us')[1].series.size,2);
+});
+
+test('every standalone mode uses its relevant peer in either direction', () => {
+  for (const [id, peer] of Object.entries({screech:'nats-main', 'screech-unsafe-ack':'nats-main',
+    'screech-before':'nats-main', 'nats-main':'screech', 'nats-default':'screech-unsafe-ack',
+    'nats-sync-10ms':'screech-unsafe-ack', 'nats-sync-1s':'screech-unsafe-ack'})) {
+    assert.equal(comparisonPeer(id, 'consume'), peer);
+  }
+  assert.equal(comparisonPeer('nats-default','fanout'),'screech');
+  assert.equal(comparisonPeer('screech','fanout'),'nats-main');
+  assert.equal(comparisonPeer('unknown','consume'),null);
+});
+
+test('all campaigns share workload tiles without pooling counts, voters or runs', () => {
+  const campaigns = [
+    {id:'standard',label:'Standard',rows:[trial('screech',10,{publishes:5000}),trial('screech',30,{publishes:5000}),trial('nats-main',40,{publishes:5000})]},
+    {id:'large',label:'Larger',rows:[trial('screech',100),trial('nats-main',200)]},
+    {id:'r3',label:'Three voters',rows:[trial('screech-cluster-3',50,{voters:3,stream_replicas:3,publishes:3000}),trial('nats-cluster-3-always',60,{voters:3,stream_replicas:3,publishes:3000})]},
+    {id:'r5',label:'Five voters',rows:[trial('screech-cluster-5',70,{voters:5,stream_replicas:5,publishes:3000}),trial('nats-cluster-5-always',80,{voters:5,stream_replicas:5,publishes:3000})]}
+  ];
+  const groups=tiles(campaignRows(campaigns),'p50_us');
+  assert.equal(groups.length,1);
+  assert.equal(groups[0].results.length,8);
+  const standard=groups[0].results.find(s=>s.id==='screech' && s.row._campaign==='standard');
+  assert.equal(standard.median,20);
+  assert.equal(standard.trials,2);
+  assert.equal(standard.row.publishes,5000);
+  assert.equal(standard.peers.get('nats-main').median,40);
+  const clustered=groups[0].results.find(s=>s.id==='screech-cluster-3');
+  assert.equal(clustered.peers.get('nats-cluster-3-always').median,60);
+  assert.equal(clustered.peers.has('nats-main'),false);
+  assert.equal(campaignRows(campaigns,'r5').length,2);
+});
+
+test('matching peers require the same campaign, message count and latency boundary', () => {
+  const rows=campaignRows([
+    {id:'a',rows:[trial('screech',10,{publishes:5000}),trial('nats-main',20,{publishes:3000})]},
+    {id:'b',rows:[trial('nats-main',30,{publishes:5000})]}
+  ]);
+  const result=tiles(rows,'p50_us')[0].results.find(s=>s.id==='screech');
+  assert.equal(result.peers.has('nats-main'),false);
+  const scopes=tiles([trial('screech',10,{latency_scope:'ACK only'}),trial('nats-main',20,{latency_scope:'Fetch and ACK'})],'p50_us')[0];
+  assert.equal(scopes.results[0].peers.has('nats-main'),false);
+});
+
+test('shared tiles retain distinct payloads, recipients and Core topology', () => {
+  assert.equal(tiles([trial('screech',1),trial('screech',2,{payload_bytes:1024}),trial('screech',3,{subscribers:4})],'p50_us').length,3);
+  assert.equal(tiles([trial('screech',1,{core_subjects:1}),trial('screech',2,{core_subjects:8192})],'p50_us').length,2);
+});
+
+test('each row reports faster/slower with correct latency and throughput direction', () => {
+  assert.equal(comparison(200,100,true).text,'2.00× faster');
+  assert.equal(comparison(50,100,true).text,'2.00× slower');
+  assert.equal(comparison(50,100,false).text,'2.00× faster');
+  assert.equal(comparison(200,100,false).text,'2.00× slower');
+  assert.equal(comparison(100,100,true).text,'1.00× · equal');
+  assert.equal(comparison(50,100,false,'server_cpu_seconds').text,'2.00× less CPU');
+  assert.equal(comparison(200,100,false,'server_rss_kib').text,'2.00× more memory');
+  for (const value of [null,undefined,NaN,Infinity,0,-1]) assert.equal(comparison(value,100,true),null);
 });
