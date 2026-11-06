@@ -184,6 +184,11 @@ Queued work, pending stream catalog changes and expired metadata retain the orde
 application path. Storage-owner failure, failed quorum observations and service
 epoch changes fence these replies; standalone and single-voter stores retain their
 existing worker path.
+Grouped appends containing multiple application records go promptly to every
+voter, letting the first durable majority complete without waiting for a preferred
+peer. These writes already amortize their sync across the group. Single-record
+appends retain the bounded backup batching policy; quorum and persistence rules
+are unchanged.
 Raft's persistence-independent leader messages may start follower writes while
 the leader flushes locally. Term/vote changes, follower ACKs and client success
 remain behind their required persistence boundaries.

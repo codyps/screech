@@ -1,4 +1,5 @@
 //! Keep a caught-up quorum prompt while other voters batch their accepted suffix.
+//! Grouped writes already amortize a sync; let every voter race to form a quorum.
 use super::*;
 use std::collections::BTreeSet;
 
@@ -15,9 +16,10 @@ pub(super) fn foreground(
         && conf.learners_next.is_empty()
         && messages.iter().all(|m| {
             m.get_msg_type() != raft::eraftpb::MessageType::MsgSnapshot
-                && m.entries
-                    .iter()
-                    .all(|entry| entry.get_entry_type() == raft::eraftpb::EntryType::EntryNormal)
+                && m.entries.iter().all(|entry| {
+                    entry.get_entry_type() == raft::eraftpb::EntryType::EntryNormal
+                        && !Batch::has_multiple_records(entry.get_data())
+                })
         });
     let mut peers: Vec<_> = conf
         .voters
