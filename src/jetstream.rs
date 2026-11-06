@@ -359,6 +359,7 @@ impl Handle {
                         // Briefly poll to avoid a sleep/wakeup on that round trip;
                         // idle connections and strictly durable stores still sleep.
                         let until = std::time::Instant::now() + Duration::from_micros(128);
+                        let mut clock_poll = 8;
                         loop {
                             match rx.try_recv() {
                                 Ok(request) => return Ok(request),
@@ -367,8 +368,14 @@ impl Handle {
                                 }
                                 Err(std_mpsc::TryRecvError::Empty) => (),
                             }
-                            if std::time::Instant::now() >= until {
-                                break;
+                            // Keep checking ingress on every spin. Clock reads
+                            // need not dominate this short reply-driven poll.
+                            clock_poll -= 1;
+                            if clock_poll == 0 {
+                                if std::time::Instant::now() >= until {
+                                    break;
+                                }
+                                clock_poll = 8;
                             }
                             std::hint::spin_loop();
                         }
