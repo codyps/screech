@@ -10,12 +10,35 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
-from cluster_vm import Cluster, check_power_canary
+from cluster_vm import Cluster, QMP, check_power_canary
 from ethernet import Hub, receive_exact
 import voter_guest
 
 
 class Controls(unittest.TestCase):
+    def test_qmp_reads_live_forwarding_ports_without_assuming_row_order(self):
+        monitor = QMP.__new__(QMP)
+        monitor.command = Mock(return_value="""Hub -1 (management):
+  Protocol[State] FD Source Address Port Dest. Address Port RecvQ SendQ
+  TCP[HOST_FORWARD] 10 127.0.0.1 37625 10.0.2.15 5001 0 0
+  TCP[HOST_FORWARD] 11 127.0.0.1 38031 10.0.2.15 9000 0 0
+""")
+        self.assertEqual({5001: 37625, 9000: 38031}, monitor.forwarded_ports())
+        monitor.command.assert_called_once_with('human-monitor-command', {'command-line': 'info usernet'})
+
+    def test_qmp_rejects_missing_ambiguous_public_or_zero_forwarding_ports(self):
+        control = 'TCP[HOST_FORWARD] 11 127.0.0.1 38031 10.0.2.15 9000 0 0'
+        client = 'TCP[HOST_FORWARD] 10 127.0.0.1 37625 10.0.2.15 5001 0 0'
+        for text in [control, control + '\n' + control + '\n' + client,
+                     (control + '\n' + client).replace('127.0.0.1', '0.0.0.0'),
+                     control + '\n' + client.replace('37625', '0'),
+                     control + '\n' + client.replace('37625', '38031')]:
+            with self.subTest(text=text):
+                monitor = QMP.__new__(QMP)
+                monitor.command = Mock(return_value=text)
+                with self.assertRaises(RuntimeError):
+                    monitor.forwarded_ports()
+
     def test_reboot_control_rejects_reused_kernel_and_wrong_disk_evidence(self):
         arm = {'boot_id': 'old'}
         good = {'boot_id': 'new', 'canary': {'clean': 'durable-canary-v1', 'dirty': 'stable-before-unsynced-overwrite'}}

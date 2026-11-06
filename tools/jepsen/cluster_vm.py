@@ -62,14 +62,37 @@ class QMP:
         assert 'QMP' in json.loads(self.file.readline())
         self.command('qmp_capabilities')
 
-    def command(self, name):
-        self.file.write(json.dumps({'execute': name}).encode() + b'\n')
+    def command(self, name, arguments=None):
+        request = {'execute': name}
+        if arguments is not None:
+            request['arguments'] = arguments
+        self.file.write(json.dumps(request).encode() + b'\n')
         while True:
             result = json.loads(self.file.readline())
             if 'error' in result:
                 raise RuntimeError(result)
             if 'return' in result:
                 return result['return']
+
+    def forwarded_ports(self):
+        # QEMU binds port zero itself; query the live sockets rather than
+        # releasing a temporary reservation before QEMU can claim its port.
+        text = self.command('human-monitor-command', {'command-line': 'info usernet'})
+        ports = {}
+        for line in text.splitlines():
+            fields = line.split()
+            if len(fields) != 8 or fields[0] != 'TCP[HOST_FORWARD]':
+                continue
+            target = int(fields[5])
+            if target not in (9000, 5001):
+                continue
+            port = int(fields[3])
+            if fields[2] != '127.0.0.1' or not 0 < port <= 65535 or target in ports:
+                raise RuntimeError('ambiguous or non-loopback VM forwarding')
+            ports[target] = port
+        if set(ports) != {9000, 5001} or len(set(ports.values())) != 2:
+            raise RuntimeError('VM control and client forwarding sockets are not ready')
+        return ports
 
     def close(self):
         self.file.close()
@@ -92,7 +115,8 @@ class VM:
         self.lock = threading.RLock()
         self.backend_client_port = None
         self.client_proxy = TCPProxy(lambda: ('127.0.0.1', self.backend_client_port)
-                                     if self.process is not None and self.process.poll() is None else None)
+                                     if self.backend_client_port is not None and self.process is not None
+                                     and self.process.poll() is None else None)
         self.client_port = self.client_proxy.port
         self.control_port = None
         self.new_disk()
@@ -120,10 +144,7 @@ class VM:
             qmp_path = self.directory / 'qmp.sock'
             qmp_path.unlink(missing_ok=True)
             index = int(self.node[1:])
-            reservations = [socket.socket() for _ in range(2)]
-            for reservation in reservations:
-                reservation.bind(('127.0.0.1', 0))
-            self.control_port, self.backend_client_port = [r.getsockname()[1] for r in reservations]
+            self.control_port = self.backend_client_port = None
             command = [self.owner.runtime['tools'] + '/bin/qemu-system-x86_64',
                        '-accel', 'tcg,thread=multi', '-m', str(self.owner.memory), '-smp', '2',
                        '-display', 'none', '-serial', 'stdio', '-monitor', 'none', '-no-reboot',
@@ -131,7 +152,7 @@ class VM:
                        '-kernel', self.owner.runtime['kernel'], '-initrd', str(self.owner.output / 'common/initramfs.gz'),
                        '-append', f'console=ttyS0 rdinit=/init panic=-1 quiet screech.node={self.node} screech.maintenance={int(maintenance)} screech.fresh={int(self.fresh_disk)}',
                        '-drive', self.drive(),
-                       '-netdev', f'user,id=management,hostfwd=tcp:127.0.0.1:{self.control_port}-:9000,hostfwd=tcp:127.0.0.1:{self.backend_client_port}-:5001',
+                       '-netdev', 'user,id=management,hostfwd=tcp:127.0.0.1:0-:9000,hostfwd=tcp:127.0.0.1:0-:5001',
                        '-device', f'e1000,netdev=management,mac=02:00:00:00:02:{index:02x}',
                        '-netdev', f'socket,id=cluster,connect=127.0.0.1:{self.owner.hub.port}',
                        '-device', f'e1000,netdev=cluster,mac=02:00:00:00:01:{index:02x}',
@@ -140,13 +161,16 @@ class VM:
                        '-virtfs', f'local,path={self.owner.output},mount_tag=artifacts,security_model=none,readonly=on',
                        '-virtfs', f'local,path={self.directory}/bootshare,mount_tag=bootshare,security_model=none,readonly=on']
             with (self.directory / f'boot-{boot:03}.log').open('wb') as log:
-                for reservation in reservations:
-                    reservation.close()
                 self.process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
             self.boots.append({'maintenance': maintenance, 'pid': self.process.pid, 'command': command})
             deadline = time.monotonic() + 90
             while True:
                 try:
+                    if self.qmp is None:
+                        self.qmp = QMP(qmp_path)
+                    if self.control_port is None:
+                        ports = self.qmp.forwarded_ports()
+                        self.control_port, self.backend_client_port = ports[9000], ports[5001]
                     status = self.call('status')
                     assert status['node'] == self.node and status['maintenance'] == maintenance
                     break
@@ -154,7 +178,6 @@ class VM:
                     if self.process.poll() is not None or time.monotonic() > deadline:
                         raise RuntimeError(f'{self.node} failed to boot; inspect {self.directory}/boot-{boot:03}.log')
                     time.sleep(.1)
-            self.qmp = QMP(qmp_path)
             self.boots[-1]['boot_id'] = status['boot_id']
             self.fresh_disk = False
             if self.pending is not None:
