@@ -44,6 +44,7 @@ jobs:
       - name: Dashboard and benchmark-data tests
         run: |
           python3 -m unittest discover -s tests -p 'test_*.py' -v
+          PYTHONPATH=tools/jepsen:scripts python3 -m unittest discover -s tools/jepsen/tests -p 'test_*.py' -v
           node --test tests/benchmark_dashboard.test.cjs
       - run: cargo test --locked --all-features
       - name: Extended projection and group histories
