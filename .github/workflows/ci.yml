@@ -187,8 +187,7 @@ jobs:
             results/nats-commit.txt
       - name: Profile Core forwarding and confirmed consumer ACKs
         run: |
-          sudo apt-get update
-          sudo apt-get install -y linux-tools-generic strace
+          sudo bash scripts/install_profile_tools.sh
           sudo sysctl kernel.perf_event_paranoid=1
           perf_binary=$(find -L /usr/lib/linux-tools -type f -name perf | sort | tail -1)
           test -n "$perf_binary"

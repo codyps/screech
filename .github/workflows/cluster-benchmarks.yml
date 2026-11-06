@@ -107,8 +107,7 @@ jobs:
           IFS=, read -ra scenarios <<< "$PROFILE_SCENARIOS"
           scenario_args=()
           for scenario in "${scenarios[@]}"; do scenario_args+=(--scenario "$scenario"); done
-          sudo apt-get update
-          sudo apt-get install -y linux-tools-generic strace
+          sudo bash scripts/install_profile_tools.sh
           sudo sysctl kernel.perf_event_paranoid=1
           perf_binary=$(find -L /usr/lib/linux-tools -type f -name perf | sort | tail -1)
           test -x "$perf_binary"
