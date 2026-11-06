@@ -7,7 +7,9 @@ const MAGIC: &[u8; 8] = b"SCSEAL05";
 const LEGACY_MAGIC: &[u8; 8] = b"SCSEAL04";
 const ROOT_KEY: &str = "journal_root";
 const MAX_RECORD: u64 = 34 * 1024 * 1024;
-const ALLOCATION_BYTES: u64 = 1024 * 1024;
+// Reserve enough for several publication bursts before another extent change.
+// Allocation is physical headroom only; each acceptance retains its sync fence.
+const ALLOCATION_BYTES: u64 = 8 * 1024 * 1024;
 
 fn reserve(file: &mut File, end: u64) -> io::Result<u64> {
     let capacity = end
@@ -90,6 +92,36 @@ mod allocation_tests {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
         std::fs::copy(path.with_extension("sql-before"), path).unwrap();
+    }
+
+    #[test]
+    fn publication_burst_uses_reserved_space_and_replays_without_sql_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let mut db = Database::open(&path, &config(), true).unwrap();
+        backup(&db, &path);
+        let reserved = db.watermark.journal.as_ref().unwrap().capacity;
+        for index in 1..=12 {
+            db.persist(&[record(index, 256 * 1024)], Some(&hard(index)))
+                .unwrap();
+            assert_eq!(
+                db.watermark.journal.as_ref().unwrap().capacity,
+                reserved,
+                "a three-megabyte publication burst extended the journal on its sync path"
+            );
+        }
+        let expected = db.position().unwrap();
+        drop(db);
+        restore_sql(&path);
+        let db = Database::open(&path, &config(), false).unwrap();
+        assert_eq!(db.position().unwrap(), expected);
+        for index in 1..=12 {
+            assert_eq!(db.entry(index).unwrap(), record(index, 256 * 1024));
+            assert_eq!(
+                db.record(index).unwrap().unwrap().payload.as_ref(),
+                vec![index as u8; 256 * 1024]
+            );
+        }
     }
 
     #[test]

@@ -72,6 +72,7 @@ Each row below is a whole R3/R5 campaign using the same 3,000-publication worklo
 | [42166305893](https://github.com/codyps/screech/actions/runs/42166305893) | EPYC 9V74 | 11/28 | 1.162× | 2.805× | Integrated main; all CI jobs and standalone targets passed |
 | [42172626951](https://github.com/codyps/screech/actions/runs/42172626951) | R3: EPYC 7763; R5: EPYC 9V45 | 25/28 | 1.193× | 2.254× | Isolated timing jobs; raw provenance independently verified; CI postprocessing failed |
 | [42176137594](https://github.com/codyps/screech/actions/runs/42176137594) | EPYC 9V74 | 11/28 | 0.381× | 71.084× | Publication collection candidate; all CI jobs, standalone targets and local fault histories passed |
+| [42179667716](https://github.com/codyps/screech/actions/runs/42179667716) | R3: EPYC 7763; R5: EPYC 9V45 | 27/28 | 1.363× | 1.662× | Transport queue/failure feedback; all CI, standalone targets and 20 local fault histories passed |
 
 The individual experiments retain their branches and raw campaign artifacts. Shorter or diagnostic runs are not combined with these five-trial results to fill missing targets.
 
@@ -167,3 +168,29 @@ also report transfer failure. Partial-frame ordering, bounded admission, synced
 acceptance, distinct-voter quorum requirements, application projection fences and
 standalone behavior retain their existing contracts. Fresh complete measurements
 must determine the effect on the observed stalls and the overall target.
+
+
+Complete five-trial campaign 42179667716 at `d2b4be2` passed every clustered
+throughput target and both targets in 27 of 28 cases. R3 passed all 14 cases. Only
+R5 concurrent-publish p99 missed, at 1.662× NATS; its throughput was 1.376×. All 19
+standalone targets, all CI jobs and all 20 local VM/LazyFS histories passed, and
+the page was published. The runners differed from the prior campaign, so the
+complete results do not isolate a causal effect size for the transport fix.
+
+The allocation trace in diagnostic run [42182193134](https://github.com/codyps/screech/actions/runs/42182193134)
+records explicit journal growth alongside the ordinary sync calls. Several first
+syncs after growth took 6–16 ms. Many other long syncs did not coincide with growth;
+allocation is a contribution to investigate, rather than an explanation of every
+stall. Diagnostic phases share a cluster and retain earlier phase history; they
+are not performance qualification data.
+
+The next candidate reserves new journal space in 8 MiB chunks instead of 1 MiB,
+reducing repeated extent allocation and materialization during publication bursts.
+This adds physical disk headroom at journal creation and rollover; it changes
+neither logical log limits nor the on-disk format. Existing smaller journals remain
+valid. Every acceptance still performs the same mandatory sync, and standalone
+storage retains its existing path. The new regression forces the old reservation
+to grow during a 3 MiB burst, then requires the candidate to replay every byte after
+losing SQL projection state. Existing cursor/prefix-preservation tests still force
+real growth beyond the configured reservation. Fresh complete timing and fault
+campaigns must validate the tradeoff before claiming the target.
