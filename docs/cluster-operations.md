@@ -142,7 +142,8 @@ New cluster projections use 1 KiB SQLite pages to reduce WAL write amplification
 existing databases keep their page size. Passive SQLite page checkpoints run on a
 separate connection after 1,024 committed projection row changes and at least 2,048
 pages of WAL capacity (2 MiB for new databases, 8 MiB for legacy 4 KiB pages). Retained capacity alone
-does not trigger another checkpoint. The primary connection retains an automatic
+does not trigger another checkpoint. A pass blocked partway by a reader stays
+pending until all frames are backfilled, including when no new writes arrive. The primary connection retains an automatic
 checkpoint fallback at 32,768 frames, with a retained WAL size limit of 32,768
 database pages (about 32 MiB for new databases, 128 MiB for legacy 4 KiB pages).
 Checkpoint I/O errors fence the voter. These physical page checkpoints
