@@ -42,8 +42,16 @@ The [five-trial qualification report](cluster-benchmark-results.md) records the 
 The focused workflow also captures CPU stacks and disk/syscall summaries across
 all five voters, including per-file sync latency distributions. Its separate
 9,000-publication diagnostic workloads cross automatic checkpoint boundaries.
-Publication-phase gates exclude setup and payload
-validation; these diagnostic timings never count toward the performance target.
+Phase gates exclude setup, consumer prefill and payload validation; diagnostic
+timings never count toward the performance target. Set `profile_only=true` to
+collect profiles without rerunning or certifying timing campaigns. The optional
+`profile_scenarios` comma-separated list selects workloads (for example,
+`durable-parallel,consume-one-parallel`); `profile_voters` selects three or five
+voters. Concurrent profiles retain all 16 clients and the same Fetch/confirmed-ACK
+cycles, starting after prefill and stopping before final correctness validation.
+Without `--profile-gate`, the driver retains its existing timing boundaries and
+workload. The ordinary workflow defaults remain sequential durable and dedup
+profiles after the full timing campaigns.
 
 ## Storage modes
 

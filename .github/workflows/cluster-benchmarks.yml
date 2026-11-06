@@ -17,6 +17,19 @@ on:
         description: NATS branch, tag or commit (resolved SHA is recorded)
         type: string
         default: main
+      profile_only:
+        description: Profile checked workloads without rerunning timing campaigns
+        type: boolean
+        default: false
+      profile_scenarios:
+        description: Comma-separated profiling workloads
+        type: string
+        default: durable,dedup
+      profile_voters:
+        description: Replication count for diagnostic profiles
+        type: choice
+        options: ['3', '5']
+        default: '5'
 permissions:
   contents: read
 concurrency:
@@ -61,6 +74,7 @@ jobs:
           go -C tools/bench test .
           git -C upstream rev-parse HEAD > results/nats-commit.txt
       - name: Matched three- and five-voter campaigns
+        if: ${{ !inputs.profile_only }}
         run: |
           for voters in 3 5; do
             python3 scripts/benchmark.py --screech target/release/screech-server \
@@ -70,13 +84,14 @@ jobs:
               --output "results/cluster-$voters.json"
           done
       - name: Verify throughput and p99 targets for every clustered case
+        if: ${{ !inputs.profile_only }}
         run: |
           python3 scripts/check_cluster_targets.py --three results/cluster-3.json \
             --five results/cluster-5.json --minimum-trials "$TRIALS" \
             --output results/cluster-targets.json
       - name: Upload checked timings before profiling
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: ${{ always() && steps.build.outcome == 'success' }}
+        if: ${{ always() && steps.build.outcome == 'success' && !inputs.profile_only }}
         with:
           name: cluster-benchmark-timings
           path: |
@@ -85,7 +100,13 @@ jobs:
             results/nats-commit.txt
       - name: Profile publication CPU and disk calls separately from timing
         if: ${{ always() && steps.build.outcome == 'success' }}
+        env:
+          PROFILE_SCENARIOS: ${{ inputs.profile_scenarios || 'durable,dedup' }}
+          PROFILE_VOTERS: ${{ inputs.profile_voters || '5' }}
         run: |
+          IFS=, read -ra scenarios <<< "$PROFILE_SCENARIOS"
+          scenario_args=()
+          for scenario in "${scenarios[@]}"; do scenario_args+=(--scenario "$scenario"); done
           sudo apt-get update
           sudo apt-get install -y linux-tools-generic strace
           sudo sysctl kernel.perf_event_paranoid=1
@@ -93,7 +114,7 @@ jobs:
           test -x "$perf_binary"
           sudo python3 scripts/profile_cluster.py --screech target/release/screech-server \
             --nats bin/nats-server --driver bin/bench-driver --perf "$perf_binary" \
-            --strace "$(command -v strace)" --voters 5 --messages 9000 --output results/cluster-profiles
+            --strace "$(command -v strace)" --voters "$PROFILE_VOTERS" --messages 9000 --output results/cluster-profiles "${scenario_args[@]}"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:

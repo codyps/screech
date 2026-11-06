@@ -14,7 +14,7 @@ func concurrentScenario(s string) bool {
 
 // Each connection uses ordinary synchronous publish, Fetch(1), and AckSync calls.
 // No Screech-specific batching or protocol extension is used.
-func runConcurrent(url, scenario, subject string, count, size, replicas int, options []nats.Option) (time.Duration, int64, []float64, error) {
+func runConcurrent(url, scenario, subject string, count, size, replicas int, options []nats.Option, profileGate string) (time.Duration, int64, []float64, error) {
 	control, err := nats.Connect(url, options...)
 	if err != nil {
 		return 0, 0, nil, err
@@ -100,6 +100,13 @@ func runConcurrent(url, scenario, subject string, count, size, replicas int, opt
 			if e != nil {
 				return 0, 0, nil, e
 			}
+		}
+	}
+	// Setup, consumer prefill and connections finish before profilers attach.
+	// Ordinary benchmark invocations do not use these diagnostic barriers.
+	if profileGate != "" {
+		if err := profileBarrier(profileGate, ".ready", ".release"); err != nil {
+			return 0, 0, nil, err
 		}
 	}
 	gate := make(chan struct{})
@@ -195,6 +202,11 @@ func runConcurrent(url, scenario, subject string, count, size, replicas int, opt
 	elapsed := time.Since(start)
 	if failure != nil {
 		return 0, 0, nil, failure
+	}
+	if profileGate != "" {
+		if err := profileBarrier(profileGate, ".complete", ".finish"); err != nil {
+			return 0, 0, nil, err
+		}
 	}
 	sequences := make([]map[uint64]bool, streams)
 	for i := range sequences {
