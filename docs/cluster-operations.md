@@ -178,7 +178,10 @@ retry the pending context against every voter if a selected peer is unavailable.
 Joint configurations and learners retain full probe fanout. Raft still requires
 the current configuration's quorum acknowledgements for each fresh read context.
 Duplicate publications with no preceding admitted request can obtain that fresh
-observation asynchronously from the replication owner. They read an immutable
+observation asynchronously from the replication owner. The connection’s existing
+completion task drives that proof directly. If the caller disconnects, the admitted
+proof finishes independently and keeps its admission lease until completion;
+cancellation cannot accumulate unbounded outstanding reads. They read an immutable
 model published only after a successful application commit and before its replies.
 Queued work, pending stream catalog changes and expired metadata retain the ordered
 application path. Storage-owner failure, failed quorum observations and service

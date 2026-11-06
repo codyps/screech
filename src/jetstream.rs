@@ -10,7 +10,10 @@ use serde_json::{json, Value};
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
+    future::Future,
+    pin::Pin,
     sync::{mpsc as std_mpsc, Arc, Mutex, RwLock},
+    task::{Context, Poll},
     time::Duration,
 };
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
@@ -193,7 +196,7 @@ impl Drop for CatalogFence {
     }
 }
 pub struct PendingRequest {
-    response: oneshot::Receiver<Result<bool, String>>,
+    response: Completion,
     permit: Arc<OwnedSemaphorePermit>,
 }
 impl PendingRequest {
@@ -202,9 +205,41 @@ impl PendingRequest {
     }
     pub async fn wait(self) -> Result<bool, String> {
         let Self { response, permit } = self;
-        let result = response.await.map_err(|_| "Storage worker stopped")?;
+        let result = match response {
+            Completion::Worker(receiver) => receiver.await.map_err(|_| "Storage worker stopped")?,
+            Completion::Direct(completion) => completion.await,
+        };
         drop(permit);
         result
+    }
+}
+enum Completion {
+    Worker(oneshot::Receiver<Result<bool, String>>),
+    Direct(DetachedCompletion),
+}
+type CompletionFuture = Pin<Box<dyn Future<Output = Result<bool, String>> + Send>>;
+// Drive direct reads in the caller's existing completion task. If it is
+// cancelled, finish the admitted proof on the runtime, retaining its lease
+// until the proof resolves. Cancellation must not create unbounded Raft reads.
+struct DetachedCompletion {
+    future: Option<CompletionFuture>,
+    runtime: tokio::runtime::Handle,
+}
+impl Future for DetachedCompletion {
+    type Output = Result<bool, String>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let result = self.future.as_mut().unwrap().as_mut().poll(cx);
+        if result.is_ready() {
+            self.future = None;
+        }
+        result
+    }
+}
+impl Drop for DetachedCompletion {
+    fn drop(&mut self) {
+        if let Some(future) = self.future.take() {
+            self.runtime.spawn(future);
+        }
     }
 }
 #[derive(Clone)]
@@ -516,9 +551,8 @@ impl Handle {
                     let reads = reads.clone();
                     let permit = Arc::new(permit);
                     let work_permit = permit.clone();
-                    let (response, receiver) = oneshot::channel();
                     let stop = self.stop.clone();
-                    runtime.spawn(async move {
+                    let future: CompletionFuture = Box::pin(async move {
                         crate::fault::group_gate_async().await;
                         let proof = proof.await.map_err(|e| {
                             reads.fail();
@@ -534,12 +568,15 @@ impl Handle {
                             crate::fault::point("before_async_duplicate_reply");
                             sink(outbound).map(|()| true)
                         });
-                        let _ = response.send(result);
                         drop(work_permit);
+                        result
                     });
                     crate::fault::group_ingress();
                     return Ok(PendingRequest {
-                        response: receiver,
+                        response: Completion::Direct(DetachedCompletion {
+                            future: Some(future),
+                            runtime,
+                        }),
                         permit,
                     });
                 }
@@ -571,7 +608,7 @@ impl Handle {
             .map_err(|_| "Storage worker stopped")?;
         crate::fault::group_ingress();
         Ok(PendingRequest {
-            response: receiver,
+            response: Completion::Worker(receiver),
             permit,
         })
     }
