@@ -250,6 +250,28 @@ mod admission_tests {
     }
 
     #[test]
+    fn disconnected_admission_returns_the_complete_partial_burst() {
+        let (tx, rx) = std_mpsc::channel();
+        tx.send(2).unwrap();
+        tx.send(3).unwrap();
+        drop(tx);
+        let mut requests = vec![1];
+        let mut deferred = None;
+        let started = std::time::Instant::now();
+        collect_group(
+            &mut requests,
+            &rx,
+            &mut deferred,
+            16,
+            Duration::from_secs(5),
+            |r| Some(*r),
+        );
+        assert_eq!(requests, [1, 2, 3]);
+        assert!(deferred.is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
     fn sequential_admission_does_not_wait_for_another_request() {
         let (_tx, rx) = std_mpsc::channel();
         let mut requests = vec![1];
@@ -498,6 +520,17 @@ impl Handle {
                         crate::fault::group_gate();
                         let mut requests = std::mem::take(&mut request_scratch);
                         requests.reserve(32);
+                        let group_wait = if worker.engine.replicas() == 1 {
+                            Duration::ZERO
+                        } else if req.message.subject.starts_with("$JS.ACK.")
+                            || req.message.subject.starts_with("$JS.API.")
+                        {
+                            Duration::from_micros(64)
+                        } else {
+                            // Publication bursts can span several network turns.
+                            // Sequential traffic has target 1 and never waits.
+                            Duration::from_micros(256)
+                        };
                         requests.push(req);
                         collect_group(
                             &mut requests,
@@ -508,11 +541,7 @@ impl Handle {
                             } else {
                                 previous_group
                             },
-                            if worker.engine.replicas() > 1 {
-                                Duration::from_micros(64)
-                            } else {
-                                Duration::ZERO
-                            },
+                            group_wait,
                             |req| {
                                 worker.groupable(&req.message).then_some(
                                     req.message.payload.len() + req.message.headers.len(),

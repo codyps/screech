@@ -118,3 +118,27 @@ because the provenance CLI's positional arguments following options were rejecte
 by the runner's Python version. Explicit intermixed argument parsing fixes that
 failure, with a CLI regression checked against Python 3.12.3. The timing results
 remain retained and are not a successful CI or performance qualification.
+
+
+The isolated campaign's standalone unsafe-ACK comparison independently passed 18
+of 19 targets. Sequential publication throughput was 1.094× against the existing
+1.100× requirement; its p99 was 0.809×. This gate is still required for publication.
+
+Focused diagnostic run [42173951057](https://github.com/codyps/screech/actions/runs/42173951057)
+profiled both concurrent workloads at R5 with 9,000 checked publications. The
+publisher profile recorded about 1,117 accepted-journal syncs per voter, or eight
+publications per sync despite 16 clients. A 256 microsecond collection experiment
+improved publisher throughput in both orders of a local five-trial comparison,
+but extending consumer collection also regressed Fetch/ACK p99 in the reversed
+comparison. That broader policy was rejected. The candidate extends only active
+clustered publication collection from 64 to 256 microseconds. Consumer collection
+keeps 64 microseconds; sequential traffic never waits for a second request, and
+standalone collection keeps its zero wait. Count/byte bounds and all durability
+fences are unchanged.
+
+The local comparisons used five checked trials of 3,000 publications for each of
+the two R5 workloads, on one Ryzen 9955HX host. Publisher throughput improved by
+13% in the first order and 5% in the reverse order. NATS results and natural leader
+placement also varied, so these diagnostics do not establish a controlled effect
+size or qualify the complete clustered target. Fresh complete CI measurements are
+required for the final publication-only policy.
