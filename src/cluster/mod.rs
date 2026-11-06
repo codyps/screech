@@ -703,6 +703,9 @@ fn reply_to_read_heartbeat(active: &startup::Active, message: &Message, nonce: [
             to: message.from,
             term: message.term,
             msg_type: raft::eraftpb::MessageType::MsgHeartbeatResponse,
+            // Validation above proves this frontier is already recorded. Keep
+            // Raft's commit-progress hint even when the actor is bypassed.
+            commit: message.commit,
             context: message.context.clone(),
             ..Default::default()
         })

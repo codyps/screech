@@ -104,18 +104,17 @@ fn early_read_contacts_still_require_distinct_fresh_quorum_responses() {
         for heartbeat in heartbeats {
             let follower = &mut sim.nodes[(heartbeat.to - 1) as usize];
             let role = cache_contact_policy(follower);
-            assert!(
-                follower
-                    .store()
-                    .db
-                    .lock()
-                    .unwrap()
-                    .can_reply_to_read_heartbeat(role, &heartbeat, [0; 16])
-            );
+            assert!(follower
+                .store()
+                .db
+                .lock()
+                .unwrap()
+                .can_reply_to_read_heartbeat(role, &heartbeat, [0; 16]));
             let response = Message {
                 from: heartbeat.to,
                 to: 1,
                 term: heartbeat.term,
+                commit: heartbeat.commit,
                 msg_type: MessageType::MsgHeartbeatResponse,
                 context: heartbeat.context.clone(),
                 ..Default::default()
@@ -207,76 +206,90 @@ fn actor_keeps_responses_when_contact_has_become_a_term_or_commit_transition() {
     let mut message = contact_message(&sim.nodes[2]);
     message.commit += 1;
     step_peer_message(&mut sim.nodes[2], message, true).unwrap();
-    assert!(
-        sim.nodes[2]
-            .raft
-            .msgs
-            .iter()
-            .any(|m| m.get_msg_type() == MessageType::MsgHeartbeatResponse)
-    );
+    assert!(sim.nodes[2]
+        .raft
+        .msgs
+        .iter()
+        .any(|m| m.get_msg_type() == MessageType::MsgHeartbeatResponse));
 }
 
 #[tokio::test]
 async fn read_contact_network_path_is_nonblocking_and_preserves_authenticated_context() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut sim = Simulation::new(dir.path());
-    sim.nodes[0].campaign().unwrap();
-    sim.settle(None);
-    let role = cache_contact_policy(&sim.nodes[1]);
-    let message = contact_message(&sim.nodes[1]);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let (tx, _rx) = mpsc::sync_channel(8);
-    let (stop, stop_rx) = watch::channel(false);
-    let (role_tx, role_rx) = watch::channel(role);
-    let sender = transport::PeerSender::start(
-        config(2),
-        listener.local_addr().unwrap(),
-        tx.clone(),
-        stop_rx,
-        [0; 16],
-    );
-    let db = sim.nodes[1].store().db.clone();
-    let active = startup::Active {
-        config: config(2),
-        tx,
-        role: role_rx,
-        db: db.clone(),
-        incarnation: [0; 16],
-        session: Arc::new(AtomicU64::new(1)),
-        peer_senders: Arc::new([(1, sender)].into_iter().collect()),
-    };
-    {
-        let _busy = db.lock().unwrap();
-        assert!(
-            !reply_to_read_heartbeat(&active, &message, [0; 16]),
-            "socket path blocked on the owner"
+    for voters in [3, 5] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sim = Simulation::with_voters(dir.path(), voters);
+        sim.nodes[0].campaign().unwrap();
+        sim.settle(None);
+        let role = cache_contact_policy(&sim.nodes[1]);
+        let message = contact_message(&sim.nodes[1]);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (tx, _rx) = mpsc::sync_channel(8);
+        let (stop, stop_rx) = watch::channel(false);
+        let (role_tx, role_rx) = watch::channel(role);
+        let sender = transport::PeerSender::start(
+            config(2),
+            listener.local_addr().unwrap(),
+            tx.clone(),
+            stop_rx,
+            [0; 16],
         );
+        let db = sim.nodes[1].store().db.clone();
+        let active = startup::Active {
+            config: config(2),
+            tx,
+            role: role_rx,
+            db: db.clone(),
+            incarnation: [0; 16],
+            session: Arc::new(AtomicU64::new(1)),
+            peer_senders: Arc::new([(1, sender)].into_iter().collect()),
+        };
+        {
+            let _busy = db.lock().unwrap();
+            assert!(
+                !reply_to_read_heartbeat(&active, &message, [0; 16]),
+                "socket path blocked on the owner"
+            );
+        }
+        let gate = db.lock().unwrap().gate.clone();
+        {
+            let _projection = gate.lock().unwrap();
+            assert!(reply_to_read_heartbeat(&active, &message, [0; 16]));
+        }
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let bytes = Arc::new(Semaphore::new(64 * 1024 * 1024));
+        let first = stream.read_u32().await.unwrap();
+        let (response, nonce, _permit) =
+            receive_message(&config(1), &mut stream, bytes, Some(first))
+                .await
+                .unwrap();
+        assert_eq!(nonce, [0; 16]);
+        assert!(message.commit > 0);
+        assert_eq!(response.commit, message.commit);
+        sim.nodes[0]
+            .raft
+            .mut_prs()
+            .get_mut(2)
+            .unwrap()
+            .committed_index = 0;
+        sim.nodes[0].step(response.clone()).unwrap();
+        assert_eq!(
+            sim.nodes[0].raft.prs().get(2).unwrap().committed_index,
+            message.commit
+        );
+        assert_eq!(response.context, message.context);
+        assert_eq!(
+            (response.from, response.to, response.term),
+            (2, 1, role.term)
+        );
+        assert_eq!(
+            response.get_msg_type(),
+            raft::eraftpb::MessageType::MsgHeartbeatResponse
+        );
+        drop(role_tx);
+        assert!(!reply_to_read_heartbeat(&active, &message, [0; 16]));
+        stop.send(true).unwrap();
     }
-    let gate = db.lock().unwrap().gate.clone();
-    {
-        let _projection = gate.lock().unwrap();
-        assert!(reply_to_read_heartbeat(&active, &message, [0; 16]));
-    }
-    let (mut stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
-        .await
-        .unwrap()
-        .unwrap();
-    let bytes = Arc::new(Semaphore::new(64 * 1024 * 1024));
-    let first = stream.read_u32().await.unwrap();
-    let (response, nonce, _permit) = receive_message(&config(1), &mut stream, bytes, Some(first))
-        .await
-        .unwrap();
-    assert_eq!(nonce, [0; 16]);
-    assert_eq!(response.context, message.context);
-    assert_eq!(
-        (response.from, response.to, response.term),
-        (2, 1, role.term)
-    );
-    assert_eq!(
-        response.get_msg_type(),
-        raft::eraftpb::MessageType::MsgHeartbeatResponse
-    );
-    drop(role_tx);
-    assert!(!reply_to_read_heartbeat(&active, &message, [0; 16]));
-    stop.send(true).unwrap();
 }

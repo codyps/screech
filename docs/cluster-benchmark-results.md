@@ -194,3 +194,25 @@ to grow during a 3 MiB burst, then requires the candidate to replay every byte a
 losing SQL projection state. Existing cursor/prefix-preservation tests still force
 real growth beyond the configured reservation. Fresh complete timing and fault
 campaigns must validate the tradeoff before claiming the target.
+
+
+The journal-reservation campaign [42184075460](https://github.com/codyps/screech/actions/runs/42184075460),
+source `3c03a72`, passed both targets in 27 of 28 clustered cases using five
+checked trials. Every p99 target passed. Only R5 deduplication throughput missed,
+at 1.176× NATS against 1.200×; its p99 was 0.722×. R3 passed all 14 cases, and
+R5 concurrent publication passed at 1.210× throughput and 0.740× p99. R5 ran on
+a Xeon Platinum 8370C, a different host from the preceding campaign, so these
+results do not isolate the reservation change's effect. This incomplete result
+is retained independently and does not qualify the target.
+
+A subsequent read-contact regression test found that the socket fast path
+returned commit index zero even though its existing validation required the
+request's commit to be recorded locally. Ordinary Raft heartbeat replies include
+the follower commit frontier; omitting that hint prevents the leader from
+learning the fast responder's commit progress. The corrected fast response
+advertises the validated request commit as a conservative lower bound. The
+actual TCP test fails against the previous reply and passes for both R3 and R5
+after the correction, including updating Raft's leader progress. Newer commits
+still require the actor, and every read still needs distinct, fresh, context-bound
+quorum responses. The change adds no storage operation or cached quorum proof.
+Fresh complete timings are required to establish its performance effect.
