@@ -97,7 +97,7 @@ class VM:
         sock=socket.socket();sock.bind(('127.0.0.1',0));port=sock.getsockname()[1];sock.close()
         self.address=('127.0.0.1',port)
         self.log=open(work/f'guest-{cycle}.log','wb')
-        cmd=[args.qemu,'-accel','tcg','-m','512','-smp','2','-display','none','-serial','stdio','-monitor','none','-no-reboot',
+        cmd=[args.qemu,'-accel','tcg','-m','1024','-smp','2','-display','none','-serial','stdio','-monitor','none','-no-reboot',
              '-kernel',args.kernel,'-initrd',str(work/'initramfs.gz'),'-append','console=ttyS0 rdinit=/init panic=-1 quiet',
              '-drive',f'file={work}/disk.raw,format=raw,if=virtio,cache=none',
              '-netdev',f'user,id=net0,hostfwd=tcp:127.0.0.1:{port}-:4222','-device','e1000,netdev=net0']
