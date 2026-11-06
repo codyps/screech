@@ -16,7 +16,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
           shared-key: debug
-      - run: sudo apt-get update && sudo apt-get install -y linux-image-generic busybox-static qemu-system-x86 e2fsprogs kmod zstd
+      - run: sudo bash scripts/install_vm_tools.sh
       - run: cargo build --locked --features fault-injection
       - name: Kill and restart a disposable guest three times
         shell: bash
