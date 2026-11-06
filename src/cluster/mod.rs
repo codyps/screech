@@ -751,6 +751,19 @@ fn start_read(node: &mut RawNode<LogStorage>, context: &[u8], round: usize) -> V
                 .get(*id)
                 .is_some_and(|progress| progress.recent_active && progress.matched >= committed)
     });
+    let has_commit = |id: &u64| {
+        node.raft
+            .prs()
+            .get(*id)
+            .is_some_and(|progress| progress.committed_index >= committed)
+    };
+    if peers.iter().filter(|id| has_commit(id)).count() >= needed {
+        // Prefer replicas whose commit notification already completed. A
+        // background replica can have all accepted bytes while still needing
+        // a projection turn for this heartbeat. This is only a routing hint;
+        // the new context still needs distinct fresh quorum responses.
+        peers.retain(has_commit);
+    }
     peers.sort_unstable();
     if peers.len() < needed || peers.is_empty() {
         return Vec::new();
@@ -2713,6 +2726,68 @@ mod tests {
             assert!(sim.nodes[0].raft.msgs.is_empty());
         }
     }
+    #[test]
+    fn initial_read_probes_prefer_voters_that_already_report_the_commit() {
+        for count in [3, 5] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut sim = Simulation::with_voters(dir.path(), count);
+            sim.nodes[0].campaign().unwrap();
+            sim.settle(None);
+            let committed = sim.nodes[0].raft.raft_log.committed;
+            assert!(committed > 0);
+            let needed = count / 2;
+            // Every follower has the accepted bytes, but the background set's
+            // commit notifications have not yet been acknowledged. A new
+            // ReadIndex probe to them would also need to advance that view.
+            for id in needed + 2..=count {
+                let progress = sim.nodes[0].raft.mut_prs().get_mut(id).unwrap();
+                assert!(progress.matched >= committed);
+                progress.committed_index = committed - 1;
+            }
+            for round in 0..count as usize - 1 {
+                let context = format!("commit-aware-{round}").into_bytes();
+                start_read(&mut sim.nodes[0], &context, round);
+                let selected: std::collections::BTreeSet<_> = sim.nodes[0]
+                    .raft
+                    .msgs
+                    .drain(..)
+                    .filter(|message| {
+                        message.get_msg_type() == raft::eraftpb::MessageType::MsgHeartbeat
+                            && message.get_context() == context.as_slice()
+                    })
+                    .map(|message| message.to)
+                    .collect();
+                assert_eq!(selected, (2..=needed + 1).collect());
+                assert!(
+                    sim.nodes[0].raft.read_states.is_empty(),
+                    "previous commit acknowledgements released a new read"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_commit_progress_keeps_initial_and_hedged_read_quorums() {
+        for count in [3, 5] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut sim = Simulation::with_voters(dir.path(), count);
+            sim.nodes[0].campaign().unwrap();
+            sim.settle(None);
+            for id in 2..=count {
+                sim.nodes[0]
+                    .raft
+                    .mut_prs()
+                    .get_mut(id)
+                    .unwrap()
+                    .committed_index = 0;
+            }
+            let deferred = start_read(&mut sim.nodes[0], b"unknown-commit", 0);
+            assert_eq!(sim.nodes[0].raft.msgs.len(), count as usize / 2);
+            assert_eq!(deferred.len(), (count as usize - 1) - count as usize / 2);
+            assert!(sim.nodes[0].raft.read_states.is_empty());
+        }
+    }
+
     #[test]
     fn initial_read_probes_prefer_caught_up_voters_without_reusing_their_acks() {
         let dir = tempfile::tempdir().unwrap();
