@@ -83,8 +83,20 @@ def run(binary, failure_dir=None):
             audit(cluster, last, retained)
             cluster.close()
             progress("cold restart")
-            for node in range(1, 4):
+            for node in (1, 2):
                 cluster.start(node)
+            cluster.wait_leader()
+            # A returning voter that discovers a live quorum must enroll a
+            # fresh identity, even if its local store is intact. Deliberately
+            # exercise that path and finish its promotion before losing another
+            # voter. A serving leader alone does not establish that the next
+            # fault will leave a durable quorum.
+            cluster.start(3)
+            wait_healed(cluster, 3)
+            recovered = status(cluster)
+            assert set(recovered['voters']) == {cluster.member(node) for node in (1, 2, 3)}, recovered
+            assert not recovered['outgoing'] and recovered['replacement'] is None, recovered
+            progress("cold restart voters fully recovered")
             audit(cluster, last, retained)
             progress("cold restart audited; replacing leader")
             leader = cluster.wait_leader()
@@ -95,7 +107,8 @@ def run(binary, failure_dir=None):
             progress("wiped leader repaired")
             audit(cluster, last, retained)
             return [dict(test='automatic compaction preserves retained payloads, dedup and confirmed ACKs across cold restart and voter repair',
-                         publications=last, retained=retained, passed=True)]
+                         publications=last, retained=retained, cold_returner_promoted_before_next_fault=True,
+                         surviving_voters_during_leader_loss=2, passed=True)]
         except BaseException:
             cluster.close()
             if failure_dir is not None:

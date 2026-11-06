@@ -305,3 +305,47 @@ in the first order and 5.1% in the reverse; p99 increased about 12–16%. Those 
 latency changes remain unresolved by the diagnostics. A fresh complete CI
 campaign must pass both clustered and standalone throughput/p99 gates before
 claiming qualification for the checkpoint candidate.
+
+The checkpoint-range campaign [42205575826](https://github.com/codyps/screech/actions/runs/42205575826),
+source `0c54798`, passed all 19 existing standalone unsafe-ACK targets, including
+10,000-message limits retention at 1.132× throughput and 0.710× p99. Its whole
+clustered campaign passed both targets in 17 of 28 cases. R3 concurrent publishing
+missed p99 at 0.806×; R5 had several throughput and latency misses. R3 ran on an
+EPYC 7763 and R5 on an EPYC 9V74. These results remain a failed clustered
+qualification, without combining them with the preceding campaign's 28 passes.
+All four raw files independently match the shared binary manifest, source, pinned
+NATS revision, workflow ID and attempt.
+
+The same source passed 269 Rust tests, both Clippy configurations, all 279 local
+process checks, the retained-content memory workload, and all 20 independent-VM
+and LazyFS histories. The local memory observer required this managed host's
+existing PID-namespace translation; its 256 MiB retained-content workload and
+96 MiB RSS limit were unchanged, and peak sampled RSS was about 32 MiB.
+
+CI nevertheless failed its automatic-checkpoint history and did not publish.
+The preserved stores show that one intact returning voter was already enrolling
+a fresh identity when the test wiped the current leader. Only one voting member
+then remained, so the injected loss did not leave the required durable quorum.
+An intact voter that discovers a live quorum deliberately enrolls a new identity,
+preventing a consistent stale disk image from reusing old voting promises. A
+serving leader does not establish that this replacement has finished.
+
+The revised history deliberately restarts two voters, establishes their quorum,
+then starts the third intact voter and requires its replacement, catch-up and
+promotion to finish. It verifies that all three current identities are voters
+before wiping the leader. The subsequent disk loss therefore leaves two durable
+voters. It retains all 8,200 publications, automatic compaction, cold restart,
+payload/retention/deduplication/ACK-floor audits and damaged-leader recovery;
+startup rules and durability checks are unchanged.
+
+A separate contact-during-SQL-commit prototype passed a new actual-SQLite-commit-hook
+and TCP regression, including rejected commits, fresh distinct-voter ReadIndex
+responses and cold recovery after losing the old leader. It exposed a short-lived
+validated contact view while the owner held the database mutex inside SQL COMMIT.
+That prototype is **not integrated**: a 120-trial local before/after/after/before
+comparison showed worse parallel Fetch/confirmed-ACK p99 in both orders at R3 and
+R5. Its candidate/baseline p99 ratios were 1.487× and 1.099× at R3, and 2.165× and
+1.057× at R5. Throughput and other latency results varied. These diagnostics use
+five checked 3,000-publication trials per workload/block, natural leader selection,
+two workers per voter and a shared four-CPU affinity; they have no NATS comparison
+and do not qualify the benchmark target. The existing read path is retained.
