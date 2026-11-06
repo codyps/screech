@@ -52,6 +52,35 @@ struct Request {
     _catalog: Option<CatalogFence>,
 }
 
+// Learn a concurrent burst once per active episode. Reusing only the last
+// batch size can lock admission onto alternating halves of the same burst.
+// Probe upward until one bounded collection underfills, then stop probing.
+// A shrinking burst lowers the target immediately; idle/control turns reset it.
+struct BurstAdmission {
+    target: usize,
+    growing: bool,
+}
+impl Default for BurstAdmission {
+    fn default() -> Self {
+        Self {
+            target: 1,
+            growing: true,
+        }
+    }
+}
+impl BurstAdmission {
+    fn observe(&mut self, count: usize) {
+        if count < self.target {
+            self.growing = false;
+        }
+        self.target = if self.growing && count > 1 {
+            (count * 2).min(32)
+        } else {
+            count
+        };
+    }
+}
+
 // A concurrent burst can arrive in several network-runtime turns. After a
 // multi-request round, briefly allow the next burst to catch up before starting
 // its durability boundary. Sequential traffic and standalone stores never wait.
@@ -96,6 +125,83 @@ fn collect_group<T>(
 #[cfg(test)]
 mod admission_tests {
     use super::*;
+
+    #[test]
+    fn learned_burst_collects_split_arrivals_then_stops_waiting_after_underfill() {
+        let mut burst = BurstAdmission::default();
+        burst.observe(2);
+        let (tx, rx) = std_mpsc::channel();
+        // Only the first half is queued. Keep the second half in the test
+        // until the collector has observed the first half and stayed pending.
+        tx.send(2).unwrap();
+        let (ready, observed) = std_mpsc::channel();
+        let (done, returned) = std_mpsc::channel();
+        let target = burst.target;
+        let collector = std::thread::spawn(move || {
+            let mut requests = vec![1];
+            let mut deferred = None;
+            collect_group(
+                &mut requests,
+                &rx,
+                &mut deferred,
+                target,
+                Duration::from_secs(1),
+                |r| {
+                    if *r == 2 {
+                        ready.send(()).unwrap();
+                    }
+                    Some(*r)
+                },
+            );
+            done.send(()).unwrap();
+            (requests, rx, deferred)
+        });
+        observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            matches!(
+                returned.recv_timeout(Duration::from_millis(100)),
+                Err(std_mpsc::RecvTimeoutError::Timeout)
+            ),
+            "collection split an active burst at the previous batch size"
+        );
+        tx.send(3).unwrap();
+        tx.send(4).unwrap();
+        let (mut requests, rx, mut deferred) = collector.join().unwrap();
+        assert_eq!(requests, [1, 2, 3, 4]);
+        burst.observe(requests.len());
+        // An underfilled collection must end exploration. The following full
+        // burst must finish even with a large wait budget and a connected sender.
+        requests.clear();
+        requests.push(1);
+        for item in 2..=4 {
+            tx.send(item).unwrap();
+        }
+        collect_group(
+            &mut requests,
+            &rx,
+            &mut deferred,
+            burst.target,
+            Duration::ZERO,
+            |r| Some(*r),
+        );
+        burst.observe(requests.len());
+        requests.clear();
+        requests.push(1);
+        for item in 2..=4 {
+            tx.send(item).unwrap();
+        }
+        let started = std::time::Instant::now();
+        collect_group(
+            &mut requests,
+            &rx,
+            &mut deferred,
+            burst.target,
+            Duration::from_secs(5),
+            |r| Some(*r),
+        );
+        assert_eq!(requests, [1, 2, 3, 4]);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 
     #[test]
     fn concurrent_admission_preserves_catalog_fence_and_following_request() {
@@ -349,6 +455,7 @@ impl Handle {
             // ACK-only rounds return an empty vector for the next admission burst.
             let mut request_scratch = Vec::with_capacity(32);
             let mut previous_group = 1;
+            let mut burst = BurstAdmission::default();
             loop {
                 if worker_stop.load(std::sync::atomic::Ordering::Acquire) {
                     break;
@@ -389,7 +496,11 @@ impl Handle {
                             &mut requests,
                             &rx,
                             &mut deferred,
-                            previous_group,
+                            if worker.engine.replicas() > 1 {
+                                burst.target
+                            } else {
+                                previous_group
+                            },
                             if worker.engine.replicas() > 1 {
                                 Duration::from_micros(64)
                             } else {
@@ -426,14 +537,21 @@ impl Handle {
                                 && worker.engine.buffers_consumer_state();
                             let _ = req.response.send(result);
                         }
+                        if worker.engine.replicas() > 1 {
+                            burst.observe(previous_group);
+                        }
                     }
                     Ok(req) => {
                         previous_group = 1;
+                        burst = BurstAdmission::default();
                         let result = worker.handle(req.message);
                         let _ = req.response.send(result);
                     }
                     Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
-                    Err(std_mpsc::RecvTimeoutError::Timeout) => previous_group = 1,
+                    Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                        previous_group = 1;
+                        burst = BurstAdmission::default();
+                    }
                 }
                 idle_wait = match worker.maintain() {
                     Ok(true) => Duration::ZERO,
