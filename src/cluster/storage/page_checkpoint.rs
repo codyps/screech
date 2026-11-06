@@ -65,9 +65,11 @@ impl PageCheckpointer {
                                 row.get::<_, i64>(2)?,
                             ))
                         }) {
-                            Ok((busy, _, _)) => {
-                                if busy == 0 {
-                                    // Count work observed before this checkpoint.
+                            Ok((busy, frames, backfilled)) => {
+                                if busy == 0 && frames == backfilled {
+                                    // PASSIVE can return SQLITE_OK with readers
+                                    // still holding back frames. Keep partial work
+                                    // pending, even if no more commits arrive.
                                     // Concurrent commits remain in the next budget.
                                     checkpointed = current;
                                 }
@@ -150,6 +152,74 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+    #[test]
+    fn partial_checkpoint_finishes_after_reader_release_without_new_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA page_size=1024; PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL; PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE t(id INTEGER PRIMARY KEY, body BLOB);
+             INSERT INTO t VALUES(0, x'01');",
+        )
+        .unwrap();
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        assert_eq!(
+            reader
+                .query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let changes = Arc::new(AtomicU64::new(conn.total_changes()));
+        let (tx, rx) = mpsc::sync_channel(1);
+        let _worker = PageCheckpointer::start(path.clone(), changes.clone(), tx).unwrap();
+        conn.execute_batch(
+            "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1024)
+             INSERT INTO t SELECT i, zeroblob(3072) FROM n;",
+        )
+        .unwrap();
+        let committed = conn.total_changes();
+        changes.store(committed, Ordering::Release);
+        let progress = || {
+            conn.query_row("PRAGMA wal_checkpoint(NOOP)", [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+        };
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (busy, frames, backfilled) = progress();
+            if busy == 0 && backfilled > 0 && backfilled < frames {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "reader did not hold a partial checkpoint"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        reader.execute_batch("ROLLBACK").unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (busy, frames, backfilled) = progress();
+            if busy == 0 && frames > 0 && backfilled == frames {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "partial checkpoint was abandoned after reader release"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(changes.load(Ordering::Acquire), committed);
         assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
     }
     #[test]
