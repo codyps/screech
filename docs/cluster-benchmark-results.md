@@ -1,5 +1,7 @@
 # Cluster benchmark target qualification
 
+The historical campaign below qualifies all 28 cases, but fresh repeats have not consistently met the latency target. The 20% goal remains open; a green main CI run alone does not certify clustered performance because its clustered target report is informational.
+
 [Campaign 42139057786](https://github.com/codyps/screech/actions/runs/42139057786) qualifies all 28 three- and five-voter cases against the 20% target. Each case uses five checked trials of 3,000 publications, plus warmups, with the existing throughput and end-to-end latency boundaries. The checker reports `goal_verified: true`; recomputing the report from the retained raw trials gives the same result.
 
 The lowest throughput ratio is 1.241× NATS (24.1% higher); the highest p99 ratio is 0.746× NATS (25.4% lower). Ratios below compare medians of each server’s checked trials. Higher throughput and lower p99 are better.
@@ -32,3 +34,13 @@ The changes send grouped appends promptly to every voter so the first durable ma
 [The grouped-fanout campaign](https://github.com/codyps/screech/actions/runs/42134441962) passed 27 of 28 comparisons, missing R5 duplicate throughput. [The scheduling-only campaign](https://github.com/codyps/screech/actions/runs/42138333410) passed 16 of 28 on an AMD EPYC 9V74 runner. Their raw results are retained. Different hosts and runs prevent attributing the entire difference to one change. Passing cases from these campaigns are not combined with this qualification.
 
 The workflow retains raw trials, environment metadata, binary hashes, launch configurations and the complete `cluster-targets.json` report in `cluster-benchmark-timings`. CPU/syscall profiles are separate diagnostics and do not count toward qualification. Crash safety is checked separately by the Rust, process, independent-VM and LazyFS suites described in [testing](testing.md).
+
+## Subsequent measurements and checkpoint correction
+
+[Main campaign 42151468327](https://github.com/codyps/screech/actions/runs/42151468327), source `07893ea`, passed throughput in all 28 cases but passed both throughput and p99 in only 14. It used five checked trials of 3,000 publications per case and the same upstream NATS commit. Its correctness, process-failure, guest power-loss, benchmark and dashboard deployment jobs all passed. These CI results do not turn its missed latency targets into a qualification. The published dashboard retains that complete campaign.
+
+A reproduced checkpoint bookkeeping defect was then corrected in `ec678e8`: SQLite PASSIVE checkpoints can return success while an existing reader prevents complete backfill. The background worker previously counted this partial pass as completed work, so it could abandon the remaining frames after the reader released if no further writes arrived. The worker now keeps that work pending until the reported frame and backfill counts match. The regression test fails against the old implementation and passes after the correction, without issuing any additional writes after reader release. Checkpoint polling, row and WAL budgets, synchronous journal acceptance, FULL roots and quorum rules are unchanged.
+
+[Checkpoint correction campaign 42153796720](https://github.com/codyps/screech/actions/runs/42153796720) passed throughput in all 28 cases and passed both targets in 27. R5 concurrent publishing missed p99: 0.817× NATS against the required 0.800×. It used five trials of 3,000 publications and the same NATS revision. Both campaigns reported an AMD EPYC 7763 with four logical CPUs, but ran on separate shared runners; the difference is not a controlled measurement of the checkpoint fix's effect. These incomplete campaigns are retained separately and their passing cases are not pooled.
+
+The checkpoint correction also passed 257 Rust tests, Clippy with default and all features, 86 process failure cases, the 8,200-publication automatic-checkpoint/restart/repair case, seven independent-VM scenarios at each voter count, and three LazyFS scenarios. The fault campaigns checked confirmed ACKs, retention, deduplication and consumer recreation through power loss, torn writes, write/flush errors, asymmetric partitions and damaged-voter replacement. These safety checks are independent of performance qualification.
