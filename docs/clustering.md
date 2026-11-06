@@ -53,10 +53,11 @@ Steady-state Raft persistence reuses the verified accepted frontier and last
 recorded hard state. A projection rollback invalidates those hints; startup,
 checkpoint roots and application epoch checks retain their direct SQL validation.
 Replication prioritizes a caught-up quorum. Other stable voters keep one append
-outstanding and can wait up to one millisecond on the peer writer, allowing Raft
-to batch the following suffix. Empty commit notifications and urgent traffic end
-that wait without overtaking
-the queued append. The existing queue bound remains in force. Learners, joint
+outstanding and can wait up to two milliseconds on the peer writer, allowing Raft
+to batch the following suffix. Their commit notifications share that queue instead
+of prematurely flushing each append. Read contacts and other urgent traffic end
+that wait without overtaking the queued append. Grouped appends go promptly to all
+voters, allowing the first durable majority to complete. The existing queue bound remains in force. Learners, joint
 configurations, membership entries, snapshots and insufficient caught-up quorums
 retain immediate fanout. Persistence-dependent responses and client successes
 still require the same accepted-journal syncs and actual voter majorities.
