@@ -11,6 +11,24 @@ mod writeback;
 // Small, regular passes avoid a large dirty WAL flush delaying the accepted
 // journals on the same device. Activity still gates retained WAL capacity.
 const PROJECTION_CHANGE_BUDGET: u64 = 1024;
+const MINIMUM_WAL_FRAMES: i64 = 2048;
+
+fn progress(conn: &Connection, pragma: &str) -> io::Result<Option<(i64, i64, i64)>> {
+    match conn.query_row(pragma, [], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    }) {
+        Ok(stats) => Ok(Some(stats)),
+        Err(e)
+            if matches!(
+                e.sqlite_error_code(),
+                Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(error(e)),
+    }
+}
 
 pub(crate) struct PageCheckpointer {
     stop: mpsc::Sender<()>,
@@ -36,7 +54,7 @@ impl PageCheckpointer {
             .map_err(error)?
             .try_into()
             .map_err(error)?;
-        let minimum_wal_bytes = page_size * 2048;
+        let minimum_wal_bytes = page_size * MINIMUM_WAL_FRAMES as u64;
         let mut wal = path.into_os_string();
         wal.push("-wal");
         let wal = PathBuf::from(wal);
@@ -44,6 +62,7 @@ impl PageCheckpointer {
         let writeback = writeback::Writeback::start(wal.clone(), fault.clone())?;
         let (stop, stopped) = mpsc::channel();
         let mut checkpointed = changes.load(Ordering::Acquire);
+        let mut pending = false;
         std::thread::Builder::new()
             .name("screech-page-checkpoint".into())
             .spawn(move || {
@@ -58,33 +77,40 @@ impl PageCheckpointer {
                         if std::fs::metadata(&wal)?.len() < minimum_wal_bytes {
                             return Ok(());
                         }
-                        match conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
-                            Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, i64>(1)?,
-                                row.get::<_, i64>(2)?,
-                            ))
-                        }) {
-                            Ok((busy, frames, backfilled)) => {
-                                if busy == 0 && frames == backfilled {
-                                    // PASSIVE can return SQLITE_OK with readers
-                                    // still holding back frames. Keep partial work
-                                    // pending, even if no more commits arrive.
-                                    // Concurrent commits remain in the next budget.
-                                    checkpointed = current;
-                                }
-                                Ok(())
+                        if !pending {
+                            let Some((busy, frames, backfilled)) =
+                                progress(&conn, "PRAGMA wal_checkpoint(NOOP)")?
+                            else {
+                                return Ok(());
+                            };
+                            if busy != 0 {
+                                return Ok(());
                             }
-                            Err(e)
-                                if matches!(
-                                    e.sqlite_error_code(),
-                                    Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
-                                ) =>
-                            {
-                                Ok(())
+                            if frames == backfilled {
+                                checkpointed = current;
+                                return Ok(());
                             }
-                            Err(e) => Err(error(e)),
+                            // SQLite retains WAL capacity across reuse. Temp
+                            // index updates count as changes too, so neither
+                            // that capacity nor the row budget measures dirty
+                            // permanent pages. NOOP never performs a checkpoint.
+                            if frames.saturating_sub(backfilled) < MINIMUM_WAL_FRAMES {
+                                return Ok(());
+                            }
+                            pending = true;
                         }
+                        if let Some((busy, frames, backfilled)) =
+                            progress(&conn, "PRAGMA wal_checkpoint(PASSIVE)")?
+                        {
+                            if busy == 0 && frames == backfilled {
+                                // Once started, finish partial passes even if a
+                                // reader leaves fewer than the threshold dirty.
+                                // Concurrent commits retain their next budget.
+                                checkpointed = current;
+                                pending = false;
+                            }
+                        }
+                        Ok(())
                     })();
                     if let Err(failure) = result {
                         tracing::error!(%failure,"SQLite page checkpoint failed; fencing voter");
@@ -125,6 +151,69 @@ mod tests {
     }
 
     #[test]
+    fn reused_wal_capacity_does_not_flush_small_suffixes_after_temp_index_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA page_size=1024; PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=NORMAL; PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE t(id INTEGER PRIMARY KEY, body BLOB);
+            INSERT INTO t VALUES(1, zeroblob(9437184));
+            PRAGMA wal_checkpoint(PASSIVE);
+            INSERT INTO t VALUES(2, x'01');
+            CREATE TEMP TABLE idx(id INTEGER PRIMARY KEY);
+            WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1024)
+            INSERT INTO idx SELECT x FROM n;",
+        )
+        .unwrap();
+        let progress = || {
+            conn.query_row("PRAGMA wal_checkpoint(NOOP)", [], |row| {
+                Ok((row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+            })
+            .unwrap()
+        };
+        let (frames, backfilled) = progress();
+        assert!(frames > backfilled && frames < 2048);
+        assert!(
+            std::fs::metadata(format!("{}-wal", path.display()))
+                .unwrap()
+                .len()
+                > 8 * 1024 * 1024
+        );
+        let changes = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = mpsc::sync_channel(1);
+        let _worker = PageCheckpointer::start(path.clone(), changes.clone(), tx).unwrap();
+        changes.store(conn.total_changes(), Ordering::Release);
+        std::thread::sleep(Duration::from_millis(500));
+        let (frames, backfilled) = progress();
+        assert!(
+            frames > backfilled,
+            "retained WAL capacity checkpointed a small suffix after temp-index work"
+        );
+        // Useful permanent WAL work must still trigger the background pass.
+        conn.execute_batch(
+            "WITH RECURSIVE n(x) AS (VALUES(3) UNION ALL SELECT x+1 FROM n WHERE x<1026)
+            INSERT INTO t SELECT x, zeroblob(3072) FROM n;",
+        )
+        .unwrap();
+        changes.store(conn.total_changes(), Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let (frames, backfilled) = progress();
+            if frames > 0 && frames == backfilled {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "dirty WAL budget did not checkpoint"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
     fn small_page_projections_checkpoint_before_eight_megabytes_accumulate() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
@@ -156,6 +245,13 @@ mod tests {
     }
     #[test]
     fn partial_checkpoint_finishes_after_reader_release_without_new_writes() {
+        partial_checkpoint_after_reader_release(0);
+    }
+    #[test]
+    fn partial_checkpoint_retries_a_remaining_suffix_below_the_dirty_frame_budget() {
+        partial_checkpoint_after_reader_release(900);
+    }
+    fn partial_checkpoint_after_reader_release(pinned: i64) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db");
         let conn = Connection::open(&path).unwrap();
@@ -166,20 +262,29 @@ mod tests {
              INSERT INTO t VALUES(0, x'01');",
         )
         .unwrap();
+        if pinned > 0 {
+            conn.execute(
+                "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?1)
+                INSERT INTO t SELECT i, zeroblob(3072) FROM n",
+                [pinned],
+            )
+            .unwrap();
+        }
         let reader = Connection::open(&path).unwrap();
         reader.execute_batch("BEGIN").unwrap();
         assert_eq!(
             reader
                 .query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            1
+            pinned + 1
         );
-        let changes = Arc::new(AtomicU64::new(conn.total_changes()));
+        let changes = Arc::new(AtomicU64::new(0));
         let (tx, rx) = mpsc::sync_channel(1);
         let _worker = PageCheckpointer::start(path.clone(), changes.clone(), tx).unwrap();
-        conn.execute_batch(
-            "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<1024)
-             INSERT INTO t SELECT i, zeroblob(3072) FROM n;",
+        conn.execute(
+            "WITH RECURSIVE n(i) AS (VALUES(?1) UNION ALL SELECT i+1 FROM n WHERE i<1024)
+             INSERT INTO t SELECT i, zeroblob(3072) FROM n",
+            [pinned + 1],
         )
         .unwrap();
         let committed = conn.total_changes();
@@ -198,6 +303,9 @@ mod tests {
         loop {
             let (busy, frames, backfilled) = progress();
             if busy == 0 && backfilled > 0 && backfilled < frames {
+                if pinned > 0 {
+                    assert!(frames - backfilled < MINIMUM_WAL_FRAMES);
+                }
                 break;
             }
             assert!(
