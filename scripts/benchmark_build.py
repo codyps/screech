@@ -63,7 +63,7 @@ def main():
     parser.add_argument('--rustc')
     parser.add_argument('--run-id')
     parser.add_argument('paths', type=Path, nargs='*')
-    args = parser.parse_args()
+    args = parser.parse_intermixed_args()
     if args.operation == 'create':
         if not args.nats_commit or not args.rustc:
             parser.error('create requires --nats-commit and --rustc')

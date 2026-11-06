@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import subprocess
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
@@ -66,3 +67,13 @@ class BenchmarkBuild(unittest.TestCase):
                     campaigns(self.build, [path], 'run')
         with self.assertRaisesRegex(ValueError, 'no benchmark campaigns'):
             campaigns(self.build, [], 'run')
+
+    def test_cli_accepts_campaign_paths_after_options(self):
+        paths = [self.write_campaign(f'{name}.json') for name in ('standard', 'concurrent', 'three', 'five')]
+        script = Path(__file__).resolve().parents[1] / 'scripts' / 'benchmark_build.py'
+        result = subprocess.run([sys.executable, str(script), 'campaigns',
+                                 '--directory', str(self.root), '--revision', 'source',
+                                 '--run-id', 'run', *map(str, paths)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Verified 4 campaigns', result.stdout)

@@ -70,6 +70,7 @@ Each row below is a whole R3/R5 campaign using the same 3,000-publication worklo
 | [42159736231](https://github.com/codyps/screech/actions/runs/42159736231) | EPYC 9V74 | 16/28 | 0.784× | 5.412× | Unsafe polling; clustered path unchanged |
 | [42164213943](https://github.com/codyps/screech/actions/runs/42164213943) | Xeon Platinum 8573C | 25/28 | 1.273× | 1.431× | Commit-aware read probes with learned admission and checkpoint pacing |
 | [42166305893](https://github.com/codyps/screech/actions/runs/42166305893) | EPYC 9V74 | 11/28 | 1.162× | 2.805× | Integrated main; all CI jobs and standalone targets passed |
+| [42172626951](https://github.com/codyps/screech/actions/runs/42172626951) | R3: EPYC 7763; R5: EPYC 9V45 | 25/28 | 1.193× | 2.254× | Isolated timing jobs; raw provenance independently verified; CI postprocessing failed |
 
 The individual experiments retain their branches and raw campaign artifacts. Shorter or diagnostic runs are not combined with these five-trial results to fill missing targets.
 
@@ -100,3 +101,20 @@ counts, publication counts, workload checks, durability settings, latency bounda
 and the all-28 qualification requirement are unchanged. Dashboard assembly rejects
 mixed builds, workflow IDs or measurement attempts; no passing cases are pooled
 across campaigns to claim qualification.
+
+
+The first complete isolated timing set, campaign 42172626951 at `8432fb7`, passed
+both targets in 25 of 28 clustered cases using five checked trials. R3 concurrent
+publishing missed p99 at 0.809×; R5 concurrent publishing missed throughput at
+1.193× and p99 at 2.254×; R5 concurrent Fetch/ACK missed p99 at 0.911×. The other
+25 cases passed both targets. R3 ran on an EPYC 7763 and R5 on an EPYC 9V45, with
+Screech/NATS pairs sharing their respective hosts. These separate machines and
+changed measurement conditions prevent attributing the difference from earlier
+campaigns solely to isolation.
+
+Both raw clustered files independently match the shared build manifest, source,
+NATS pin, workflow ID and measurement attempt. Their CI jobs failed after timing
+because the provenance CLI's positional arguments following options were rejected
+by the runner's Python version. Explicit intermixed argument parsing fixes that
+failure, with a CLI regression checked against Python 3.12.3. The timing results
+remain retained and are not a successful CI or performance qualification.
