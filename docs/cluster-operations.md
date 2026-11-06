@@ -189,7 +189,11 @@ epoch changes fence these replies; standalone and single-voter stores retain the
 existing worker path.
 Grouped appends containing multiple application records go promptly to every
 voter, letting the first durable majority complete without waiting for a preferred
-peer. These writes already amortize their sync across the group. Single-record
+peer. These writes already amortize their sync across the group. Concurrent
+admission accounts for work already holding a request slot, allowing a larger
+burst than the previous batch while returning once that known work is collected.
+The 64 microsecond wait, 32-request limit and 1 MiB cap remain bounded; sequential
+traffic and standalone stores retain immediate admission. Single-record
 appends retain the bounded backup batching policy; quorum and persistence rules
 are unchanged.
 Raft's persistence-independent leader messages may start follower writes while

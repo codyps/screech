@@ -60,15 +60,21 @@ fn collect_group<T>(
     ingress: &std_mpsc::Receiver<T>,
     deferred: &mut Option<T>,
     previous: usize,
+    admitted: usize,
     wait: Duration,
     size: impl Fn(&T) -> Option<usize>,
 ) {
+    let target = if previous > 1 {
+        previous.max(admitted)
+    } else {
+        1
+    };
     let deadline = std::time::Instant::now() + wait;
     let mut bytes = size(&requests[0]).unwrap();
     while requests.len() < 32 {
         let next = match ingress.try_recv() {
             Ok(request) => request,
-            Err(std_mpsc::TryRecvError::Empty) if requests.len() < previous => {
+            Err(std_mpsc::TryRecvError::Empty) if requests.len() < target => {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
                     break;
@@ -110,6 +116,7 @@ mod admission_tests {
             &rx,
             &mut deferred,
             16,
+            32,
             Duration::from_secs(1),
             |r| *r,
         );
@@ -126,18 +133,30 @@ mod admission_tests {
         }
         let mut requests = vec![1];
         let mut deferred = None;
-        collect_group(&mut requests, &rx, &mut deferred, 32, Duration::ZERO, |r| {
-            Some(*r)
-        });
+        collect_group(
+            &mut requests,
+            &rx,
+            &mut deferred,
+            32,
+            32,
+            Duration::ZERO,
+            |r| Some(*r),
+        );
         assert_eq!(requests.len(), 32);
         assert_eq!(rx.try_iter().count(), 9);
         tx.send(1024 * 1024).unwrap();
         tx.send(2).unwrap();
         requests.clear();
         requests.push(1);
-        collect_group(&mut requests, &rx, &mut deferred, 32, Duration::ZERO, |r| {
-            Some(*r)
-        });
+        collect_group(
+            &mut requests,
+            &rx,
+            &mut deferred,
+            32,
+            32,
+            Duration::ZERO,
+            |r| Some(*r),
+        );
         assert_eq!(requests, [1]);
         assert_eq!(deferred, Some(1024 * 1024));
         assert_eq!(rx.try_recv().unwrap(), 2);
@@ -156,6 +175,7 @@ mod admission_tests {
             &rx,
             &mut deferred,
             1,
+            32,
             Duration::from_secs(5),
             |r| Some(*r),
         );
@@ -164,7 +184,48 @@ mod admission_tests {
     }
 
     #[test]
-    fn burst_admission_accepts_arrivals_then_returns_at_previous_size() {
+    fn admitted_work_can_extend_a_burst_beyond_its_previous_size() {
+        let (tx, rx) = std_mpsc::channel();
+        let (reached, waiting) = std_mpsc::channel();
+        let (finished, completion) = std_mpsc::channel();
+        for item in 2..=4 {
+            tx.send(item).unwrap();
+        }
+        let collector = std::thread::spawn(move || {
+            let mut requests = vec![1];
+            collect_group(
+                &mut requests,
+                &rx,
+                &mut None,
+                4,
+                8,
+                Duration::from_secs(2),
+                |item| {
+                    if *item == 4 {
+                        reached.send(()).unwrap();
+                    }
+                    Some(1)
+                },
+            );
+            finished.send(requests).unwrap();
+        });
+        waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            completion.recv_timeout(Duration::from_millis(100)),
+            Err(std_mpsc::RecvTimeoutError::Timeout)
+        ));
+        for item in 5..=8 {
+            tx.send(item).unwrap();
+        }
+        drop(tx);
+        assert_eq!(
+            completion.recv_timeout(Duration::from_secs(2)).unwrap(),
+            (1..=8).collect::<Vec<_>>()
+        );
+        collector.join().unwrap();
+    }
+    #[test]
+    fn burst_admission_returns_once_all_admitted_work_is_collected() {
         let (tx, rx) = std_mpsc::channel();
         let (done, wait) = std_mpsc::channel();
         let producer = std::thread::spawn(move || {
@@ -176,15 +237,18 @@ mod admission_tests {
         });
         let mut requests = vec![1];
         let mut deferred = None;
+        let started = std::time::Instant::now();
         collect_group(
             &mut requests,
             &rx,
             &mut deferred,
+            2,
             3,
-            Duration::from_secs(1),
+            Duration::from_secs(5),
             |r| Some(*r),
         );
         assert_eq!(requests, [1, 2, 3]);
+        assert!(started.elapsed() < Duration::from_secs(2));
         done.send(()).unwrap();
         producer.join().unwrap();
     }
@@ -311,6 +375,8 @@ impl Handle {
                 .collect::<Vec<_>>(),
         ));
         let worker_interests = interests.clone();
+        let slots = Arc::new(Semaphore::new(REQUEST_SLOTS));
+        let worker_slots = slots.clone();
         let (tx, rx) = std_mpsc::channel::<Request>();
         let (out, output) = mpsc::channel(1024);
         let sink = Arc::new(RwLock::new(None));
@@ -390,6 +456,7 @@ impl Handle {
                             &rx,
                             &mut deferred,
                             previous_group,
+                            REQUEST_SLOTS - worker_slots.available_permits(),
                             if worker.engine.replicas() > 1 {
                                 Duration::from_micros(64)
                             } else {
@@ -452,7 +519,7 @@ impl Handle {
         });
         Ok(Self {
             tx,
-            slots: Arc::new(Semaphore::new(REQUEST_SLOTS)),
+            slots,
             catalog_pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             interests,
             output: Arc::new(Mutex::new(Some(output))),

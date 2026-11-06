@@ -7,6 +7,7 @@ import select
 import json
 import zlib
 import sqlite3
+import shutil
 import tempfile
 import time
 from pathlib import Path
@@ -20,7 +21,16 @@ def wait_recovery(cluster, slot, previous):
         if cluster.member(slot) != previous:
             return wait_healed(cluster, slot, previous)
         time.sleep(.05)
-    raise AssertionError('corrupt application leader kept its voting identity instead of healing')
+    details = cluster.failure_details()
+    failure_root = Path('results/cluster-model-recovery-failures')
+    failure_root.mkdir(parents=True, exist_ok=True)
+    saved = Path(tempfile.mkdtemp(prefix='history-', dir=failure_root))
+    # Stop all writers before retaining the stores. The outer finally closes
+    # again safely, and TemporaryDirectory cleanup cannot erase the evidence.
+    cluster.close()
+    shutil.copytree(cluster.root, saved / 'cluster')
+    raise AssertionError(('corrupt application leader kept its voting identity instead of healing',
+                          details, str(saved)))
 
 
 def missing_live_content(binary, kind):
