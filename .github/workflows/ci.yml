@@ -96,14 +96,12 @@ jobs:
     name: Guest power-loss recovery
     needs: test
     uses: ./.github/workflows/vm.yml
-  benchmarks:
-    name: Checked NATS comparisons
+  benchmark_build:
+    name: Build benchmark binaries once
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 25
     outputs:
-      pages_artifact: github-pages-${{ github.run_id }}-${{ github.run_attempt }}
-    env:
-      TRIALS: ${{ inputs.trials || '3' }}
+      binaries_artifact: benchmark-binaries-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -134,57 +132,55 @@ jobs:
           go -C tools/bench build -o "$GITHUB_WORKSPACE/bin/bench-driver" .
           go -C tools/bench test .
           git -C upstream rev-parse HEAD > results/nats-commit.txt
-      - name: Standard cases · FULL, always, 10 ms, default
-        run: |
-          python3 scripts/benchmark.py --screech target/release/screech-server \
-            --nats bin/nats-server --driver bin/bench-driver \
-            --nats-commit "$(cat results/nats-commit.txt)" \
-            --nats-default --nats-sync-interval 10ms --screech-unsafe-ack --trials "$TRIALS" \
-            --reverse --output results/standard.json
-      - name: Larger JetStream cases
-        run: |
-          python3 scripts/benchmark.py --screech target/release/screech-server \
-            --nats bin/nats-server --driver bin/bench-driver \
-            --nats-commit "$(cat results/nats-commit.txt)" \
-            --nats-default --nats-sync-interval 10ms --screech-unsafe-ack --trials "$TRIALS" \
-            --scale-only --output results/concurrent.json
-      - name: Standalone JetStream performance target reports
-        run: |
-          python3 scripts/check_jetstream_targets.py --standard results/standard.json --concurrent results/concurrent.json --server screech --minimum-trials "$TRIALS" --report-only --output results/jetstream-full-targets.json
-          python3 scripts/check_jetstream_targets.py --standard results/standard.json --concurrent results/concurrent.json --server screech-unsafe-ack --minimum-trials "$TRIALS" --report-only --output results/jetstream-unsafe-ack-targets.json
-      - name: Upload standalone timings before clustered cases
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: always()
+          cp target/release/screech-server bin/screech-server
+          python3 scripts/benchmark_build.py create --directory bin --revision "$GITHUB_SHA" \
+            --nats-commit "$(cat results/nats-commit.txt)" --rustc "$(rustc --version)"
+          tar -C bin -czf benchmark-binaries.tar.gz screech-server nats-server bench-driver benchmark-build.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: benchmark-standalone-timings
-          path: |
-            results/standard.json
-            results/standard.jsonl
-            results/concurrent.json
-            results/concurrent.jsonl
-            results/jetstream-*-targets.json
-            results/nats-commit.txt
-      - name: Clustered JetStream cases · 3 and 5 voters
-        run: |
-          for voters in 3 5; do
-            python3 scripts/benchmark.py --screech target/release/screech-server \
-              --nats bin/nats-server --driver bin/bench-driver \
-              --nats-commit "$(cat results/nats-commit.txt)" \
-              --cluster-voters "$voters" --cluster-messages 3000 --trials "$TRIALS" \
-              --output "results/cluster-$voters.json"
-          done
-      - name: Clustered JetStream performance target report
-        run: |
-          python3 scripts/check_cluster_targets.py --three results/cluster-3.json --five results/cluster-5.json --minimum-trials "$TRIALS" --report-only --output results/cluster-targets.json
-      - name: Upload checked timings before profiling
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: always()
+          name: benchmark-binaries-${{ github.run_id }}-${{ github.run_attempt }}
+          path: benchmark-binaries.tar.gz
+  standalone:
+    name: Standalone comparisons
+    needs: benchmark_build
+    uses: ./.github/workflows/benchmark-timing.yml
+    with:
+      voters: 1
+      trials: ${{ inputs.trials || 3 }}
+      binaries_artifact: ${{ needs.benchmark_build.outputs.binaries_artifact }}
+  cluster_three:
+    name: Clustered comparisons · 3 voters
+    needs: benchmark_build
+    uses: ./.github/workflows/benchmark-timing.yml
+    with:
+      voters: 3
+      trials: ${{ inputs.trials || 3 }}
+      binaries_artifact: ${{ needs.benchmark_build.outputs.binaries_artifact }}
+  cluster_five:
+    name: Clustered comparisons · 5 voters
+    needs: benchmark_build
+    uses: ./.github/workflows/benchmark-timing.yml
+    with:
+      voters: 5
+      trials: ${{ inputs.trials || 3 }}
+      binaries_artifact: ${{ needs.benchmark_build.outputs.binaries_artifact }}
+  profiles:
+    name: Diagnostic profiles
+    needs: benchmark_build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          name: benchmark-timings
-          path: |
-            results/*.json
-            results/*.jsonl
-            results/nats-commit.txt
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.benchmark_build.outputs.binaries_artifact }}
+      - name: Verify the shared benchmark build
+        run: |
+          mkdir -p bin
+          tar -C bin -xzf benchmark-binaries.tar.gz
+          python3 scripts/benchmark_build.py verify --directory bin --revision "$GITHUB_SHA"
       - name: Profile Core forwarding and confirmed consumer ACKs
         run: |
           sudo bash scripts/install_profile_tools.sh
@@ -192,30 +188,74 @@ jobs:
           perf_binary=$(find -L /usr/lib/linux-tools -type f -name perf | sort | tail -1)
           test -n "$perf_binary"
           test -x "$perf_binary"
-          sudo python3 scripts/profile_core.py --include-kernel --screech target/release/screech-server \
+          sudo python3 scripts/profile_core.py --include-kernel --screech bin/screech-server \
             --nats bin/nats-server --driver bin/bench-driver --perf "$perf_binary" \
             --output core-profiles
-          sudo python3 scripts/profile_jetstream.py --include-kernel --screech target/release/screech-server \
+          sudo python3 scripts/profile_jetstream.py --include-kernel --screech bin/screech-server \
             --nats bin/nats-server --driver bin/bench-driver --perf "$perf_binary" \
             --output jetstream-profiles
-          sudo python3 scripts/profile_publication_io.py --screech target/release/screech-server \
+          sudo python3 scripts/profile_publication_io.py --screech bin/screech-server \
             --nats bin/nats-server --driver bin/bench-driver --strace "$(command -v strace)" \
             --output publication-io-profiles
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: core-profiles
+          name: core-profiles-${{ github.run_id }}-${{ github.run_attempt }}
           path: core-profiles/
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: jetstream-profiles
+          name: jetstream-profiles-${{ github.run_id }}-${{ github.run_attempt }}
           path: jetstream-profiles/
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: publication-io-profiles
+          name: publication-io-profiles-${{ github.run_id }}-${{ github.run_attempt }}
           path: publication-io-profiles/
+  dashboard:
+    name: Assemble checked benchmark dashboard
+    needs: [benchmark_build, standalone, cluster_three, cluster_five]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      pages_artifact: github-pages-${{ github.run_id }}-${{ github.run_attempt }}
+    env:
+      TRIALS: ${{ inputs.trials || '3' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.benchmark_build.outputs.binaries_artifact }}
+      - name: Verify the shared benchmark build
+        run: |
+          mkdir -p bin
+          tar -C bin -xzf benchmark-binaries.tar.gz
+          python3 scripts/benchmark_build.py verify --directory bin --revision "$GITHUB_SHA"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.standalone.outputs.timings_artifact }}
+          path: results
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.cluster_three.outputs.timings_artifact }}
+          path: results
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.cluster_five.outputs.timings_artifact }}
+          path: results
+      - name: Verify campaign provenance and report clustered targets
+        run: |
+          python3 scripts/benchmark_build.py campaigns --directory bin --revision "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" \
+            results/standard.json results/concurrent.json results/cluster-3.json results/cluster-5.json
+          python3 scripts/check_cluster_targets.py --three results/cluster-3.json --five results/cluster-5.json \
+            --minimum-trials "$TRIALS" --report-only --output results/cluster-targets.json
+      - name: Retain the complete timing campaign
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: benchmark-timings-${{ github.run_id }}-${{ github.run_attempt }}
+          path: results/
       - name: Generate benchmark dashboard
         run: |
           python3 scripts/render_benchmarks.py \
@@ -230,24 +270,21 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: benchmark-results
+          name: benchmark-results-${{ github.run_id }}-${{ github.run_attempt }}
           path: results/
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: benchmark-site
+          name: benchmark-site-${{ github.run_id }}-${{ github.run_attempt }}
           path: _site/
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         with:
           name: github-pages-${{ github.run_id }}-${{ github.run_attempt }}
           path: _site
-      - name: Verify unsafe-ACK JetStream performance targets
-        if: ${{ !inputs.trials || inputs.trials >= 3 }}
-        run: python3 scripts/check_jetstream_targets.py --standard results/standard.json --concurrent results/concurrent.json --server screech-unsafe-ack --minimum-trials "$TRIALS" --output results/jetstream-unsafe-ack-targets.json
   deploy:
     name: Publish benchmark dashboard
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-    needs: [test, vm, benchmarks]
+    needs: [test, vm, profiles, dashboard]
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     concurrency:
@@ -264,5 +301,5 @@ jobs:
       - uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
         id: deployment
         with:
-          artifact_name: ${{ needs.benchmarks.outputs.pages_artifact }}
+          artifact_name: ${{ needs.dashboard.outputs.pages_artifact }}
           timeout: '600000'

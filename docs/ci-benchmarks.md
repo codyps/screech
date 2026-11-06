@@ -9,12 +9,23 @@ The reusable guest workflow kills and recovers a disposable VM three times, incl
 forced checkpoints and concurrent commits. Each test artifact is downloadable from
 its workflow run. A manual guest-only run remains available in vm.yml.
 
-Correctness and benchmarks run on separate runners in parallel; guest recovery
-starts after correctness passes. Deployment waits for all three jobs.
-Benchmark jobs build release Screech without fault hooks, the official nats.go driver,
-and NATS from main (or a manually supplied ref). The resolved NATS SHA, binary hashes,
-versions, CPU/kernel/filesystem, trial counts and commands are preserved with raw JSON.
-Tests and VMs run separately; profiling starts after all benchmark timing finishes.
+Correctness and benchmark builds run on separate runners in parallel; guest recovery
+starts after correctness passes. One build job packages release Screech without fault
+hooks, the official nats.go driver and NATS from main (or a manually supplied ref).
+Standalone, R3 and R5 timing jobs each download that same immutable build onto a
+fresh runner. Each Screech/NATS comparison stays on the same runner; no CPU model,
+leader placement or favorable result is selected. Profiling uses a fourth runner,
+so builds, tests, other voter-count campaigns and profiles do not precede or overlap
+timing on a timing host. Deployment waits for correctness, recovery, profiles and
+the assembled dashboard.
+
+A manifest records all three binary SHA256 hashes, source revision, resolved NATS
+SHA and Rust version. Each timing job verifies the downloaded binaries. Dashboard
+assembly verifies that all four campaign files match the manifest and come from
+the same workflow ID and measurement attempt. Mixing one retried topology into an
+older attempt is rejected. A publication-only retry can reuse the complete original
+measurement set. Versions, CPU/kernel/filesystem, trial counts and commands remain
+in each raw campaign JSON.
 Hosted machines are shared and
 unpinned; cross-run differences can reflect hardware and filesystem variation.
 Cluster launch artifacts record the entry slot and the serving Screech slot from
@@ -74,19 +85,25 @@ and behavior can evolve, so each campaign records the exact NATS commit.
 
 ## Publishing and reading results
 
-A successful main run publishes the static dashboard to GitHub Pages after both
-recovery and benchmark jobs pass. PRs upload the same generated site as a downloadable
+A successful main run publishes the static dashboard to GitHub Pages after
+correctness, recovery, profiling and benchmark jobs pass. PRs upload the same generated site as a downloadable
 benchmark-site artifact without deploying it. Failed campaigns do not replace the
-last successful page. Each Pages archive includes its run ID and benchmark job
-attempt in its name. Deployment uses the name recorded by that benchmark job, so
-retrying only deployment still selects the correct archive and a benchmark rerun
-does not create ambiguous duplicate Pages artifacts. Benchmark-results retains raw JSON/JSONL and launch metadata;
-benchmark-site contains a self-contained page and raw downloads for that run.
+last successful page. Each artifact name includes its workflow ID and producing attempt. The
+`benchmark-binaries-*` artifact contains the shared build and manifest;
+`benchmark-timings-r1-*`, `benchmark-timings-r3-*` and `benchmark-timings-r5-*` retain
+each timing job's raw files before performance gates. `benchmark-timings-*` from
+assembly retains the verified complete set. `benchmark-results-*` retains raw
+JSON/JSONL and launch metadata; `benchmark-site-*` contains the self-contained page
+and raw downloads. Each Pages archive also includes its run ID and producing
+attempt. Deployment uses the exact name recorded by dashboard assembly, so retrying
+only deployment selects the correct archive without ambiguous duplicates.
 
 The default view combines all campaigns: each workload tile shows standalone,
 three-voter and five-voter results for both servers. Different publication counts
 and campaigns remain separate bars, each labeled with its sample count; their
-trials are never pooled. Use Benchmark set to restrict the campaigns, or expand
+trials are never pooled. CI uses separate runners for standalone, R3 and R5, so
+absolute values across campaigns can also reflect different hardware. Paired ratios
+compare servers within the same campaign on the same host. Use Benchmark set to restrict the campaigns, or expand
 “Filter server modes and workloads” to hide individual modes or workloads.
 Use Metric for throughput, latency percentiles, live-Core durable ACK latency,
 CPU or final RSS. Table exposes the same results, ranges and per-result ratios.

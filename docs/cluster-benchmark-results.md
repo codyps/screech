@@ -69,6 +69,7 @@ Each row below is a whole R3/R5 campaign using the same 3,000-publication worklo
 | [42161467251](https://github.com/codyps/screech/actions/runs/42161467251) | EPYC 7763 | 27/28 | 1.131× | 0.730× | learned admission with 10 ms checkpoint polling |
 | [42159736231](https://github.com/codyps/screech/actions/runs/42159736231) | EPYC 9V74 | 16/28 | 0.784× | 5.412× | Unsafe polling; clustered path unchanged |
 | [42164213943](https://github.com/codyps/screech/actions/runs/42164213943) | Xeon Platinum 8573C | 25/28 | 1.273× | 1.431× | Commit-aware read probes with learned admission and checkpoint pacing |
+| [42166305893](https://github.com/codyps/screech/actions/runs/42166305893) | EPYC 9V74 | 11/28 | 1.162× | 2.805× | Integrated main; all CI jobs and standalone targets passed |
 
 The individual experiments retain their branches and raw campaign artifacts. Shorter or diagnostic runs are not combined with these five-trial results to fill missing targets.
 
@@ -81,3 +82,21 @@ The separate unsafe-polling candidate `3268c64`, measured in [campaign 421597362
 The integrated candidate combines learned admission, 10 ms checkpoint polling, commit-aware initial read probes, and the separately tested unsafe polling change. Read-probe selection prefers voters whose Raft progress already reports the leader's commit only when enough such voters exist. Each read still obtains fresh context-bound replies from a distinct current quorum; unknown progress uses the prior selection and the existing delayed probes. New tests reproduce the former choice of a commit-lagging voter and preserve fallback, rotation among equally caught-up voters, and rejection of old read contexts. The combined source must be measured as a whole before claiming qualification.
 
 The commit-aware read-probe campaign 42164213943 passed all throughput targets, including R3/R5 deduplication at 1.487× and 1.421×. It passed both targets in 25 of 28 cases. Concurrent-publish p99 missed at R3 (0.874×) and R5 (1.431×), as did R3 concurrent Fetch(1) p99 (0.837×). Its Xeon Platinum 8573C runner differs from the prior EPYC runners; these separate campaigns do not establish a controlled effect size for read selection.
+
+
+Integrated main `faed73b` in campaign 42166305893 passed the existing 19 standalone
+unsafe-ACK targets and all correctness, guest recovery and publication jobs. Its
+complete five-trial clustered result passed both targets in only 11 of 28 cases;
+R5 deduplication throughput was 1.162× and R3 concurrent-publish p99 was 2.805×.
+A green CI result does not certify the informational clustered target report.
+
+Subsequent CI campaigns isolate standalone, R3 and R5 timing onto separate fresh
+runners, using the identical three binaries from one manifest-verified build. Each
+Screech/NATS pair still shares one runner. This changes measurement conditions,
+not the server implementation or target. Prior suite activity and storage history
+are possible contributors to variability; the previous runs do not establish a
+causal effect. Hardware remains unpinned and is reported for each campaign. Trial
+counts, publication counts, workload checks, durability settings, latency boundaries
+and the all-28 qualification requirement are unchanged. Dashboard assembly rejects
+mixed builds, workflow IDs or measurement attempts; no passing cases are pooled
+across campaigns to claim qualification.
