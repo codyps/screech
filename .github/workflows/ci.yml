@@ -100,6 +100,8 @@ jobs:
     name: Checked NATS comparisons
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    outputs:
+      pages_artifact: github-pages-${{ github.run_id }}-${{ github.run_attempt }}
     env:
       TRIALS: ${{ inputs.trials || '3' }}
     steps:
@@ -238,6 +240,7 @@ jobs:
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         with:
+          name: github-pages-${{ github.run_id }}-${{ github.run_attempt }}
           path: _site
       - name: Verify unsafe-ACK JetStream performance targets
         if: ${{ !inputs.trials || inputs.trials >= 3 }}
@@ -262,4 +265,5 @@ jobs:
       - uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
         id: deployment
         with:
-          timeout: '1200000'
+          artifact_name: ${{ needs.benchmarks.outputs.pages_artifact }}
+          timeout: '600000'

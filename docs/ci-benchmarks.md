@@ -69,7 +69,10 @@ and behavior can evolve, so each campaign records the exact NATS commit.
 A successful main run publishes the static dashboard to GitHub Pages after both
 recovery and benchmark jobs pass. PRs upload the same generated site as a downloadable
 benchmark-site artifact without deploying it. Failed campaigns do not replace the
-last successful page. Benchmark-results retains raw JSON/JSONL and launch metadata;
+last successful page. Each Pages archive includes its run ID and benchmark job
+attempt in its name. Deployment uses the name recorded by that benchmark job, so
+retrying only deployment still selects the correct archive and a benchmark rerun
+does not create ambiguous duplicate Pages artifacts. Benchmark-results retains raw JSON/JSONL and launch metadata;
 benchmark-site contains a self-contained page and raw downloads for that run.
 
 The default view combines all campaigns: each workload tile shows standalone,
