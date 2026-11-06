@@ -68,7 +68,7 @@ fn collect_group<T>(
     while requests.len() < 32 {
         let next = match ingress.try_recv() {
             Ok(request) => request,
-            Err(std_mpsc::TryRecvError::Empty) if requests.len() < previous => {
+            Err(std_mpsc::TryRecvError::Empty) if previous > 1 => {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
                     break;
@@ -164,7 +164,49 @@ mod admission_tests {
     }
 
     #[test]
-    fn burst_admission_accepts_arrivals_then_returns_at_previous_size() {
+    fn a_growing_burst_is_not_cut_off_at_the_previous_groups_size() {
+        let (tx, rx) = std_mpsc::channel();
+        let (reached, waiting) = std_mpsc::channel();
+        let (finished, completion) = std_mpsc::channel();
+        for item in 2..=4 {
+            tx.send(item).unwrap();
+        }
+        let collector = std::thread::spawn(move || {
+            let mut requests = vec![1];
+            collect_group(
+                &mut requests,
+                &rx,
+                &mut None,
+                4,
+                Duration::from_secs(2),
+                |item| {
+                    if *item == 4 {
+                        reached.send(()).unwrap();
+                    }
+                    Some(1)
+                },
+            );
+            finished.send(requests).unwrap();
+        });
+        waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Hold back the second half until the old size has been reached. A
+        // previous-size cutoff would already release a partial durable group.
+        assert!(matches!(
+            completion.recv_timeout(Duration::from_millis(100)),
+            Err(std_mpsc::RecvTimeoutError::Timeout)
+        ));
+        for item in 5..=8 {
+            tx.send(item).unwrap();
+        }
+        drop(tx);
+        assert_eq!(
+            completion.recv_timeout(Duration::from_secs(2)).unwrap(),
+            (1..=8).collect::<Vec<_>>()
+        );
+        collector.join().unwrap();
+    }
+    #[test]
+    fn burst_admission_returns_at_its_deadline_with_a_connected_producer() {
         let (tx, rx) = std_mpsc::channel();
         let (done, wait) = std_mpsc::channel();
         let producer = std::thread::spawn(move || {
@@ -181,7 +223,7 @@ mod admission_tests {
             &rx,
             &mut deferred,
             3,
-            Duration::from_secs(1),
+            Duration::from_millis(20),
             |r| Some(*r),
         );
         assert_eq!(requests, [1, 2, 3]);
