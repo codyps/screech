@@ -810,7 +810,7 @@ impl Store for SqliteStore {
             return Err(StoreError::Invalid);
         }
         let tx = self.connection.transaction()?;
-        tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS live_content(generation INTEGER,seq INTEGER,PRIMARY KEY(generation,seq)) WITHOUT ROWID; DELETE FROM live_content;")?;
+        tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS live_content_ranges(generation INTEGER,first_seq INTEGER,last_seq INTEGER NOT NULL CHECK(last_seq>=first_seq),PRIMARY KEY(generation,first_seq)) WITHOUT ROWID; DELETE FROM live_content_ranges;")?;
         {
             let mut insert =
                 tx.prepare_cached("INSERT INTO retained_content VALUES(?1,?2,?3,?4,?5,?6)")?;
@@ -824,25 +824,74 @@ impl Store for SqliteStore {
                     content_checksum(c)
                 ])?;
             }
-            let mut insert = tx.prepare_cached("INSERT INTO live_content VALUES(?1,?2)")?;
+            // Adjacent keys form an exact range, not a min/max approximation.
+            // Unordered inputs remain valid; overlapping ranges reject duplicate
+            // keys just as the former per-key primary key did.
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO live_content_ranges SELECT ?1,?2,?3
+                 WHERE COALESCE((SELECT last_seq<?2 FROM live_content_ranges
+                 WHERE generation=?1 AND first_seq<=?3 ORDER BY first_seq DESC LIMIT 1),1)",
+            )?;
+            let mut insert_range = |(generation, first, last)| -> Result<(), StoreError> {
+                if insert.execute([generation, first, last])? != 1 {
+                    return Err(StoreError::Invalid);
+                }
+                Ok(())
+            };
+            let mut range: Option<(i64, i64, i64)> = None;
             for key in live {
-                insert.execute([
-                    i64::try_from(key.generation).map_err(|_| StoreError::Invalid)?,
-                    i64::try_from(key.sequence).map_err(|_| StoreError::Invalid)?,
-                ])?;
+                let generation = i64::try_from(key.generation).map_err(|_| StoreError::Invalid)?;
+                let sequence = i64::try_from(key.sequence).map_err(|_| StoreError::Invalid)?;
+                if let Some((current, first, last)) = range {
+                    if current == generation && last.checked_add(1) == Some(sequence) {
+                        range = Some((current, first, sequence));
+                        continue;
+                    }
+                    insert_range((current, first, last))?;
+                }
+                range = Some((generation, sequence, sequence));
+            }
+            if let Some(range) = range {
+                insert_range(range)?;
             }
         }
-        let missing:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM live_content l WHERE NOT EXISTS(SELECT 1 FROM retained_content c WHERE c.generation=l.generation AND c.seq=l.seq))",[],|r|r.get(0))?;
+        // A primary key makes cardinality equivalent to checking every key in
+        // each disjoint range, including missing keys in the middle.
+        let missing: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM live_content_ranges l WHERE
+             (SELECT count(*)-1 FROM retained_content c WHERE c.generation=l.generation
+             AND c.seq BETWEEN l.first_seq AND l.last_seq) != l.last_seq-l.first_seq)",
+            [],
+            |r| r.get(0),
+        )?;
         if missing {
             return Err(StoreError::Corrupt(sequence));
         }
+        // Disjointness and complete range coverage establish a unique live set.
+        // Equal cardinalities then prove that collection has nothing to remove.
+        let all_content_live: bool = tx.query_row(
+            "SELECT COALESCE((SELECT sum(last_seq-first_seq+1) FROM live_content_ranges),0)
+             =(SELECT count(*) FROM retained_content)",
+            [],
+            |r| r.get(0),
+        )?;
         tx.execute("INSERT INTO snapshot VALUES(1,?1,?2,?3) ON CONFLICT(id) DO UPDATE SET seq=excluded.seq,data=excluded.data,checksum=excluded.checksum",params![sequence as i64,state,checksum(sequence,"$SCREECH.snapshot.v2",&[],state)])?;
         tx.execute("DELETE FROM messages WHERE seq<=?1", [sequence as i64])?;
         tx.execute(
             "DELETE FROM consumer_blocks WHERE last_seq<=?1",
             [sequence as i64],
         )?;
-        tx.execute("DELETE FROM retained_content WHERE (generation,seq) IN (SELECT c.generation,c.seq FROM retained_content c WHERE NOT EXISTS(SELECT 1 FROM live_content l WHERE l.generation=c.generation AND l.seq=c.seq))",[])?;
+        if !all_content_live {
+            // Only the nearest preceding range can contain a key. LIMIT 1 keeps
+            // sparse live sets from turning collection into a scan of every range.
+            tx.execute(
+                "DELETE FROM retained_content WHERE (generation,seq) IN
+                 (SELECT c.generation,c.seq FROM retained_content c WHERE NOT COALESCE(
+                 (SELECT l.last_seq FROM live_content_ranges l WHERE l.generation=c.generation
+                 AND l.first_seq<=c.seq ORDER BY l.first_seq DESC LIMIT 1)>=c.seq,0))",
+                [],
+            )?;
+        }
         crate::fault::point("before_checkpoint_commit");
         tx.commit()?;
         self.consumer_cache.get_mut().take();
@@ -1518,5 +1567,151 @@ mod retained_content_layout_tests {
         let store = SqliteStore::open(path).unwrap();
         assert_eq!(store.last_sequence().unwrap(), 1);
         assert!(store.get_content(content.key).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_reachability_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn content(generation: u64, sequence: u64) -> Content {
+        Content {
+            key: ContentKey {
+                generation,
+                sequence,
+            },
+            subject: "retained".into(),
+            headers: Bytes::new(),
+            payload: Bytes::from_static(b"payload"),
+        }
+    }
+
+    fn record() -> Append {
+        Append {
+            subject: "event".into(),
+            headers: Bytes::new(),
+            payload: Bytes::from_static(b"reference"),
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn checkpoint_collection_matches_exact_unordered_reachability(
+            selected in proptest::collection::btree_set((1u64..4, 1u64..17), 0..48),
+            reverse in any::<bool>(),
+            rotation in 0usize..64,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("store");
+            let contents: Vec<_> = (1..4).flat_map(|g| (1..17).map(move |s| content(g,s))).collect();
+            let mut store = SqliteStore::open(&path).unwrap();
+            store.append_with_content(&[record()], &contents).unwrap();
+            let mut live: Vec<_> = selected.iter().map(|&(generation, sequence)| ContentKey { generation, sequence }).collect();
+            if reverse { live.reverse(); }
+            if !live.is_empty() { let n = rotation % live.len(); live.rotate_left(n); }
+            store.checkpoint_with_content(1, b"exact", &mut live.into_iter(), &[]).unwrap();
+            drop(store);
+            let store = SqliteStore::open(&path).unwrap();
+            prop_assert_eq!(store.load_checkpoint().unwrap(), Some((1, Bytes::from_static(b"exact"))));
+            for item in contents {
+                let expected = selected.contains(&(item.key.generation, item.key.sequence)).then_some(item.clone());
+                prop_assert_eq!(store.get_content(item.key).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn missing_middle_and_duplicate_live_keys_roll_back_checkpoint_and_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let contents = [content(1, 1), content(1, 3), content(1, 4)];
+        let mut store = SqliteStore::open(&path).unwrap();
+        store.append_with_content(&[record()], &contents).unwrap();
+        store
+            .checkpoint_with_content(1, b"before", &mut contents.iter().map(|c| c.key), &[])
+            .unwrap();
+        store.append("later", &[], b"uncompacted").unwrap();
+        let imported = content(2, 1);
+        let live = [
+            ContentKey {
+                generation: 1,
+                sequence: 1,
+            },
+            ContentKey {
+                generation: 1,
+                sequence: 2,
+            },
+            ContentKey {
+                generation: 1,
+                sequence: 3,
+            },
+            imported.key,
+        ];
+        assert!(matches!(
+            store.checkpoint_with_content(
+                2,
+                b"missing",
+                &mut live.into_iter(),
+                std::slice::from_ref(&imported)
+            ),
+            Err(StoreError::Corrupt(2))
+        ));
+        assert!(store.get_content(imported.key).unwrap().is_none());
+        let filled = content(1, 2);
+        store
+            .append_with_content(&[record()], std::slice::from_ref(&filled))
+            .unwrap();
+        // Both intersecting ranges contain only existing rows: rejection must
+        // come from their duplicate keys, rather than a missing-content check.
+        let live = [
+            contents[0].key,
+            filled.key,
+            contents[1].key,
+            filled.key,
+            contents[1].key,
+            contents[2].key,
+        ];
+        assert!(store
+            .checkpoint_with_content(3, b"duplicate", &mut live.into_iter(), &[])
+            .is_err());
+        drop(store);
+        let store = SqliteStore::open(&path).unwrap();
+        assert_eq!(
+            store.load_checkpoint().unwrap(),
+            Some((1, Bytes::from_static(b"before")))
+        );
+        assert_eq!(store.get(2).unwrap().unwrap().payload, b"uncompacted"[..]);
+        assert_eq!(store.last_sequence().unwrap(), 3);
+        assert_eq!(store.get_content(filled.key).unwrap(), Some(filled));
+        for item in contents {
+            assert_eq!(store.get_content(item.key).unwrap(), Some(item));
+        }
+        assert!(store.get_content(imported.key).unwrap().is_none());
+    }
+
+    #[test]
+    fn checkpoint_reachability_preserves_integer_edges_and_generation_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store");
+        let maximum = i64::MAX as u64;
+        let contents = [
+            content(1, maximum - 1),
+            content(1, maximum),
+            content(2, 1),
+            content(maximum, maximum),
+            content(1, 1),
+        ];
+        let mut store = SqliteStore::open(&path).unwrap();
+        store.append_with_content(&[record()], &contents).unwrap();
+        store
+            .checkpoint_with_content(1, b"edges", &mut contents[..4].iter().map(|c| c.key), &[])
+            .unwrap();
+        drop(store);
+        let store = SqliteStore::open(&path).unwrap();
+        for item in &contents[..4] {
+            assert_eq!(store.get_content(item.key).unwrap(), Some(item.clone()));
+        }
+        assert!(store.get_content(contents[4].key).unwrap().is_none());
     }
 }

@@ -74,6 +74,7 @@ Each row below is a whole R3/R5 campaign using the same 3,000-publication worklo
 | [42176137594](https://github.com/codyps/screech/actions/runs/42176137594) | EPYC 9V74 | 11/28 | 0.381× | 71.084× | Publication collection candidate; all CI jobs, standalone targets and local fault histories passed |
 | [42179667716](https://github.com/codyps/screech/actions/runs/42179667716) | R3: EPYC 7763; R5: EPYC 9V45 | 27/28 | 1.363× | 1.662× | Transport queue/failure feedback; all CI, standalone targets and 20 local fault histories passed |
 | [42190078293](https://github.com/codyps/screech/actions/runs/42190078293) | R3: EPYC 7763; R5: EPYC 9V74 | 22/28 | 1.088× | 3.518× | Commit-progress correction; all CI, standalone targets and 20 local fault histories passed |
+| [42195162772](https://github.com/codyps/screech/actions/runs/42195162772) | R3: Xeon Platinum 8370C; R5: EPYC 7763 | 28/28 | 1.344× | 0.659× | Clustered qualification; separate standalone gate passed 18/19 and blocked publication |
 
 The individual experiments retain their branches and raw campaign artifacts. Shorter or diagnostic runs are not combined with these five-trial results to fill missing targets.
 
@@ -259,3 +260,48 @@ survivors elect a leader and recover the exact publication. Real TCP tests hold
 the projection gate and verify that a lagging commit never appears in the reply
 as already recorded. Fresh complete timings and failure histories are required
 for this candidate before claiming a performance result.
+
+
+Complete campaign [42195162772](https://github.com/codyps/screech/actions/runs/42195162772)
+at `ada4b0d` qualified every clustered comparison using five checked trials per
+case and the unchanged NATS pin. Independently recomputing its 28-case report
+from the complete raw trials gives `goal_verified: true`. Every case has at least
+1.344× throughput and at most 0.660× end-to-end p99, rounded to three decimals.
+All raw campaigns independently match one build and measurement attempt. All
+266 Rust tests, 87 local cluster/process/checkpoint checks and 20 local VM/LazyFS
+histories passed for this runtime.
+
+Publication was blocked by the separate standalone unsafe-ACK gate: the
+10,000-message limits-retention case reached 1.092× throughput against its
+existing 1.100× requirement. Its p99 passed at 0.868×; the other 18 standalone
+cases passed. That gate is retained, and the passing clustered results are not
+combined with standalone timings from another revision or campaign.
+
+A longer unsafe reply-polling window and a backoff between empty queue probes
+showed inconsistent local throughput changes in both orders. Both experiments
+were rejected. A subsequent wall-time diagnostic identified a checkpoint within
+the ACK phase: about 9.8 ms committing its snapshot and 4.7 ms restarting its WAL
+in a roughly 168 ms phase. These are diagnostic measurements, not qualification.
+
+The checkpoint candidate represents only adjacent, actually enumerated live keys
+as temporary ranges. It rejects overlapping ranges, checks that every key in
+each range exists, and preserves unordered inputs. Once this establishes a
+unique live set contained in the retained set, equal cardinalities prove that
+collection cannot remove anything. Otherwise the collector checks exact range
+membership, including holes. This proof is rebuilt in the same SQLite transaction
+for every checkpoint; it is not a cached reachability hint.
+
+The candidate changes temporary bookkeeping only. Durable tables and snapshot
+formats, FULL commits, WAL restart, publication fences, consumer-state flush
+intervals and checkpoint record/byte thresholds retain their existing contracts.
+Properties compare collected payloads with exact unordered live sets; additional
+tests cover missing middle keys with equal cardinalities, intersecting duplicate
+ranges, import rollback, cold reopen, generation boundaries and integer limits.
+The full 269-test Rust suite and both Clippy configurations passed.
+
+Local before/after/after/before diagnostics used ten checked trials per block of
+the existing 10,000-message limits-retention workload. Throughput increased 0.9%
+in the first order and 5.1% in the reverse; p99 increased about 12–16%. Those local
+latency changes remain unresolved by the diagnostics. A fresh complete CI
+campaign must pass both clustered and standalone throughput/p99 gates before
+claiming qualification for the checkpoint candidate.
