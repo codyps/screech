@@ -140,13 +140,15 @@ jobs:
         with:
           name: benchmark-binaries-${{ github.run_id }}-${{ github.run_attempt }}
           path: benchmark-binaries.tar.gz
+  # Normalize dispatch values before passing the reusable workflow a number:
+  # https://github.com/actions/runner/issues/2848
   standalone:
     name: Standalone comparisons
     needs: benchmark_build
     uses: ./.github/workflows/benchmark-timing.yml
     with:
       voters: 1
-      trials: ${{ inputs.trials || 3 }}
+      trials: ${{ fromJSON(format('{0}', inputs.trials || 3)) }}
       binaries_artifact: ${{ needs.benchmark_build.outputs.binaries_artifact }}
   cluster_three:
     name: Clustered comparisons · 3 voters
@@ -154,7 +156,7 @@ jobs:
     uses: ./.github/workflows/benchmark-timing.yml
     with:
       voters: 3
-      trials: ${{ inputs.trials || 3 }}
+      trials: ${{ fromJSON(format('{0}', inputs.trials || 3)) }}
       binaries_artifact: ${{ needs.benchmark_build.outputs.binaries_artifact }}
   cluster_five:
     name: Clustered comparisons · 5 voters
@@ -162,7 +164,7 @@ jobs:
     uses: ./.github/workflows/benchmark-timing.yml
     with:
       voters: 5
-      trials: ${{ inputs.trials || 3 }}
+      trials: ${{ fromJSON(format('{0}', inputs.trials || 3)) }}
       binaries_artifact: ${{ needs.benchmark_build.outputs.binaries_artifact }}
   profiles:
     name: Diagnostic profiles
