@@ -37,10 +37,26 @@ The workflow retains raw trials, environment metadata, binary hashes, launch con
 
 ## Subsequent measurements and checkpoint correction
 
-[Main campaign 42151468327](https://github.com/codyps/screech/actions/runs/42151468327), source `07893ea`, passed throughput in all 28 cases but passed both throughput and p99 in only 14. It used five checked trials of 3,000 publications per case and the same upstream NATS commit. Its correctness, process-failure, guest power-loss, benchmark and dashboard deployment jobs all passed. These CI results do not turn its missed latency targets into a qualification. The published dashboard retains that complete campaign.
+[Main campaign 42151468327](https://github.com/codyps/screech/actions/runs/42151468327), source `07893ea`, passed throughput in all 28 cases but passed both throughput and p99 in only 13. It used five checked trials of 3,000 publications per case and the same upstream NATS commit. Its correctness, process-failure, guest power-loss, benchmark and dashboard deployment jobs all passed. These CI results do not turn its missed latency targets into a qualification. The published dashboard retains that complete campaign.
 
 A reproduced checkpoint bookkeeping defect was then corrected in `ec678e8`: SQLite PASSIVE checkpoints can return success while an existing reader prevents complete backfill. The background worker previously counted this partial pass as completed work, so it could abandon the remaining frames after the reader released if no further writes arrived. The worker now keeps that work pending until the reported frame and backfill counts match. The regression test fails against the old implementation and passes after the correction, without issuing any additional writes after reader release. Checkpoint polling, row and WAL budgets, synchronous journal acceptance, FULL roots and quorum rules are unchanged.
 
 [Checkpoint correction campaign 42153796720](https://github.com/codyps/screech/actions/runs/42153796720) passed throughput in all 28 cases and passed both targets in 27. R5 concurrent publishing missed p99: 0.817× NATS against the required 0.800×. It used five trials of 3,000 publications and the same NATS revision. Both campaigns reported an AMD EPYC 7763 with four logical CPUs, but ran on separate shared runners; the difference is not a controlled measurement of the checkpoint fix's effect. These incomplete campaigns are retained separately and their passing cases are not pooled.
 
 The checkpoint correction also passed 257 Rust tests, Clippy with default and all features, 86 process failure cases, the 8,200-publication automatic-checkpoint/restart/repair case, seven independent-VM scenarios at each voter count, and three LazyFS scenarios. The fault campaigns checked confirmed ACKs, retention, deduplication and consumer recreation through power loss, torn writes, write/flush errors, asymmetric partitions and damaged-voter replacement. These safety checks are independent of performance qualification.
+
+## Complete five-trial campaign comparison
+
+Each row below is a whole R3/R5 campaign using the same 3,000-publication workloads and pinned NATS revision. The throughput column is the lowest ratio among its 28 cases; p99 is the highest ratio. A campaign qualifies only if all 28 cases pass both targets. Different shared runners prevent treating these rows as a controlled estimate of any individual change.
+
+| Campaign | R5 runner CPU | Cases passing both | Lowest throughput | Highest p99 | Adopted change |
+| --- | --- | ---: | ---: | ---: | --- |
+| [42139057786](https://github.com/codyps/screech/actions/runs/42139057786) | EPYC 7763 | 28/28 | 1.241× | 0.746× | Grouped fanout and completion scheduling |
+| [42141817751](https://github.com/codyps/screech/actions/runs/42141817751) | EPYC 9V45 | 25/28 | 1.255× | 2.577× | Same runtime, main repeat |
+| [42146585037](https://github.com/codyps/screech/actions/runs/42146585037) | EPYC 7763 | 26/28 | 1.237× | 1.028× | None: 10 ms checkpoint polling experiment |
+| [42147606381](https://github.com/codyps/screech/actions/runs/42147606381) | EPYC 9V74 | 12/28 | 0.944× | 4.220× | None: full admission-window experiment |
+| [42150826564](https://github.com/codyps/screech/actions/runs/42150826564) | EPYC 9V74 | 20/28 | 1.264× | 1.398× | None: admitted-count batching experiment |
+| [42151468327](https://github.com/codyps/screech/actions/runs/42151468327) | EPYC 7763 | 13/28 | 1.291× | 1.850× | Same runtime, main repeat |
+| [42153796720](https://github.com/codyps/screech/actions/runs/42153796720) | EPYC 7763 | 27/28 | 1.232× | 0.817× | Complete partial checkpoints after reader release |
+
+The rejected experiments retain their branches and raw campaign artifacts. Shorter or diagnostic runs are not combined with these five-trial results to fill missing targets.

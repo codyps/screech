@@ -42,6 +42,7 @@ def main():
     args.output.write_text(json.dumps(report, indent=2)+'\n')
     for row in results:
         print(f"R{row['voters']} {row['scenario']} {row['payload_bytes']} B: throughput {row['throughput_ratio']:.3f}x, {row['latency_metric']} {row['p99_ratio']:.3f}x {'PASS' if row['passed'] else 'MISS'}")
+    print(f"{sum(row['passed'] for row in results)}/{len(results)} clustered cases passed both targets; goal {'VERIFIED' if report['goal_verified'] else 'NOT VERIFIED'}")
     return 0 if report['goal_verified'] or args.report_only else 1
 
 
