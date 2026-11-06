@@ -73,6 +73,7 @@ Each row below is a whole R3/R5 campaign using the same 3,000-publication worklo
 | [42172626951](https://github.com/codyps/screech/actions/runs/42172626951) | R3: EPYC 7763; R5: EPYC 9V45 | 25/28 | 1.193× | 2.254× | Isolated timing jobs; raw provenance independently verified; CI postprocessing failed |
 | [42176137594](https://github.com/codyps/screech/actions/runs/42176137594) | EPYC 9V74 | 11/28 | 0.381× | 71.084× | Publication collection candidate; all CI jobs, standalone targets and local fault histories passed |
 | [42179667716](https://github.com/codyps/screech/actions/runs/42179667716) | R3: EPYC 7763; R5: EPYC 9V45 | 27/28 | 1.363× | 1.662× | Transport queue/failure feedback; all CI, standalone targets and 20 local fault histories passed |
+| [42190078293](https://github.com/codyps/screech/actions/runs/42190078293) | R3: EPYC 7763; R5: EPYC 9V74 | 22/28 | 1.088× | 3.518× | Commit-progress correction; all CI, standalone targets and 20 local fault histories passed |
 
 The individual experiments retain their branches and raw campaign artifacts. Shorter or diagnostic runs are not combined with these five-trial results to fill missing targets.
 
@@ -216,3 +217,45 @@ after the correction, including updating Raft's leader progress. Newer commits
 still require the actor, and every read still needs distinct, fresh, context-bound
 quorum responses. The change adds no storage operation or cached quorum proof.
 Fresh complete timings are required to establish its performance effect.
+
+
+Complete five-trial campaign [42190078293](https://github.com/codyps/screech/actions/runs/42190078293)
+at `057af09` passed 22 of 28 clustered comparisons. R3 passed every p99 target
+and missed only deduplication throughput (1.088× NATS). R5 missed sequential
+publication p99, limits-retention throughput/p99, 128-byte Fetch(1) p99, concurrent
+Fetch(1) p99 and multi-stream p99. All 19 existing standalone targets, all CI jobs,
+and all 20 local VM/LazyFS histories passed, and the page was published. The
+complete raw timing set independently matches one build, revision, pinned NATS
+commit, workflow and measurement attempt. This is not a clustered qualification.
+
+The preceding attempt [42188617441](https://github.com/codyps/screech/actions/runs/42188617441)
+was incomplete: pinned NATS returned `no responders available for request` during
+R3 limits retention. Its R5 data passed all 14 comparisons but is not combined
+with the replacement campaign. Twenty separate local repetitions using that
+exact pinned NATS executable and checked driver did not reproduce the failure.
+No retry was added inside a checked workload.
+
+A counterbalanced local experiment briefly polled for consensus replies after
+new work instead of immediately parking the owner thread. Across both orders and
+both voter counts, the changes were about one percent or less in throughput,
+without a consistent latency improvement. That polling experiment was rejected.
+
+The next read-contact candidate distinguishes durable acceptance from a follower's
+commit projection. Raft's [linearizable-read rules](https://raft.github.io/raft.pdf)
+require the leader to know its committed prefix and obtain fresh majority
+contacts. The candidate lets a stable, authenticated voter confirm its already
+recorded leader term when the requested prefix is durably accepted, even while
+a commit notification awaits the actor. Its response reports only the lower of
+the requested and locally recorded commit indices. The actor still processes
+the notification through the ordinary commit pipeline. The leader's own durable
+applied prefix and each read's distinct, context-bound quorum proof remain
+required. Membership transitions, unaccepted prefixes, changed terms and failed
+storage retain their existing fallback or fencing behavior.
+
+The new regression fails against the old commit guard. With the change, actual
+R3/R5 Raft leaders complete fresh reads while followers retain older commit
+cursors; after discarding volatile state and isolating the former leader, the
+survivors elect a leader and recover the exact publication. Real TCP tests hold
+the projection gate and verify that a lagging commit never appears in the reply
+as already recorded. Fresh complete timings and failure histories are required
+for this candidate before claiming a performance result.

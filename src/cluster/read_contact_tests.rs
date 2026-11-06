@@ -23,7 +23,7 @@ fn contact_message(node: &RawNode<LogStorage>) -> Message {
 }
 
 #[test]
-fn read_contacts_require_recorded_term_commit_and_current_healthy_policy() {
+fn read_contacts_require_recorded_term_accepted_prefix_and_current_healthy_policy() {
     let dir = tempfile::tempdir().unwrap();
     let mut sim = Simulation::new(dir.path());
     sim.nodes[0].campaign().unwrap();
@@ -33,7 +33,7 @@ fn read_contacts_require_recorded_term_commit_and_current_healthy_policy() {
     let mut db = sim.nodes[1].store().db.lock().unwrap();
     assert!(db.can_reply_to_read_heartbeat(role, &message, [0; 16]));
     // No SQL transaction may be opened by contact validation, even while the
-    // actor owns a lazy projection. A newer commit must go through that actor.
+    // actor owns a lazy projection. An unaccepted prefix still needs that actor.
     db.begin_lazy_projection().unwrap();
     assert!(db.can_reply_to_read_heartbeat(role, &message, [0; 16]));
     assert!(db.conn.is_autocommit());
@@ -213,15 +213,158 @@ fn actor_keeps_responses_when_contact_has_become_a_term_or_commit_transition() {
         .any(|m| m.get_msg_type() == MessageType::MsgHeartbeatResponse));
 }
 
-#[tokio::test]
-async fn read_contact_network_path_is_nonblocking_and_preserves_authenticated_context() {
+#[test]
+fn fresh_read_contacts_can_precede_follower_commit_projection_and_survive_cold_leader_loss() {
+    use raft::eraftpb::MessageType;
     for voters in [3, 5] {
         let dir = tempfile::tempdir().unwrap();
         let mut sim = Simulation::with_voters(dir.path(), voters);
         sim.nodes[0].campaign().unwrap();
         sim.settle(None);
+        let previous = sim.nodes[0].raft.raft_log.committed;
+        sim.propose(0, 1, b"read-contact");
+        pump(
+            &mut sim.nodes[0],
+            &mut sim.pending[0],
+            &sim.send,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        // Accept the actual publication on every voter, but retain all later
+        // leader commit notifications in the transport queues.
+        for follower in 1..voters as usize {
+            while let Ok(message) = sim.receive[follower].try_recv() {
+                sim.nodes[follower].step(message).unwrap();
+            }
+            pump(
+                &mut sim.nodes[follower],
+                &mut sim.pending[follower],
+                &sim.send,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        }
+        while let Ok(message) = sim.receive[0].try_recv() {
+            sim.nodes[0].step(message).unwrap();
+            pump(
+                &mut sim.nodes[0],
+                &mut sim.pending[0],
+                &sim.send,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        }
+        let committed = sim.nodes[0].raft.raft_log.committed;
+        assert!(committed > previous);
+        assert_eq!(
+            sim.nodes[0]
+                .store()
+                .db
+                .lock()
+                .unwrap()
+                .hard()
+                .unwrap()
+                .commit,
+            committed
+        );
+        let read = sim.quorum_read(0, vec![6; 24]);
+        let contacts = std::mem::take(&mut sim.nodes[0].raft.msgs);
+        assert_eq!(contacts.len(), voters as usize / 2);
+        for (n, contact) in contacts.into_iter().enumerate() {
+            let follower = &mut sim.nodes[(contact.to - 1) as usize];
+            let role = cache_contact_policy(follower);
+            let db = follower.store().db.lock().unwrap();
+            assert_eq!(db.hard().unwrap().commit, previous);
+            assert_eq!(db.last().unwrap(), committed);
+            assert_eq!(contact.commit, committed);
+            assert!(db.can_reply_to_read_heartbeat(role, &contact, [0; 16]),
+                "a durable accepted suffix must not require commit projection for a leadership contact");
+            let mut beyond = contact.clone();
+            beyond.commit += 1;
+            assert!(!db.can_reply_to_read_heartbeat(role, &beyond, [0; 16]));
+            let response = Message {
+                from: contact.to,
+                to: contact.from,
+                term: contact.term,
+                commit: previous,
+                msg_type: MessageType::MsgHeartbeatResponse,
+                context: contact.context,
+                ..Default::default()
+            };
+            drop(db);
+            // The actual Raft leader counts distinct fresh responders even
+            // though each reports its older, truthful commit frontier.
+            sim.nodes[0].step(response.clone()).unwrap();
+            sim.nodes[0].step(response).unwrap();
+            pump(
+                &mut sim.nodes[0],
+                &mut sim.pending[0],
+                &sim.send,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            if n + 1 < voters as usize / 2 {
+                assert!(matches!(read.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            }
+        }
+        read.try_recv().unwrap().unwrap();
+        for follower in &sim.nodes[1..] {
+            assert_eq!(
+                follower.store().db.lock().unwrap().hard().unwrap().commit,
+                previous
+            );
+        }
+        // Discard every process's volatile state and undelivered commit notice.
+        // The former leader stays isolated; accepted bytes on the survivors
+        // must elect a leader and recover the exact publication without it.
+        drop(sim);
+        let mut reopened = Simulation::with_voters(dir.path(), voters);
+        reopened.ticks(30, Some(1));
+        let leader = reopened
+            .nodes
+            .iter()
+            .skip(1)
+            .find(|node| node.raft.state == StateRole::Leader)
+            .unwrap();
+        let db = leader.store().db.lock().unwrap();
+        assert!(db.hard().unwrap().commit >= committed);
+        assert_eq!(
+            db.content(ContentKey {
+                generation: 1,
+                sequence: 1
+            })
+            .unwrap()
+            .unwrap()
+            .payload
+            .as_ref(),
+            b"read-contact"
+        );
+    }
+}
+
+#[tokio::test]
+async fn read_contact_network_path_is_nonblocking_and_preserves_authenticated_context() {
+    for (voters, accepted_ahead) in [(3, false), (3, true), (5, false), (5, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sim = Simulation::with_voters(dir.path(), voters);
+        sim.nodes[0].campaign().unwrap();
+        sim.settle(None);
         let role = cache_contact_policy(&sim.nodes[1]);
-        let message = contact_message(&sim.nodes[1]);
+        let mut message = contact_message(&sim.nodes[1]);
+        let recorded_commit = message.commit;
+        if accepted_ahead {
+            let mut db = sim.nodes[1].store().db.lock().unwrap();
+            db.persist(
+                &[raft::eraftpb::Entry {
+                    index: recorded_commit + 1,
+                    term: role.term,
+                    ..Default::default()
+                }],
+                None,
+            )
+            .unwrap();
+            message.commit += 1;
+        }
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (tx, _rx) = mpsc::sync_channel(8);
         let (stop, stop_rx) = watch::channel(false);
@@ -267,7 +410,8 @@ async fn read_contact_network_path_is_nonblocking_and_preserves_authenticated_co
                 .unwrap();
         assert_eq!(nonce, [0; 16]);
         assert!(message.commit > 0);
-        assert_eq!(response.commit, message.commit);
+        assert_eq!(response.commit, recorded_commit);
+        assert_eq!(db.lock().unwrap().hard().unwrap().commit, recorded_commit);
         sim.nodes[0]
             .raft
             .mut_prs()
@@ -277,7 +421,7 @@ async fn read_contact_network_path_is_nonblocking_and_preserves_authenticated_co
         sim.nodes[0].step(response.clone()).unwrap();
         assert_eq!(
             sim.nodes[0].raft.prs().get(2).unwrap().committed_index,
-            message.commit
+            recorded_commit
         );
         assert_eq!(response.context, message.context);
         assert_eq!(

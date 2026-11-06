@@ -353,9 +353,11 @@ impl Database {
         let Some((revision, configuration, policy)) = &self.heartbeat_policy else {
             return false;
         };
-        // Only a no-op heartbeat can bypass the owner: no term, commit, log or
-        // membership change is permitted. This reads memory only, under the DB
-        // mutex; it never starts a SQL scope or waits for storage.
+        // A read contact confirms the already recorded leader term without
+        // changing a term, commit, log or membership. A newer commit may still
+        // be queued for the actor, provided its entire prefix is durably
+        // accepted. The reply advertises only our recorded commit frontier.
+        // This reads memory only; it never starts SQL or waits for storage.
         !self.failed
             && *revision == self.membership_revision
             && *configuration == role.configuration
@@ -363,10 +365,9 @@ impl Database {
             && role.term == message.term
             && hard.term == message.term
             && self.durable_term().ok() == Some(message.term)
-            && message.commit <= hard.commit
             && self
                 .accepted_tip
-                .is_some_and(|(last, _)| hard.commit <= last)
+                .is_some_and(|(last, _)| hard.commit <= last && message.commit <= last)
             && policy.accepts_read_heartbeat(message, nonce)
     }
     pub fn last(&self) -> io::Result<u64> {

@@ -680,7 +680,7 @@ fn reply_to_read_heartbeat(active: &startup::Active, message: &Message, nonce: [
         return false;
     }
     let role = *active.role.borrow();
-    {
+    let commit = {
         let db = match active.db.try_lock() {
             Ok(db) => db,
             Err(_) => return false,
@@ -688,7 +688,13 @@ fn reply_to_read_heartbeat(active: &startup::Active, message: &Message, nonce: [
         if !db.can_reply_to_read_heartbeat(role, message, nonce) {
             return false;
         }
-    }
+        // Validation above proves the recorded-hard cache is current. Do not
+        // claim that a newer commit notification has already been recorded.
+        let Ok(hard) = db.recorded_hard() else {
+            return false;
+        };
+        hard.commit.min(message.commit)
+    };
     let slot = if active.config.peers.contains_key(&message.from) {
         message.from
     } else {
@@ -703,9 +709,7 @@ fn reply_to_read_heartbeat(active: &startup::Active, message: &Message, nonce: [
             to: message.from,
             term: message.term,
             msg_type: raft::eraftpb::MessageType::MsgHeartbeatResponse,
-            // Validation above proves this frontier is already recorded. Keep
-            // Raft's commit-progress hint even when the actor is bypassed.
-            commit: message.commit,
+            commit,
             context: message.context.clone(),
             ..Default::default()
         })
