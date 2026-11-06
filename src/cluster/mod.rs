@@ -933,12 +933,23 @@ fn dispatch_messages<S: transport::MessageSender>(
                     .or_else(|| routes.get(&message.to).copied())
                     .unwrap_or(message.to)
             };
-            if let Some(tx) = out.get(&route) {
-                let _ = if background {
+            let to = message.to;
+            let snapshot = message.get_msg_type() == raft::eraftpb::MessageType::MsgSnapshot;
+            let sent = out.get(&route).is_some_and(|tx| {
+                if background {
                     tx.try_send_background(message)
                 } else {
                     tx.try_send(message)
-                };
+                }
+                .is_ok()
+            });
+            if !sent {
+                // A rejected enqueue wrote no bytes. Raft must not keep this
+                // append in flight or wait for a snapshot that was never sent.
+                node.report_unreachable(to);
+                if snapshot {
+                    node.report_snapshot(to, raft::SnapshotStatus::Failure);
+                }
             }
         }
     }
@@ -1990,6 +2001,85 @@ mod tests {
                 .collect(),
         }
     }
+    struct RejectPeer;
+    impl transport::MessageSender for RejectPeer {
+        fn try_send(&self, _: Message) -> Result<(), ()> {
+            Err(())
+        }
+    }
+
+    #[test]
+    fn rejected_append_returns_replication_to_probe_without_committing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sim = Simulation::new(dir.path());
+        sim.nodes[0].campaign().unwrap();
+        sim.settle(None);
+        let committed = sim.nodes[0].raft.raft_log.committed;
+        assert_eq!(
+            sim.nodes[0].raft.prs().get(2).unwrap().state,
+            raft::ProgressState::Replicate
+        );
+        sim.nodes[0]
+            .propose(b"unsent".to_vec(), Vec::new())
+            .unwrap();
+        let rejected = BTreeMap::from([(2, RejectPeer), (3, RejectPeer)]);
+        pump(
+            &mut sim.nodes[0],
+            &mut sim.pending[0],
+            &rejected,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            sim.nodes[0].raft.raft_log.committed, committed,
+            "unsent entries cannot form a quorum"
+        );
+        assert_eq!(
+            sim.nodes[0].raft.prs().get(2).unwrap().state,
+            raft::ProgressState::Probe
+        );
+        assert_eq!(
+            sim.nodes[0].raft.prs().get(3).unwrap().state,
+            raft::ProgressState::Probe
+        );
+        sim.nodes[0].propose(b"next".to_vec(), Vec::new()).unwrap();
+        sim.settle(None);
+        assert!(sim.nodes[0].raft.raft_log.committed > committed);
+    }
+
+    #[test]
+    fn rejected_snapshot_releases_snapshot_progress_without_claiming_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sim = Simulation::new(dir.path());
+        sim.nodes[0].campaign().unwrap();
+        sim.settle(None);
+        let node = &mut sim.nodes[0];
+        let committed = node.raft.raft_log.committed;
+        node.raft
+            .mut_prs()
+            .get_mut(2)
+            .unwrap()
+            .become_snapshot(committed);
+        let message = Message {
+            from: 1,
+            to: 2,
+            term: node.raft.term,
+            msg_type: raft::eraftpb::MessageType::MsgSnapshot,
+            ..Default::default()
+        };
+        dispatch_messages(
+            node,
+            vec![message],
+            &BTreeMap::from([(2, RejectPeer)]),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let progress = node.raft.prs().get(2).unwrap();
+        assert_eq!(progress.state, raft::ProgressState::Probe);
+        assert_eq!(progress.pending_snapshot, 0);
+        assert_eq!(node.raft.raft_log.committed, committed);
+    }
+
     struct Simulation {
         nodes: Vec<RawNode<LogStorage>>,
         pending: Vec<BTreeMap<Vec<u8>, Pending>>,

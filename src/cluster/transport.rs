@@ -157,7 +157,9 @@ impl PeerSender {
         mut stop: watch::Receiver<bool>,
         incarnation: [u8; 16],
     ) -> Self {
-        let (send, mut receive) = tokio::sync::mpsc::channel::<Write>(4);
+        // Raft can enqueue a complete append window before this writer runs.
+        // Keep additional bounded slots for heartbeats and commit notifications.
+        let (send, mut receive) = tokio::sync::mpsc::channel::<Write>(REPLICATION_WINDOW + 4);
         let state = Arc::new(Mutex::new(State::default()));
         let writer_state = state.clone();
         let writer_config = config.clone();
@@ -269,6 +271,60 @@ mod tests {
             ..Default::default()
         }
     }
+    #[tokio::test]
+    async fn output_queue_accepts_a_replication_window_and_control_without_losing_frames() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (tx, _rx) = mpsc::sync_channel(4);
+        let (stop, stopping) = watch::channel(false);
+        let sender = PeerSender::start(
+            config(1),
+            listener.local_addr().unwrap(),
+            tx,
+            stopping,
+            [7; 16],
+        );
+        let mut expected = Vec::new();
+        // Do not yield to the writer: Raft can produce its complete configured
+        // window before that task gets a turn. A heartbeat also needs a slot.
+        for index in 1..=REPLICATION_WINDOW as u64 {
+            let mut message = heartbeat(index);
+            message.msg_type = MessageType::MsgAppend;
+            message.entries.push(raft::eraftpb::Entry {
+                index,
+                term: 1,
+                data: vec![index as u8; 128].into(),
+                ..Default::default()
+            });
+            sender
+                .try_send(message.clone())
+                .expect("outbound queue dropped a permitted Raft append");
+            expected.push(message);
+        }
+        let control = heartbeat(REPLICATION_WINDOW as u64 + 1);
+        sender
+            .try_send(control.clone())
+            .expect("replication window left no control capacity");
+        expected.push(control);
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut stream = BufReader::new(stream);
+        let budget = Arc::new(Semaphore::new(MAX_FRAME));
+        for expected in expected {
+            let (message, nonce, _) = tokio::time::timeout(
+                Duration::from_secs(2),
+                receive_message(&config(2), &mut stream, budget.clone(), None),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(message, expected);
+            assert_eq!(nonce, [7; 16]);
+        }
+        stop.send_replace(true);
+    }
+
     #[tokio::test]
     async fn urgent_traffic_releases_background_appends_without_reordering_or_lost_wakeups() {
         for (wait_for_writer, urgent_kind) in [

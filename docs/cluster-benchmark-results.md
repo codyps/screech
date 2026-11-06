@@ -71,6 +71,7 @@ Each row below is a whole R3/R5 campaign using the same 3,000-publication worklo
 | [42164213943](https://github.com/codyps/screech/actions/runs/42164213943) | Xeon Platinum 8573C | 25/28 | 1.273× | 1.431× | Commit-aware read probes with learned admission and checkpoint pacing |
 | [42166305893](https://github.com/codyps/screech/actions/runs/42166305893) | EPYC 9V74 | 11/28 | 1.162× | 2.805× | Integrated main; all CI jobs and standalone targets passed |
 | [42172626951](https://github.com/codyps/screech/actions/runs/42172626951) | R3: EPYC 7763; R5: EPYC 9V45 | 25/28 | 1.193× | 2.254× | Isolated timing jobs; raw provenance independently verified; CI postprocessing failed |
+| [42176137594](https://github.com/codyps/screech/actions/runs/42176137594) | EPYC 9V74 | 11/28 | 0.381× | 71.084× | Publication collection candidate; all CI jobs, standalone targets and local fault histories passed |
 
 The individual experiments retain their branches and raw campaign artifacts. Shorter or diagnostic runs are not combined with these five-trial results to fill missing targets.
 
@@ -142,3 +143,27 @@ the two R5 workloads, on one Ryzen 9955HX host. Publisher throughput improved by
 placement also varied, so these diagnostics do not establish a controlled effect
 size or qualify the complete clustered target. Fresh complete CI measurements are
 required for the final publication-only policy.
+
+
+Complete five-trial campaign 42176137594 at `20c9023` passed all 19 standalone
+targets and all CI jobs, and published its results. Its clustered comparison
+passed only 11 of 28 cases. R3 concurrent publishing had throughput 0.381× and p99
+71.084× NATS; three of five trials had p99 near 180–188 ms, while their medians
+remained near 0.82 ms. R5 also missed several targets. The previous local publisher
+improvements did not establish qualification or predictable hosted performance.
+All 20 local independent-VM/LazyFS histories passed at this source.
+
+Investigating the stalls exposed two reproducible transport defects: each peer's
+output queue held only four messages although Raft permits eight appends in flight,
+and dispatch ignored rejected enqueues. A controlled real-socket test reproduces
+dropping a permitted replication burst before the writer runs. Two actual Raft
+state tests reproduce append progress remaining in replication and snapshot
+progress remaining paused after their sends were rejected. All three fail against
+the old implementation and pass after the correction.
+
+The corrected bounded queue derives its capacity from the replication window plus
+four control slots. Rejected sends report unreachability to Raft; rejected snapshots
+also report transfer failure. Partial-frame ordering, bounded admission, synced
+acceptance, distinct-voter quorum requirements, application projection fences and
+standalone behavior retain their existing contracts. Fresh complete measurements
+must determine the effect on the observed stalls and the overall target.
