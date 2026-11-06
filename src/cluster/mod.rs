@@ -133,6 +133,12 @@ impl Batch {
         })
         .map_err(error)
     }
+    // Scheduling only: full decoding and storage validation remain mandatory.
+    // Read the small prefix without allocating or traversing payloads.
+    fn has_multiple_records(data: &[u8]) -> bool {
+        postcard::take_from_bytes::<(u8, usize)>(data)
+            .is_ok_and(|((version, count), _)| version == 1 && (2..=8192).contains(&count))
+    }
     fn decode(data: &[u8]) -> io::Result<Self> {
         let b: Self = postcard::from_bytes(data).map_err(error)?;
         if b.version != 1 {
@@ -561,10 +567,10 @@ impl Store for ClusterStore {
     }
 }
 #[cfg(test)]
-fn pump(
+fn pump<S: transport::MessageSender>(
     node: &mut RawNode<LogStorage>,
     pending: &mut BTreeMap<Vec<u8>, Pending>,
-    out: &BTreeMap<u64, tokio::sync::mpsc::Sender<Message>>,
+    out: &BTreeMap<u64, S>,
     routes: &BTreeMap<u64, u64>,
 ) -> io::Result<()> {
     if !node.has_ready() {
@@ -2091,6 +2097,124 @@ mod tests {
             self.nodes[node]
                 .propose(vec![], postcard::to_allocvec(&batch).unwrap())
                 .unwrap();
+        }
+    }
+    #[test]
+    fn grouped_replication_can_commit_on_fast_backups_without_relaxing_the_quorum() {
+        use std::collections::VecDeque;
+        #[derive(Default)]
+        struct Queues {
+            ready: VecDeque<Message>,
+            delayed: Vec<Message>,
+        }
+        #[derive(Clone)]
+        struct Sender(Arc<Mutex<Queues>>);
+        impl transport::MessageSender for Sender {
+            fn try_send(&self, message: Message) -> Result<(), ()> {
+                // The normally preferred voters remain unavailable. Peers 4/5
+                // can answer immediately, but background delivery is suspended.
+                if ![2, 3].contains(&message.to) {
+                    self.0.lock().unwrap().ready.push_back(message);
+                }
+                Ok(())
+            }
+            fn try_send_background(&self, message: Message) -> Result<(), ()> {
+                self.0.lock().unwrap().delayed.push(message);
+                Ok(())
+            }
+        }
+        for records in [1, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut sim = Simulation::with_voters(dir.path(), 5);
+            sim.nodes[0].campaign().unwrap();
+            sim.settle(None);
+            let before = sim.nodes[0].raft.raft_log.committed;
+            let data = Batch::encode(
+                &vec![
+                    Append {
+                        subject: "event".into(),
+                        headers: Bytes::new(),
+                        payload: Bytes::new()
+                    };
+                    records
+                ],
+                &[],
+            )
+            .unwrap();
+            assert_eq!(Batch::has_multiple_records(&data), records > 1);
+            let queues = Arc::new(Mutex::new(Queues::default()));
+            let out: BTreeMap<u64, Sender> =
+                (1..=5).map(|id| (id, Sender(queues.clone()))).collect();
+            sim.nodes[0].propose(vec![], data).unwrap();
+            pump(
+                &mut sim.nodes[0],
+                &mut sim.pending[0],
+                &out,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            assert_eq!(sim.nodes[0].raft.raft_log.committed, before);
+            if records == 1 {
+                // Single publications retain the batching policy for backups.
+                assert_eq!(queues.lock().unwrap().delayed.len(), 2);
+                assert!(queues.lock().unwrap().ready.is_empty());
+                continue;
+            }
+            assert!(queues.lock().unwrap().delayed.is_empty());
+            for peer in [4, 5] {
+                let take = |from, to| {
+                    let mut q = queues.lock().unwrap();
+                    let index = q
+                        .ready
+                        .iter()
+                        .position(|m| m.from == from && m.to == to)
+                        .unwrap();
+                    q.ready.remove(index).unwrap()
+                };
+                let append = take(1, peer);
+                let index = append.entries.last().unwrap().index;
+                sim.nodes[peer as usize - 1].step(append).unwrap();
+                pump(
+                    &mut sim.nodes[peer as usize - 1],
+                    &mut sim.pending[peer as usize - 1],
+                    &out,
+                    &BTreeMap::new(),
+                )
+                .unwrap();
+                assert_eq!(
+                    sim.nodes[peer as usize - 1]
+                        .store()
+                        .db
+                        .lock()
+                        .unwrap()
+                        .last()
+                        .unwrap(),
+                    index
+                );
+                sim.nodes[0].step(take(peer, 1)).unwrap();
+                pump(
+                    &mut sim.nodes[0],
+                    &mut sim.pending[0],
+                    &out,
+                    &BTreeMap::new(),
+                )
+                .unwrap();
+                if peer == 4 {
+                    assert_eq!(
+                        sim.nodes[0].raft.raft_log.committed, before,
+                        "two of five must not commit"
+                    );
+                } else {
+                    assert_eq!(sim.nodes[0].raft.raft_log.committed, index);
+                    assert_eq!(
+                        sim.nodes[0].store().db.lock().unwrap().end().unwrap(),
+                        records as u64
+                    );
+                }
+            }
+        }
+        for data in [vec![], vec![1], vec![2, 2], vec![1, 0xff]] {
+            assert!(!Batch::has_multiple_records(&data));
         }
     }
     #[test]
