@@ -593,20 +593,25 @@ impl Database {
             decoded.push((entry, batch));
         }
         self.commit_transaction(false, |tx| {
-            let mut results = Vec::new();
+            let mut results = Vec::with_capacity(decoded.len());
+            // One compiled statement per committed prefix. Returning it to the
+            // cache after every record repeatedly hashes the SQL and resets the
+            // same handle in large groups. Each execution still binds every row.
+            let mut events = tx
+                .prepare_cached("INSERT INTO event_index VALUES(?1,?2,?3)")
+                .map_err(error)?;
+            let mut bodies = tx
+                .prepare_cached("INSERT INTO body_index VALUES(?1,?2,?3,?4)")
+                .map_err(error)?;
             for (entry, batch) in decoded {
                 if let Some(batch) = batch {
                     for (ordinal, _) in batch.records.iter().enumerate() {
                         end += 1;
-                        tx.prepare_cached("INSERT INTO event_index VALUES(?1,?2,?3)")
-                            .map_err(error)?
-                            .execute(params![sql(end)?, sql(entry.index)?, ordinal as i64])
+                        events.execute(params![sql(end)?, sql(entry.index)?, ordinal as i64])
                             .map_err(error)?;
                     }
                     for (ordinal, c) in batch.contents.iter().enumerate() {
-                        tx.prepare_cached("INSERT INTO body_index VALUES(?1,?2,?3,?4)")
-                            .map_err(error)?
-                            .execute(params![
+                        bodies.execute(params![
                                 sql(c.key.generation)?,
                                 sql(c.key.sequence)?,
                                 sql(entry.index)?,
