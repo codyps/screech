@@ -24,4 +24,6 @@ class SyncProfileTests(unittest.TestCase):
         self.assertEqual({}, summarize_sync('''100 123.0 fsync(4) = 0 <0.000300>
 100 123.1 write(4</tmp/db>, "x", 1) = 1 <0.000300>
 100 123.2 <... fsync resumed>) = 0 <0.000300>
+100 123.3 fallocate(4</tmp/db>, 0, 0, 8388608) = 0 <0.100000>
+100 123.4 ftruncate(4</tmp/db>, 8388608) = 0 <0.100000>
 '''))

@@ -20,7 +20,7 @@ from profile_sync import summarize_sync
 def tracing(binary, processes, prefix, sync_only=False):
     log_path = Path(str(prefix) + '.strace.log')
     with log_path.open('w') as log:
-        options = ['-ttt', '-T', '-yy', '-e', 'trace=fdatasync,fsync'] if sync_only else [
+        options = ['-ttt', '-T', '-yy', '-e', 'trace=fdatasync,fsync,fallocate,ftruncate'] if sync_only else [
                    '-c', '-w', '-e', 'trace=pwrite64,write,writev,fdatasync,fsync,futex,sendto,recvfrom,connect']
         command = [binary, '-f', '-qq', *options,
                    '-o', str(Path(str(prefix) + '.strace.txt'))]
