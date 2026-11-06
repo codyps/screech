@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Profile all voters during publications only; diagnostic timings are not targets."""
+"""Profile all voters during checked workload phases; diagnostic timings are not targets."""
 import argparse
 from contextlib import contextmanager, nullcontext
 import json
@@ -50,6 +50,7 @@ def main():
     parser.add_argument('--check-only', action='store_true', help='Validate phase gates without attaching profilers')
     parser.add_argument('--voters', type=int, choices=(3, 5), default=3)
     parser.add_argument('--messages', type=int, default=4000)
+    parser.add_argument('--scenario', action='append', choices=('durable', 'dedup', 'durable-parallel', 'consume-one-parallel', 'mixed-parallel', 'mixed-streams'), help='Profile selected workloads; default durable and dedup')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     if args.messages <= 0 or not (args.check_only or args.perf or args.strace):
@@ -64,7 +65,7 @@ def main():
         with tempfile.TemporaryDirectory(prefix='cluster-profile-') as tmp:
             cluster = BenchmarkCluster(binary, screech, args.voters, Path(tmp)).start()
             try:
-                for scenario in ('durable', 'dedup'):
+                for scenario in args.scenario or ('durable', 'dedup'):
                     for mode in modes:
                         prefix = args.output / f'{label}-{scenario}-{mode}'
                         gate = Path(tmp) / f'{scenario}-{mode}'
@@ -82,6 +83,8 @@ def main():
                                     tracing(args.strace, cluster.processes, prefix, sync_only=mode == 'sync')
                                     if mode in ('strace', 'sync') else nullcontext(None))
                                 with profile as process:
+                                    if Path(str(gate) + '.complete').exists():
+                                        raise RuntimeError('workload completed before profiling release')
                                     before = total_usage(cluster.processes)
                                     Path(str(gate) + '.release').touch()
                                     wait_for(Path(str(gate) + '.complete'), driver, timeout=120)
@@ -95,7 +98,7 @@ def main():
                             row = json.loads(stdout)
                             if row.get('checked') is not True or row.get('stream_replicas') != args.voters:
                                 raise RuntimeError('unchecked or incorrectly replicated profile')
-                            row.update(server=label, profiler=mode, profile_scope='publication phase only; setup and validation excluded; diagnostic timing',
+                            row.update(server=label, profiler=mode, profile_scope='workload phase only; setup, prefill and validation excluded; diagnostic timing',
                                 commands=cluster.commands, profile_frequency_hz=199 if mode == 'perf' else None,
                                 phase_server_cpu_seconds=after['cpu_seconds']-before['cpu_seconds']
                                 if after['cpu_seconds'] is not None and before['cpu_seconds'] is not None else None)

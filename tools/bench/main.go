@@ -31,9 +31,9 @@ func run() error {
 	flag.Parse()
 	if *profileGate != "" {
 		switch *scenario {
-		case "durable", "dedup", "consume", "consume-one", "consume-parallel", "consume-ack-window", "consume-limits", "consume-next":
+		case "durable", "dedup", "consume", "consume-one", "consume-parallel", "consume-ack-window", "consume-limits", "consume-next", "durable-parallel", "consume-one-parallel", "mixed-parallel", "mixed-streams":
 		default:
-			return fmt.Errorf("profile gate requires a sequential publication or consumer scenario")
+			return fmt.Errorf("profile gate requires a durable publication or consumer scenario")
 		}
 	}
 	if *n <= 0 || *size < 8 || *subscribers <= 0 || (*replicas != 1 && *replicas != 3 && *replicas != 5) {
@@ -68,7 +68,7 @@ func run() error {
 		}
 		deliveries = int64(*n)
 	} else if concurrentScenario(*scenario) {
-		elapsed, deliveries, latencies, e = runConcurrent(*url, *scenario, subject, *n, *size, *replicas, options)
+		elapsed, deliveries, latencies, e = runConcurrent(*url, *scenario, subject, *n, *size, *replicas, options, *profileGate)
 		if e != nil {
 			return e
 		}
