@@ -187,18 +187,20 @@ mod tests {
     async fn each_duplicate_waits_for_its_own_successful_quorum_observation() {
         let (handle, proofs, sends, output) = setup(2);
         for (index, send) in sends.into_iter().enumerate() {
-            let mut pending = handle.try_request(duplicate()).unwrap();
+            let pending = handle.try_request(duplicate()).unwrap();
             assert_eq!(proofs.calls.load(Ordering::SeqCst), index + 1);
-            assert!(matches!(
-                pending.response.try_recv(),
-                Err(oneshot::error::TryRecvError::Empty)
-            ));
+            let mut completion = Box::pin(pending.wait());
+            tokio::select! {
+                biased;
+                result = &mut completion => panic!("read completed before quorum: {result:?}"),
+                _ = tokio::task::yield_now() => {},
+            }
             assert!(matches!(
                 output.try_recv(),
                 Err(std_mpsc::TryRecvError::Empty)
             ));
             send.send(Ok(())).unwrap();
-            assert!(pending.wait().await.unwrap());
+            assert!(completion.await.unwrap());
             let result: Value =
                 serde_json::from_slice(&output.try_recv().unwrap().message.payload).unwrap();
             assert_eq!(result, json!({"stream":"S","seq":1,"duplicate":true}));
@@ -281,6 +283,28 @@ mod tests {
         assert_eq!(handle.slots.available_permits(), REQUEST_SLOTS - 1);
         sends.pop().unwrap().send(Ok(())).unwrap();
         timeout_for_lease(&handle).await;
+        handle.shutdown().await;
+    }
+    #[tokio::test]
+    async fn cancelled_wait_retains_the_lease_and_finishes_the_started_proof() {
+        let (handle, proofs, mut sends, output) = setup(1);
+        let pending = handle.try_request(duplicate()).unwrap();
+        let mut completion = Box::pin(pending.wait());
+        tokio::select! {
+            biased;
+            result = &mut completion => panic!("read completed before quorum: {result:?}"),
+            _ = tokio::task::yield_now() => {},
+        }
+        drop(completion);
+        assert_eq!(proofs.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(handle.slots.available_permits(), REQUEST_SLOTS - 1);
+        assert!(matches!(
+            output.try_recv(),
+            Err(std_mpsc::TryRecvError::Empty)
+        ));
+        sends.pop().unwrap().send(Ok(())).unwrap();
+        timeout_for_lease(&handle).await;
+        assert!(output.try_recv().is_ok());
         handle.shutdown().await;
     }
     async fn timeout_for_lease(handle: &Handle) {
