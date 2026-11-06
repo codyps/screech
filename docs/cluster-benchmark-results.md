@@ -68,6 +68,7 @@ Each row below is a whole R3/R5 campaign using the same 3,000-publication worklo
 | [42159305374](https://github.com/codyps/screech/actions/runs/42159305374) | EPYC 9V74 | 18/28 | 1.242× | 1.881× | dirty-frame checkpoint-trigger experiment |
 | [42161467251](https://github.com/codyps/screech/actions/runs/42161467251) | EPYC 7763 | 27/28 | 1.131× | 0.730× | learned admission with 10 ms checkpoint polling |
 | [42159736231](https://github.com/codyps/screech/actions/runs/42159736231) | EPYC 9V74 | 16/28 | 0.784× | 5.412× | Unsafe polling; clustered path unchanged |
+| [42164213943](https://github.com/codyps/screech/actions/runs/42164213943) | Xeon Platinum 8573C | 25/28 | 1.273× | 1.431× | Commit-aware read probes with learned admission and checkpoint pacing |
 
 The individual experiments retain their branches and raw campaign artifacts. Shorter or diagnostic runs are not combined with these five-trial results to fill missing targets.
 
@@ -78,3 +79,5 @@ The combined learned-admission/checkpoint-pacing campaign 42161467251 passed eve
 The separate unsafe-polling candidate `3268c64`, measured in [campaign 42159736231](https://github.com/codyps/screech/actions/runs/42159736231), passed all 19 standalone unsafe-ACK targets using five checked trials, including the 10,000-message limits-retention case at 1.108× throughput and 0.835× p99. Its correctness and guest power-loss jobs passed. That runner reported an EPYC 9V74; the failed prior main repeat used an EPYC 9V45, so these results alone do not isolate the polling change's effect. Strict single-voter and clustered stores do not enter the changed unsafe polling path.
 
 The integrated candidate combines learned admission, 10 ms checkpoint polling, commit-aware initial read probes, and the separately tested unsafe polling change. Read-probe selection prefers voters whose Raft progress already reports the leader's commit only when enough such voters exist. Each read still obtains fresh context-bound replies from a distinct current quorum; unknown progress uses the prior selection and the existing delayed probes. New tests reproduce the former choice of a commit-lagging voter and preserve fallback, rotation among equally caught-up voters, and rejection of old read contexts. The combined source must be measured as a whole before claiming qualification.
+
+The commit-aware read-probe campaign 42164213943 passed all throughput targets, including R3/R5 deduplication at 1.487× and 1.421×. It passed both targets in 25 of 28 cases. Concurrent-publish p99 missed at R3 (0.874×) and R5 (1.431×), as did R3 concurrent Fetch(1) p99 (0.837×). Its Xeon Platinum 8573C runner differs from the prior EPYC runners; these separate campaigns do not establish a controlled effect size for read selection.
