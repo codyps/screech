@@ -1,6 +1,10 @@
 # Cluster benchmark target qualification
 
-The historical campaign below qualifies all 28 cases, but fresh repeats have not consistently met the latency target. The 20% goal remains open; a green main CI run alone does not certify clustered performance because its clustered target report is informational.
+Qualification requires one complete R3/R5 campaign to pass all 28 cases: at least 1.200× NATS throughput and at most 0.800× NATS end-to-end p99, using the existing workload boundaries. The campaigns recorded here use five checked trials per case. Passing cases from separate campaigns are never combined.
+
+The [benchmark dashboard](https://codyps.github.io/screech/) identifies its measured revision and CI run. Check that run's `cluster-targets.json` and retained raw trials for its qualification result. A green main CI run alone does not certify clustered performance because its clustered target report is informational. The historical reports below retain both successful and unsuccessful campaigns; they do not stand in for a new revision's measurement.
+
+## Historical qualifying campaign
 
 [Campaign 42139057786](https://github.com/codyps/screech/actions/runs/42139057786) qualifies all 28 three- and five-voter cases against the 20% target. Each case uses five checked trials of 3,000 publications, plus warmups, with the existing throughput and end-to-end latency boundaries. The checker reports `goal_verified: true`; recomputing the report from the retained raw trials gives the same result.
 
@@ -49,14 +53,28 @@ The checkpoint correction also passed 257 Rust tests, Clippy with default and al
 
 Each row below is a whole R3/R5 campaign using the same 3,000-publication workloads and pinned NATS revision. The throughput column is the lowest ratio among its 28 cases; p99 is the highest ratio. A campaign qualifies only if all 28 cases pass both targets. Different shared runners prevent treating these rows as a controlled estimate of any individual change.
 
-| Campaign | R5 runner CPU | Cases passing both | Lowest throughput | Highest p99 | Adopted change |
+| Campaign | R5 runner CPU | Cases passing both | Lowest throughput | Highest p99 | Change measured |
 | --- | --- | ---: | ---: | ---: | --- |
 | [42139057786](https://github.com/codyps/screech/actions/runs/42139057786) | EPYC 7763 | 28/28 | 1.241× | 0.746× | Grouped fanout and completion scheduling |
 | [42141817751](https://github.com/codyps/screech/actions/runs/42141817751) | EPYC 9V45 | 25/28 | 1.255× | 2.577× | Same runtime, main repeat |
-| [42146585037](https://github.com/codyps/screech/actions/runs/42146585037) | EPYC 7763 | 26/28 | 1.237× | 1.028× | None: 10 ms checkpoint polling experiment |
-| [42147606381](https://github.com/codyps/screech/actions/runs/42147606381) | EPYC 9V74 | 12/28 | 0.944× | 4.220× | None: full admission-window experiment |
-| [42150826564](https://github.com/codyps/screech/actions/runs/42150826564) | EPYC 9V74 | 20/28 | 1.264× | 1.398× | None: admitted-count batching experiment |
+| [42146585037](https://github.com/codyps/screech/actions/runs/42146585037) | EPYC 7763 | 26/28 | 1.237× | 1.028× | 10 ms checkpoint polling experiment |
+| [42147606381](https://github.com/codyps/screech/actions/runs/42147606381) | EPYC 9V74 | 12/28 | 0.944× | 4.220× | full admission-window experiment |
+| [42150826564](https://github.com/codyps/screech/actions/runs/42150826564) | EPYC 9V74 | 20/28 | 1.264× | 1.398× | admitted-count batching experiment |
 | [42151468327](https://github.com/codyps/screech/actions/runs/42151468327) | EPYC 7763 | 13/28 | 1.291× | 1.850× | Same runtime, main repeat |
 | [42153796720](https://github.com/codyps/screech/actions/runs/42153796720) | EPYC 7763 | 27/28 | 1.232× | 0.817× | Complete partial checkpoints after reader release |
+| [42156853421](https://github.com/codyps/screech/actions/runs/42156853421) | EPYC 9V45 | 23/28 | 1.245× | 2.258× | projection statement-reuse experiment |
+| [42157079837](https://github.com/codyps/screech/actions/runs/42157079837) | EPYC 9V45 | 25/28 | 1.312× | 0.973× | Checkpoint completion on main |
+| [42158575551](https://github.com/codyps/screech/actions/runs/42158575551) | EPYC 7763 | 26/28 | 1.244× | 0.830× | learned burst-admission experiment |
+| [42159305374](https://github.com/codyps/screech/actions/runs/42159305374) | EPYC 9V74 | 18/28 | 1.242× | 1.881× | dirty-frame checkpoint-trigger experiment |
+| [42161467251](https://github.com/codyps/screech/actions/runs/42161467251) | EPYC 7763 | 27/28 | 1.131× | 0.730× | learned admission with 10 ms checkpoint polling |
+| [42159736231](https://github.com/codyps/screech/actions/runs/42159736231) | EPYC 9V74 | 16/28 | 0.784× | 5.412× | Unsafe polling; clustered path unchanged |
 
-The rejected experiments retain their branches and raw campaign artifacts. Shorter or diagnostic runs are not combined with these five-trial results to fill missing targets.
+The individual experiments retain their branches and raw campaign artifacts. Shorter or diagnostic runs are not combined with these five-trial results to fill missing targets.
+
+Main campaign 42157079837 missed clustered p99 for R3 Fetch(1) with 1 KiB messages (0.824×), R3 concurrent publishing (0.917×), and R5 sequential publishing (0.973×). All clustered throughput targets passed. Its separate existing standalone unsafe-ACK gate passed 18 of 19 cases, missing only the 10,000-message limits-retention throughput target (1.078× against 1.100×); correctness and guest power-loss checks passed. The benchmark job failed on that gate and dashboard deployment was skipped. That standalone requirement is distinct from the clustered 20% target.
+
+The combined learned-admission/checkpoint-pacing campaign 42161467251 passed every p99 target and 27 of 28 throughput targets. R3 deduplication throughput was 1.131× NATS against the required 1.200×. This is a complete campaign result, rather than a combination of passing cases from the two individual experiments.
+
+The separate unsafe-polling candidate `3268c64`, measured in [campaign 42159736231](https://github.com/codyps/screech/actions/runs/42159736231), passed all 19 standalone unsafe-ACK targets using five checked trials, including the 10,000-message limits-retention case at 1.108× throughput and 0.835× p99. Its correctness and guest power-loss jobs passed. That runner reported an EPYC 9V74; the failed prior main repeat used an EPYC 9V45, so these results alone do not isolate the polling change's effect. Strict single-voter and clustered stores do not enter the changed unsafe polling path.
+
+The integrated candidate combines learned admission, 10 ms checkpoint polling, commit-aware initial read probes, and the separately tested unsafe polling change. Read-probe selection prefers voters whose Raft progress already reports the leader's commit only when enough such voters exist. Each read still obtains fresh context-bound replies from a distinct current quorum; unknown progress uses the prior selection and the existing delayed probes. New tests reproduce the former choice of a commit-lagging voter and preserve fallback, rotation among equally caught-up voters, and rejection of old read contexts. The combined source must be measured as a whole before claiming qualification.
