@@ -48,7 +48,7 @@ impl PageCheckpointer {
             .name("screech-page-checkpoint".into())
             .spawn(move || {
                 while let Err(mpsc::RecvTimeoutError::Timeout) =
-                    stopped.recv_timeout(Duration::from_millis(100))
+                    stopped.recv_timeout(Duration::from_millis(10))
                 {
                     let result = (|| -> io::Result<()> {
                         let current = changes.load(Ordering::Acquire);
