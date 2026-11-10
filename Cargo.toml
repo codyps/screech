@@ -28,7 +28,7 @@ postcard = { version = "1", features = ["alloc"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 imbl = { version = "7.0.2", features = ["serde"] }
 raft = { version = "=0.7.0", default-features = false, features = ["protobuf-codec"] }
-protobuf = "2"
+protobuf = "3"
 slog = "2"
 hmac = "0.13"
 sha2 = "0.11"
