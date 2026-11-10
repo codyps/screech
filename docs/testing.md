@@ -390,10 +390,13 @@ Count, byte and time limits are checked independently at the storage boundary.
 case against NATS `sync_interval: always`, separately for each Screech mode. Targets
 are at least 1.10x throughput and at most 0.90x p99, using medians of three checked trials.
 Fetch(1) uses full-cycle p99; Core-on-stream uses durable publication p99. Missing,
-unverified, duplicate or invalid trials fail validation. CI reports strict-default results separately and gates unsafe-ACK performance
-after publishing the downloadable benchmark artifacts. The gate requires three or
+unverified, duplicate or invalid trials fail validation. CI reports strict-default results separately and checks unsafe-ACK performance
+after publishing the downloadable benchmark artifacts. The check requires three or
 more trials; shorter manual diagnostic runs produce reports without certifying the
-goal. A green correctness job alone is not evidence that performance targets passed.
+goal. Target misses are advisory: the checked timings and the published dashboard
+are still updated, misses are summarized in the job summary and target report, and
+only invalid, missing or unverified trials fail the run. A green correctness job
+alone is not evidence that performance targets passed.
 
 Buffered consumer journal tests cover logical sequence lookup, checksums and range
 bounds, malformed block lengths, cache invalidation, replay in strict mode, and

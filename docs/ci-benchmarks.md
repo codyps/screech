@@ -100,8 +100,10 @@ and behavior can evolve, so each campaign records the exact NATS commit.
 
 A successful main run publishes the static dashboard to GitHub Pages after
 correctness, recovery, profiling and benchmark jobs pass. PRs upload the same generated site as a downloadable
-benchmark-site artifact without deploying it. Failed campaigns do not replace the
-last successful page. Each artifact name includes its workflow ID and producing attempt. The
+benchmark-site artifact without deploying it. Performance target misses do not block
+publication: the dashboard and raw timings are still published, and the misses are
+recorded in target reports and the timing job's summary. Failed campaigns do not
+replace the last successful page. Each artifact name includes its workflow ID and producing attempt. The
 `benchmark-binaries-*` artifact contains the shared build and manifest;
 `benchmark-timings-r1-*`, `benchmark-timings-r3-*` and `benchmark-timings-r5-*` retain
 each timing job's raw files before performance gates. `benchmark-timings-*` from
