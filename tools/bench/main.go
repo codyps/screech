@@ -282,7 +282,7 @@ func run() error {
 		}
 		deliveries = int64((*n + 1) / 2)
 		for i := 0; i < (*n+1)/2; i++ {
-			m, e := js.GetMsg(name, uint64(i+1))
+			m, e := getStoredMessage(pub, js, name, uint64(i+1), *size)
 			if e != nil {
 				return e
 			}
@@ -323,7 +323,7 @@ func run() error {
 		}
 		deliveries = int64(*n)
 		for i := 0; i < *n; i++ {
-			m, e := js.GetMsg(name, uint64(i+1))
+			m, e := getStoredMessage(pub, js, name, uint64(i+1), *size)
 			if e != nil {
 				return e
 			}
@@ -596,6 +596,58 @@ func coreTopology(s string) (int, int) {
 		return 8192, 512
 	}
 	return 1, 0
+}
+
+// js.GetMsg returns the payload base64-expanded on nats.go's shared request-reply
+// subscription, which silently drops any single response above
+// DefaultSubPendingBytesLimit (64 MiB). Read such large messages through a private
+// reply subscription whose pending limits cover the expanded response instead.
+func getStoredMessage(conn *nats.Conn, js nats.JetStreamContext, stream string, seq uint64, size int) (*nats.RawStreamMsg, error) {
+	if int64(size)*4/3+(1<<20) <= nats.DefaultSubPendingBytesLimit {
+		return js.GetMsg(stream, seq)
+	}
+	inbox := nats.NewInbox()
+	sub, e := conn.SubscribeSync(inbox)
+	if e != nil {
+		return nil, e
+	}
+	defer sub.Unsubscribe()
+	if e = sub.SetPendingLimits(4, 2*size+2*(1<<20)); e != nil {
+		return nil, e
+	}
+	request, e := json.Marshal(map[string]uint64{"seq": seq})
+	if e != nil {
+		return nil, e
+	}
+	if e = conn.PublishRequest("$JS.API.STREAM.MSG.GET."+stream, inbox, request); e != nil {
+		return nil, e
+	}
+	if e = conn.Flush(); e != nil {
+		return nil, e
+	}
+	reply, e := sub.NextMsg(15 * time.Second)
+	if e != nil {
+		return nil, e
+	}
+	var response struct {
+		Error   *nats.APIError `json:"error"`
+		Message *struct {
+			Subject  string `json:"subject"`
+			Sequence uint64 `json:"seq"`
+			Header   []byte `json:"hdrs"`
+			Data     []byte `json:"data"`
+		} `json:"message"`
+	}
+	if e = json.Unmarshal(reply.Data, &response); e != nil {
+		return nil, e
+	}
+	if response.Error != nil {
+		return nil, response.Error
+	}
+	if response.Message == nil {
+		return nil, fmt.Errorf("missing stored message %d", seq)
+	}
+	return &nats.RawStreamMsg{Subject: response.Message.Subject, Sequence: response.Message.Sequence, Data: response.Message.Data}, nil
 }
 
 // Barriers bracket only the measured consumer phase. The profiler enables events

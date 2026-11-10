@@ -251,7 +251,7 @@ jobs:
       - name: Verify campaign provenance and report clustered targets
         run: |
           python3 scripts/benchmark_build.py campaigns --directory bin --revision "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" \
-            results/standard.json results/concurrent.json results/cluster-3.json results/cluster-5.json
+            results/standard.json results/concurrent.json results/large.json results/cluster-3.json results/cluster-5.json
           python3 scripts/check_cluster_targets.py --three results/cluster-3.json --five results/cluster-5.json \
             --minimum-trials "$TRIALS" --report-only --output results/cluster-targets.json
       - name: Retain the complete timing campaign
@@ -264,6 +264,7 @@ jobs:
           python3 scripts/render_benchmarks.py \
             --input 'CI · standard cases' results/standard.json \
             --input 'CI · larger JetStream cases' results/concurrent.json \
+            --input 'CI · large messages' results/large.json \
             --input 'CI · cluster · 3 voters' results/cluster-3.json \
             --input 'CI · cluster · 5 voters' results/cluster-5.json \
             --output _site --revision "$GITHUB_SHA" \

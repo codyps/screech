@@ -21,7 +21,7 @@ the assembled dashboard.
 
 A manifest records all three binary SHA256 hashes, source revision, resolved NATS
 SHA and Rust version. Each timing job verifies the downloaded binaries. Dashboard
-assembly verifies that all four campaign files match the manifest and come from
+assembly verifies that all five campaign files match the manifest and come from
 the same workflow ID and measurement attempt. Mixing one retried topology into an
 older attempt is rejected. A publication-only retry can reuse the complete original
 measurement set. Versions, CPU/kernel/filesystem, trial counts and commands remain
@@ -36,10 +36,23 @@ The default campaign runs three checked trials per case, plus warmups. It covers
 Core fanout/wildcards/queues/request-reply, live Core on a stream, sequential and
 concurrent durable publishers, pull consumers, ACK-and-next, dedup, retention and
 mixed workloads, including a 1000-message outstanding ACK window. A second campaign runs four concurrent cases at 20,000 messages and a 10,000-message limits-retention consumer case.
-Separate three- and five-voter campaigns run all 14 JetStream cases at 3,000
+A third campaign repeats the sequential durable case with 1 MiB, 10 MiB and
+50 MiB payloads (100/10/4 publications per trial) plus one case at 33,554,368 bytes
+— 32 MiB minus the benchmark subject and record overhead, byte-exactly the largest
+message nats-server's file store can record, so it is the biggest payload compared
+across every server mode. The campaign runs under a raised 64 MiB protocol
+payload limit; Screech also gets a 96 MiB writer pending budget and a 30 s storage
+deadline so one FULL commit per large message is not cut short. nats-server's
+file store cannot represent message records above 32 MiB, so the 50 MiB case runs
+Screech modes only and reports no NATS peer. That 32 MiB record cap (subject and
+overhead included) was verified empirically at the byte boundary against v2.16.0-dev
+and is not configurable: raising server max_payload only widens the protocol limit,
+stream max_msg_size can only lower it, s2 stream compression runs after the
+per-record check, memory storage is a different non-file store, and clustered R3/R5
+publications pass the same check before replication. Separate three- and five-voter campaigns run all 14 JetStream cases at 3,000
 publications per trial against both servers, covering repeated checkpoint and WAL
-reuse cycles. There are 513 measured trials at the
-default settings: 270 standard, 75 larger and 168 clustered.
+reuse cycles. There are 564 measured trials at the
+default settings: 270 standard, 75 larger, 51 large-message and 168 clustered.
 A manual CI run can set trials (1–10) and nats_ref (branch, tag or SHA).
 The manual `Cluster benchmark targets` workflow runs just the two clustered
 campaigns on a fresh runner and uploads their raw trials and target report; its
@@ -174,7 +187,8 @@ python3 scripts/benchmark.py --screech target/release/screech-server \
   --nats bin/nats-server --driver bin/bench-driver \
   --nats-commit "$(cat results/nats-commit.txt)" \
   --nats-default --nats-sync-interval 10ms --screech-unsafe-ack --trials 3 --output results/standard.json
-# Repeat with --scale-only --output results/concurrent.json for larger cases.
+# Repeat with --scale-only --output results/concurrent.json for larger cases,
+# and --large-messages --output results/large.json for 1 MiB/10 MiB/50 MiB payloads.
 for voters in 3 5; do
   python3 scripts/benchmark.py --screech target/release/screech-server \
     --nats bin/nats-server --driver bin/bench-driver \
@@ -183,6 +197,7 @@ for voters in 3 5; do
 done
 python3 scripts/render_benchmarks.py \
   --input 'Local standard' results/standard.json \
+  --input 'Local large messages' results/large.json \
   --input 'Local cluster · 3 voters' results/cluster-3.json \
   --input 'Local cluster · 5 voters' results/cluster-5.json --output _site
 python3 -m http.server --directory _site 8000

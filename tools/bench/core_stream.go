@@ -86,7 +86,7 @@ func runCoreStream(url, subject string, count, size, replicas int, options []nat
 		return 0, nil, nil, fmt.Errorf("live Core mismatch")
 	}
 	for i := 0; i < count; i++ {
-		message, e := js.GetMsg(name, uint64(i+1))
+		message, e := getStoredMessage(publisher, js, name, uint64(i+1), size)
 		if e != nil {
 			return 0, nil, nil, e
 		}

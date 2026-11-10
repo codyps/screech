@@ -60,6 +60,14 @@ jobs:
             --nats-commit "$(cat results/nats-commit.txt)" \
             --nats-default --nats-sync-interval 10ms --screech-unsafe-ack --trials "$TRIALS" \
             --scale-only --output results/concurrent.json
+      - name: Large-message JetStream cases
+        if: inputs.voters == 1
+        run: |
+          python3 scripts/benchmark.py --screech bin/screech-server \
+            --nats bin/nats-server --driver bin/bench-driver \
+            --nats-commit "$(cat results/nats-commit.txt)" \
+            --nats-default --nats-sync-interval 10ms --screech-unsafe-ack --trials "$TRIALS" \
+            --large-messages --output results/large.json
       - name: Standalone JetStream performance target reports
         if: inputs.voters == 1
         run: |
@@ -74,7 +82,7 @@ jobs:
       - name: Verify timing provenance
         run: |
           if [ "$VOTERS" = 1 ]; then
-            campaigns=(results/standard.json results/concurrent.json)
+            campaigns=(results/standard.json results/concurrent.json results/large.json)
           else
             campaigns=("results/cluster-$VOTERS.json")
           fi

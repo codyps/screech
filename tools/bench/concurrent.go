@@ -222,7 +222,7 @@ func runConcurrent(url, scenario, subject string, count, size, replicas int, opt
 			return 0, 0, nil, fmt.Errorf("publish/delivery mismatch at %d", i)
 		}
 		if !consuming {
-			message, e := js.GetMsg(names[stream], seq)
+			message, e := getStoredMessage(control, js, names[stream], seq, size)
 			if e != nil {
 				return 0, 0, nil, e
 			}
