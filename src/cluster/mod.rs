@@ -12,7 +12,7 @@ use crate::{
     storage::{Append, CheckpointJob, Content, ContentKey, Record, Replication, Store, StoreError},
 };
 use bytes::Bytes;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use protobuf::Message as ProtoMessage;
 use raft::{eraftpb::Message, RawNode, StateRole};
 use serde::{Deserialize, Serialize};

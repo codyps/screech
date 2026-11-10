@@ -20,23 +20,23 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
 crc32fast = "1"
-getrandom = "0.3"
+getrandom = "0.4"
 itoa = "1"
 fs2 = "0.4"
-base64 = "0.22"
+base64 = "0.23"
 postcard = { version = "1", features = ["alloc"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 imbl = { version = "7.0.2", features = ["serde"] }
 raft = { version = "=0.7.0", default-features = false, features = ["protobuf-codec"] }
 protobuf = "2"
 slog = "2"
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
-async-nats = "0.49"
+async-nats = "0.52"
 futures-util = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
